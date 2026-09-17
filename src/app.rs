@@ -1,10 +1,10 @@
 use crate::account::{AccountStore, DEFAULT_ACCOUNT};
-use crate::agent::{Agent, claude_launch, codex_launch};
+use crate::agent::{Agent, Launch, claude_launch, codex_launch};
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::store::{Store, TabRecord};
 use crate::tab::Tab;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub struct App {
@@ -32,36 +32,44 @@ impl App {
         }
     }
 
-    pub fn new_tab(&mut self, name: String, cwd: PathBuf, agent: Agent) -> Result<()> {
-        let (launch, record) = match agent {
+    /// Builds the argv and the record for a brand-new tab, without spawning
+    /// anything. Pure and side-effect free (besides `self.accounts.ensure`,
+    /// which just creates a directory) — this is what makes the record shape
+    /// unit-testable without needing the real `claude`/`codex` binary on PATH.
+    fn build_new_tab(&self, name: &str, cwd: &Path, agent: Agent) -> Result<(Launch, TabRecord)> {
+        match agent {
             Agent::Claude => {
                 let account = DEFAULT_ACCOUNT.to_string();
                 let config_dir = self.accounts.ensure(&account)?;
                 let session_id = Uuid::new_v4();
                 let launch = claude_launch(session_id, false, None, Some(&config_dir));
                 let record = TabRecord {
-                    name: name.clone(),
-                    cwd: cwd.clone(),
+                    name: name.to_string(),
+                    cwd: cwd.to_path_buf(),
                     agent,
                     claude_session_id: Some(session_id),
                     claude_account: Some(account),
                     codex_used: false,
                 };
-                (launch, record)
+                Ok((launch, record))
             }
             Agent::Codex => {
                 let launch = codex_launch(false, None);
                 let record = TabRecord {
-                    name: name.clone(),
-                    cwd: cwd.clone(),
+                    name: name.to_string(),
+                    cwd: cwd.to_path_buf(),
                     agent,
                     claude_session_id: None,
                     claude_account: None,
                     codex_used: false,
                 };
-                (launch, record)
+                Ok((launch, record))
             }
-        };
+        }
+    }
+
+    pub fn new_tab(&mut self, name: String, cwd: PathBuf, agent: Agent) -> Result<()> {
+        let (launch, record) = self.build_new_tab(&name, &cwd, agent)?;
         let tab = Tab::spawn(cwd, launch, self.rows, self.cols)?;
         self.tabs.push(tab);
         self.records.push(record);
@@ -244,7 +252,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Launch;
     use tempfile::tempdir;
 
     fn sh_cat_launch() -> Launch {
@@ -331,14 +338,29 @@ mod tests {
         assert!(app.tabs.is_empty());
     }
 
+    // build_new_tab is pure (no pty spawn), so these don't need the real
+    // claude/codex binaries on PATH — unlike a full new_tab() call, which
+    // does, and would fail wherever those aren't installed (e.g. CI).
     #[test]
-    fn new_tab_with_codex_agent_persists_a_record() {
-        let (mut app, _tmp) = test_app();
-        app.new_tab("t".to_string(), std::env::temp_dir(), Agent::Codex)
-            .unwrap();
-        assert_eq!(app.tabs.len(), 1);
-        assert_eq!(app.records[0].agent, Agent::Codex);
-        assert!(!app.records[0].codex_used); // fresh launch, not a resume
-        assert!(app.store_path.exists());
+    fn build_new_tab_for_codex_has_no_claude_identity() {
+        let (app, _tmp) = test_app();
+        let cwd = std::env::temp_dir();
+        let (launch, record) = app.build_new_tab("t", &cwd, Agent::Codex).unwrap();
+        assert_eq!(launch.program, "codex");
+        assert_eq!(record.agent, Agent::Codex);
+        assert!(!record.codex_used); // fresh launch, not a resume
+        assert!(record.claude_session_id.is_none());
+        assert!(record.claude_account.is_none());
+    }
+
+    #[test]
+    fn build_new_tab_for_claude_pins_a_session_id() {
+        let (app, _tmp) = test_app();
+        let cwd = std::env::temp_dir();
+        let (launch, record) = app.build_new_tab("t", &cwd, Agent::Claude).unwrap();
+        assert_eq!(launch.program, "claude");
+        assert_eq!(record.agent, Agent::Claude);
+        assert!(record.claude_session_id.is_some());
+        assert_eq!(record.claude_account.as_deref(), Some(DEFAULT_ACCOUNT));
     }
 }
