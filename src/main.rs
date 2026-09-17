@@ -7,6 +7,7 @@ mod app;
 mod handoff;
 mod store;
 mod tab;
+mod ui;
 
 fn main() {
     println!("Hello, world!");
