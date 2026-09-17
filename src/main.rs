@@ -2,6 +2,7 @@
 
 mod account;
 mod agent;
+mod handoff;
 mod store;
 mod tab;
 
