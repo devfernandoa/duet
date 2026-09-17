@@ -1163,7 +1163,7 @@ Create `src/app.rs`:
 
 ```rust
 use crate::account::{AccountStore, DEFAULT_ACCOUNT};
-use crate::agent::{claude_launch, codex_launch, Agent, Launch};
+use crate::agent::{claude_launch, codex_launch, Agent};
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::store::{Store, TabRecord};
 use crate::tab::Tab;
@@ -1174,6 +1174,7 @@ use uuid::Uuid;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Launch;
     use tempfile::tempdir;
 
     fn sh_cat_launch() -> Launch {
