@@ -51,6 +51,7 @@ pub fn claude_launch(
         session_id.to_string(),
     ];
     if let Some(prompt) = initial_prompt {
+        args.push("--".to_string());
         args.push(prompt.to_string());
     }
     Launch {
@@ -67,6 +68,7 @@ pub fn codex_launch(resume: bool, initial_prompt: Option<&str>) -> Launch {
         args.push("--last".to_string());
     }
     if let Some(prompt) = initial_prompt {
+        args.push("--".to_string());
         args.push(prompt.to_string());
     }
     Launch {
@@ -128,7 +130,10 @@ mod tests {
     fn claude_launch_appends_initial_prompt() {
         let id = Uuid::nil();
         let launch = claude_launch(id, true, Some("hello"), None);
-        assert_eq!(launch.args, vec!["--resume", &id.to_string(), "hello"]);
+        assert_eq!(
+            launch.args,
+            vec!["--resume", &id.to_string(), "--", "hello"]
+        );
     }
 
     #[test]
@@ -149,13 +154,13 @@ mod tests {
     fn codex_fresh_launch_has_no_resume_flags() {
         let launch = codex_launch(false, Some("hi"));
         assert_eq!(launch.program, "codex");
-        assert_eq!(launch.args, vec!["hi"]);
+        assert_eq!(launch.args, vec!["--", "hi"]);
     }
 
     #[test]
     fn codex_resume_launch_uses_resume_last() {
         let launch = codex_launch(true, Some("hi"));
-        assert_eq!(launch.args, vec!["resume", "--last", "hi"]);
+        assert_eq!(launch.args, vec!["resume", "--last", "--", "hi"]);
     }
 
     #[test]

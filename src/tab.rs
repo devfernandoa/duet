@@ -1,9 +1,10 @@
-use crate::agent::{Agent, Launch};
+use crate::agent::Launch;
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
+use tui_term::vt100;
 
 pub struct Tab {
     pair: PtyPair,
@@ -15,14 +16,7 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn spawn(
-        _name: String,
-        cwd: PathBuf,
-        _agent: Agent,
-        launch: Launch,
-        rows: u16,
-        cols: u16,
-    ) -> anyhow::Result<Tab> {
+    pub fn spawn(cwd: PathBuf, launch: Launch, rows: u16, cols: u16) -> anyhow::Result<Tab> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -107,11 +101,16 @@ impl Tab {
     pub fn exit_status(&self) -> Option<&portable_pty::ExitStatus> {
         self.exit_status.as_ref()
     }
+
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
 }
 
 impl Drop for Tab {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -137,15 +136,7 @@ mod tests {
 
     #[test]
     fn spawn_reads_child_output_into_screen() {
-        let mut tab = Tab::spawn(
-            "t".to_string(),
-            std::env::temp_dir(),
-            Agent::Codex,
-            echo_hello(),
-            24,
-            80,
-        )
-        .unwrap();
+        let mut tab = Tab::spawn(std::env::temp_dir(), echo_hello(), 24, 80).unwrap();
 
         let mut seen = String::new();
         for _ in 0..50 {
@@ -164,30 +155,14 @@ mod tests {
 
     #[test]
     fn resize_updates_screen_dimensions() {
-        let mut tab = Tab::spawn(
-            "t".to_string(),
-            std::env::temp_dir(),
-            Agent::Codex,
-            sleeper(),
-            24,
-            80,
-        )
-        .unwrap();
+        let mut tab = Tab::spawn(std::env::temp_dir(), sleeper(), 24, 80).unwrap();
         tab.resize(30, 100).unwrap();
         assert_eq!(tab.screen().size(), (30, 100));
     }
 
     #[test]
     fn pull_output_detects_child_exit() {
-        let mut tab = Tab::spawn(
-            "t".to_string(),
-            std::env::temp_dir(),
-            Agent::Codex,
-            echo_hello(),
-            24,
-            80,
-        )
-        .unwrap();
+        let mut tab = Tab::spawn(std::env::temp_dir(), echo_hello(), 24, 80).unwrap();
         let mut status = None;
         for _ in 0..50 {
             tab.pull_output();
@@ -202,15 +177,7 @@ mod tests {
 
     #[test]
     fn exit_status_is_none_while_child_is_running() {
-        let mut tab = Tab::spawn(
-            "t".to_string(),
-            std::env::temp_dir(),
-            Agent::Codex,
-            sleeper(),
-            24,
-            80,
-        )
-        .unwrap();
+        let mut tab = Tab::spawn(std::env::temp_dir(), sleeper(), 24, 80).unwrap();
         tab.pull_output();
         assert!(tab.exit_status().is_none());
     }
@@ -222,14 +189,7 @@ mod tests {
             args: vec![],
             envs: vec![],
         };
-        let result = Tab::spawn(
-            "t".to_string(),
-            std::env::temp_dir(),
-            Agent::Codex,
-            launch,
-            24,
-            80,
-        );
+        let result = Tab::spawn(std::env::temp_dir(), launch, 24, 80);
         assert!(result.is_err());
     }
 }

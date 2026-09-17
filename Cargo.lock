@@ -353,7 +353,6 @@ dependencies = [
  "tempfile",
  "tui-term",
  "uuid",
- "vt100",
 ]
 
 [[package]]

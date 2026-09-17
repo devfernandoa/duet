@@ -62,7 +62,7 @@ impl App {
                 (launch, record)
             }
         };
-        let tab = Tab::spawn(name, cwd, agent, launch, self.rows, self.cols)?;
+        let tab = Tab::spawn(cwd, launch, self.rows, self.cols)?;
         self.tabs.push(tab);
         self.records.push(record);
         self.focused = self.tabs.len() - 1;
@@ -99,6 +99,11 @@ impl App {
         }
         let idx = self.focused;
         let record = self.records[idx].clone();
+
+        // Drop the outgoing pty before summarizing: the CLI's non-interactive
+        // summarize run needs sole ownership of the session id, which a still-live
+        // interactive process for the same session would collide with.
+        self.tabs[idx].kill();
 
         let summary = match record.agent {
             Agent::Claude => {
@@ -145,14 +150,7 @@ impl App {
         };
         updated.agent = to;
 
-        let new_tab = Tab::spawn(
-            record.name.clone(),
-            record.cwd.clone(),
-            to,
-            launch,
-            self.rows,
-            self.cols,
-        )?;
+        let new_tab = Tab::spawn(record.cwd.clone(), launch, self.rows, self.cols)?;
         self.tabs[idx] = new_tab;
         self.records[idx] = updated;
         self.persist()
@@ -170,6 +168,11 @@ impl App {
         if names.is_empty() {
             names.push(DEFAULT_ACCOUNT.to_string());
         }
+        if names.len() < 2 {
+            self.last_error =
+                Some("only one Claude account exists — nothing to switch to".to_string());
+            return Ok(());
+        }
         let current = self.records[idx]
             .claude_account
             .clone()
@@ -181,14 +184,7 @@ impl App {
         let session_id = Uuid::new_v4(); // a different account is a different identity: fresh session
         let launch = claude_launch(session_id, false, None, Some(&config_dir));
         let record = self.records[idx].clone();
-        let new_tab = Tab::spawn(
-            record.name.clone(),
-            record.cwd.clone(),
-            Agent::Claude,
-            launch,
-            self.rows,
-            self.cols,
-        )?;
+        let new_tab = Tab::spawn(record.cwd.clone(), launch, self.rows, self.cols)?;
         self.tabs[idx] = new_tab;
         self.records[idx].claude_account = Some(next_account);
         self.records[idx].claude_session_id = Some(session_id);
@@ -201,7 +197,7 @@ impl App {
         }
         let idx = self.focused;
         let record = self.records[idx].clone();
-        let launch = match record.agent {
+        let (launch, claude_session_id) = match record.agent {
             Agent::Claude => {
                 let config_dir = record
                     .claude_account
@@ -211,20 +207,29 @@ impl App {
                     Some(id) => (id, true),
                     None => (Uuid::new_v4(), false),
                 };
-                claude_launch(session_id, resume, None, config_dir.as_deref())
+                let launch = claude_launch(session_id, resume, None, config_dir.as_deref());
+                (launch, Some(session_id))
             }
-            Agent::Codex => codex_launch(record.codex_used, None),
+            Agent::Codex => (codex_launch(record.codex_used, None), None),
         };
-        let new_tab = Tab::spawn(
-            record.name.clone(),
-            record.cwd.clone(),
-            record.agent,
-            launch,
-            self.rows,
-            self.cols,
-        )?;
+        let new_tab = Tab::spawn(record.cwd.clone(), launch, self.rows, self.cols)?;
         self.tabs[idx] = new_tab;
-        Ok(())
+        // A freshly-minted session id must be written back, or the next restart
+        // would mint yet another one and orphan this session forever.
+        if let Some(session_id) = claude_session_id {
+            self.records[idx].claude_session_id = Some(session_id);
+        }
+        self.persist()
+    }
+
+    pub fn resize_all(&mut self, rows: u16, cols: u16) {
+        self.rows = rows;
+        self.cols = cols;
+        for tab in self.tabs.iter_mut() {
+            if let Err(e) = tab.resize(rows, cols) {
+                self.last_error = Some(e.to_string());
+            }
+        }
     }
 
     fn persist(&self) -> Result<()> {
@@ -263,15 +268,7 @@ mod tests {
 
     fn push_fake_tab(app: &mut App, name: &str) {
         let cwd = std::env::temp_dir();
-        let tab = Tab::spawn(
-            name.to_string(),
-            cwd.clone(),
-            Agent::Codex,
-            sh_cat_launch(),
-            24,
-            80,
-        )
-        .unwrap();
+        let tab = Tab::spawn(cwd.clone(), sh_cat_launch(), 24, 80).unwrap();
         let record = TabRecord {
             name: name.to_string(),
             cwd,

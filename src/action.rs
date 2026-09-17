@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     NewTab,
+    NewCodexTab,
     CloseTab,
     NextTab,
     PrevTab,
@@ -17,6 +18,7 @@ pub fn map_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('t') => return Action::NewTab,
+            KeyCode::Char('n') => return Action::NewCodexTab,
             KeyCode::Char('w') => return Action::CloseTab,
             KeyCode::Right => return Action::NextTab,
             KeyCode::Left => return Action::PrevTab,
@@ -61,6 +63,12 @@ mod tests {
     fn ctrl_t_maps_to_new_tab() {
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(map_key(key), Action::NewTab);
+    }
+
+    #[test]
+    fn ctrl_n_maps_to_new_codex_tab() {
+        let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(key), Action::NewCodexTab);
     }
 
     #[test]

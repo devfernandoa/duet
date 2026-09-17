@@ -13,6 +13,7 @@ use agent::Agent;
 use anyhow::Result;
 use app::App;
 use crossterm::event::{self, Event, KeyEventKind};
+use std::path::PathBuf;
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -36,11 +37,19 @@ fn main() -> Result<()> {
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+    // Draw once up front so the first frame isn't blank while waiting on the
+    // first tick or event.
+    terminal.draw(|frame| ui::draw(frame, app))?;
     loop {
+        let mut changed = false;
         for tab in app.tabs.iter_mut() {
-            tab.pull_output();
+            if tab.pull_output() {
+                changed = true;
+            }
         }
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        if changed {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
 
         if !event::poll(Duration::from_millis(33))? {
             continue;
@@ -51,17 +60,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if handle_action(app, map_key(key)) {
+                let quit = handle_action(app, map_key(key));
+                terminal.draw(|frame| ui::draw(frame, app))?;
+                if quit {
                     break;
                 }
             }
             Event::Resize(cols, rows) => {
-                let pty_rows = rows.saturating_sub(2);
-                for tab in app.tabs.iter_mut() {
-                    if let Err(e) = tab.resize(pty_rows, cols) {
-                        app.last_error = Some(e.to_string());
-                    }
-                }
+                app.resize_all(rows.saturating_sub(2), cols);
+                terminal.draw(|frame| ui::draw(frame, app))?;
             }
             _ => {}
         }
@@ -69,21 +76,45 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Default name/cwd for a newly created tab.
+fn new_tab_name_and_cwd(app: &App) -> std::io::Result<(String, PathBuf)> {
+    let name = format!("tab-{}", app.tabs.len() + 1);
+    let cwd = std::env::current_dir()?;
+    Ok((name, cwd))
+}
+
 /// Returns true if the app should quit.
 fn handle_action(app: &mut App, action: Action) -> bool {
     app.last_error = None;
     match action {
         Action::Quit => return true,
+        // Every tab is created in the current working directory. Codex's
+        // identity is `codex resume --last` filtered by cwd (not a stored
+        // session id — see `codex_used` on TabRecord), so more than one
+        // same-directory tab switched/created as Codex will resume and
+        // summarize each other's sessions. Claude tabs don't have this
+        // limitation: each gets its own pinned UUID.
         Action::NewTab => {
-            let name = format!("tab-{}", app.tabs.len() + 1);
-            let cwd = match std::env::current_dir() {
-                Ok(dir) => dir,
+            let (name, cwd) = match new_tab_name_and_cwd(app) {
+                Ok(v) => v,
                 Err(e) => {
                     app.last_error = Some(e.to_string());
                     return false;
                 }
             };
             if let Err(e) = app.new_tab(name, cwd, Agent::Claude) {
+                app.last_error = Some(e.to_string());
+            }
+        }
+        Action::NewCodexTab => {
+            let (name, cwd) = match new_tab_name_and_cwd(app) {
+                Ok(v) => v,
+                Err(e) => {
+                    app.last_error = Some(e.to_string());
+                    return false;
+                }
+            };
+            if let Err(e) = app.new_tab(name, cwd, Agent::Codex) {
                 app.last_error = Some(e.to_string());
             }
         }
