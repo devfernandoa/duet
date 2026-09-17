@@ -19,6 +19,10 @@ pub struct Store {
 }
 
 impl Store {
+    // Not yet called from `main` — restoring persisted tabs on startup is an
+    // explicitly deferred follow-up (see the plan's Follow-ups section).
+    // Exercised by the round-trip tests below.
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Store {
         match std::fs::read_to_string(path) {
             Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),

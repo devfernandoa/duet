@@ -2,13 +2,10 @@ use crate::agent::{Agent, Launch};
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 pub struct Tab {
-    pub name: String,
-    pub cwd: PathBuf,
-    pub agent: Agent,
     pair: PtyPair,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
@@ -19,9 +16,9 @@ pub struct Tab {
 
 impl Tab {
     pub fn spawn(
-        name: String,
+        _name: String,
         cwd: PathBuf,
-        agent: Agent,
+        _agent: Agent,
         launch: Launch,
         rows: u16,
         cols: u16,
@@ -64,9 +61,6 @@ impl Tab {
         let parser = vt100::Parser::new(rows, cols, 10_000);
 
         Ok(Tab {
-            name,
-            cwd,
-            agent,
             pair,
             child,
             writer,
@@ -93,20 +87,15 @@ impl Tab {
 
     pub fn pull_output(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            match self.output_rx.try_recv() {
-                Ok(chunk) => {
-                    self.parser.process(&chunk);
-                    changed = true;
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(chunk) = self.output_rx.try_recv() {
+            self.parser.process(&chunk);
+            changed = true;
         }
-        if self.exit_status.is_none() {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.exit_status = Some(status);
-                changed = true;
-            }
+        if self.exit_status.is_none()
+            && let Ok(Some(status)) = self.child.try_wait()
+        {
+            self.exit_status = Some(status);
+            changed = true;
         }
         changed
     }
