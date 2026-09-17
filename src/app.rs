@@ -1,5 +1,5 @@
 use crate::account::{AccountStore, DEFAULT_ACCOUNT};
-use crate::agent::{Agent, Launch, claude_launch, codex_launch};
+use crate::agent::{Agent, claude_launch, codex_launch};
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::store::{Store, TabRecord};
 use crate::tab::Tab;
@@ -239,6 +239,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Launch;
     use tempfile::tempdir;
 
     fn sh_cat_launch() -> Launch {
