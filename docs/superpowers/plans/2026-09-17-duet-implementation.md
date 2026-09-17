@@ -137,7 +137,7 @@ Add `mod agent;` to `src/main.rs`, keeping the default `fn main() { println!("He
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib agent:: -- --list` (or just `cargo build`)
+Run: `cargo build`
 Expected: FAIL to compile — `claude_launch`, `codex_launch`, `claude_summarize_launch`, `codex_summarize_launch`, `Launch`, `SUMMARY_PROMPT` are not defined.
 
 - [ ] **Step 3: Implement `agent.rs`**
@@ -247,7 +247,7 @@ pub fn codex_summarize_launch() -> Launch {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib agent::`
+Run: `cargo test agent::`
 Expected: PASS, all 10 tests green.
 
 - [ ] **Step 5: Commit**
@@ -330,7 +330,7 @@ Add `mod account;` to `src/main.rs`.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cargo test --lib account::`
+Run: `cargo test account::`
 Expected: FAIL to compile — `AccountStore` is not defined.
 
 - [ ] **Step 4: Implement `AccountStore`**
@@ -374,7 +374,7 @@ impl AccountStore {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test --lib account::`
+Run: `cargo test account::`
 Expected: PASS, all 4 tests green.
 
 - [ ] **Step 6: Commit**
@@ -464,7 +464,7 @@ Add `mod store;` to `src/main.rs`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib store::`
+Run: `cargo test store::`
 Expected: FAIL to compile — `TabRecord` and `Store` are not defined.
 
 - [ ] **Step 3: Implement `TabRecord`, `Store`, and the path helpers**
@@ -522,7 +522,7 @@ pub fn default_accounts_dir() -> anyhow::Result<PathBuf> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib store::`
+Run: `cargo test store::`
 Expected: PASS, all 4 tests green.
 
 - [ ] **Step 5: Commit**
@@ -672,7 +672,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib tab::`
+Run: `cargo test tab::`
 Expected: FAIL to compile — `Tab` is not defined.
 
 - [ ] **Step 3: Implement `Tab`**
@@ -806,7 +806,7 @@ Add `mod tab;` to `src/main.rs`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib tab::`
+Run: `cargo test tab::`
 Expected: PASS, all 6 tests green. (The output/exit tests poll for up to 1 second; they should pass well before that on any reasonable machine.)
 
 - [ ] **Step 5: Commit**
@@ -905,7 +905,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib handoff::`
+Run: `cargo test handoff::`
 Expected: FAIL to compile — `run_and_capture` is not defined.
 
 - [ ] **Step 3: Implement `run_and_capture` and the two summarize wrappers**
@@ -947,7 +947,7 @@ Add `mod handoff;` to `src/main.rs`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib handoff::`
+Run: `cargo test handoff::`
 Expected: PASS, all 5 tests green.
 
 - [ ] **Step 5: Commit**
@@ -1067,7 +1067,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib action::`
+Run: `cargo test action::`
 Expected: FAIL to compile — `Action` and `map_key` are not defined.
 
 - [ ] **Step 3: Implement `Action` and `map_key`**
@@ -1133,7 +1133,7 @@ Add `mod action;` to `src/main.rs`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib action::`
+Run: `cargo test action::`
 Expected: PASS, all 11 tests green.
 
 - [ ] **Step 5: Commit**
@@ -1274,7 +1274,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib app::`
+Run: `cargo test app::`
 Expected: FAIL to compile — `App` is not defined (and `store_path` is referenced in the last test before the field exists).
 
 - [ ] **Step 3: Implement `App`**
@@ -1479,7 +1479,7 @@ impl App {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib app::`
+Run: `cargo test app::`
 Expected: PASS, all 6 tests green.
 
 - [ ] **Step 5: Commit**
