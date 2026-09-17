@@ -27,6 +27,12 @@ best-effort way to hand a conversation off from one to the other.
   open the incoming agent with that summary as its opening prompt. This is
   a real handoff of a text summary, not shared context — Claude and Codex
   have no shared session store and never will.
+- Multiple Claude accounts (e.g. personal vs. work): each Claude tab is
+  bound to a named account, isolated via Claude Code's own
+  `CLAUDE_CONFIG_DIR` env var (verified empirically — pointing it at an
+  empty directory gives Claude a fully self-contained config/credentials/
+  projects store). Codex is untouched; this is scoped to Claude only
+  because that's the only one asked for.
 
 ## Non-goals
 
@@ -60,9 +66,17 @@ two agents.
   session"` / `codex exec resume <id> "..."`), capture stdout as the
   summary, then spawn the incoming agent with that summary as its initial
   prompt.
-- **`store.rs`** — tab records (name, cwd, claude_id, codex_id) persisted as
-  one JSON file under `$XDG_DATA_HOME/duet/tabs.json` (via the `dirs`
-  crate), loaded at startup.
+- **`store.rs`** — tab records (name, cwd, claude_id, codex_id,
+  claude_account) persisted as one JSON file under
+  `$XDG_DATA_HOME/duet/tabs.json` (via the `dirs` crate), loaded at startup.
+- **`account.rs`** — Claude account isolation. An account is a name mapped
+  to `$XDG_DATA_HOME/duet/accounts/<name>/`. The filesystem is the
+  registry: listing that directory *is* listing known accounts, no
+  separate index to keep in sync. Creating a tab's Claude side with a new
+  account name just `mkdir -p`s the directory; `duet` sets
+  `CLAUDE_CONFIG_DIR` to it before spawning `claude`, so the normal
+  `claude auth login` flow inside that pty populates it — no custom auth
+  UI needed. A tab remembers which account it last used for Claude.
 
 ## Data flow
 
@@ -87,6 +101,8 @@ Ponytail rule: non-trivial logic gets one runnable check, nothing more.
 - `agent.rs`: unit tests for argv construction (fresh vs. resume, both
   agents).
 - `store.rs`: unit test for JSON save/load round-trip via a temp file.
+- `account.rs`: unit test that the account name → directory mapping and
+  listing behave correctly against a temp directory.
 - No integration test that spawns a real pty/agent process — too heavy for
   a single-user personal tool, and YAGNI.
 
