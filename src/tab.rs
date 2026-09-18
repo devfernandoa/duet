@@ -17,6 +17,11 @@ pub struct Tab {
 
 impl Tab {
     pub fn spawn(cwd: PathBuf, launch: Launch, rows: u16, cols: u16) -> anyhow::Result<Tab> {
+        // A terminal may briefly report 0×0 during startup (notably when it
+        // is launched by a terminal multiplexer). vt100 cannot represent a
+        // zero-sized grid, and a single column cannot hold a wide character.
+        let rows = rows.max(1);
+        let cols = cols.max(2);
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -69,6 +74,8 @@ impl Tab {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
+        let rows = rows.max(1);
+        let cols = cols.max(2);
         self.pair.master.resize(PtySize {
             rows,
             cols,
@@ -158,6 +165,12 @@ mod tests {
         let mut tab = Tab::spawn(std::env::temp_dir(), sleeper(), 24, 80).unwrap();
         tab.resize(30, 100).unwrap();
         assert_eq!(tab.screen().size(), (30, 100));
+    }
+
+    #[test]
+    fn zero_sized_terminal_is_clamped_to_a_safe_screen() {
+        let tab = Tab::spawn(std::env::temp_dir(), sleeper(), 0, 0).unwrap();
+        assert_eq!(tab.screen().size(), (1, 2));
     }
 
     #[test]

@@ -7,11 +7,25 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlay {
+    /// Shown before the first session. Creating the profile gives Claude an
+    /// isolated config directory, where its normal login flow can run.
+    AccountSetup {
+        name: String,
+    },
+    NewSession {
+        agent: Agent,
+        account_index: usize,
+    },
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub records: Vec<TabRecord>,
     pub focused: usize,
     pub last_error: Option<String>,
+    pub overlay: Option<Overlay>,
     accounts: AccountStore,
     store_path: PathBuf,
     rows: u16,
@@ -25,11 +39,129 @@ impl App {
             records: Vec::new(),
             focused: 0,
             last_error: None,
+            overlay: None,
             accounts,
             store_path,
             rows,
             cols,
         }
+    }
+
+    /// Recreate the workspace from the last saved records. The underlying
+    /// agent CLIs own conversation history; Duet recreates their PTYs and
+    /// asks each CLI to resume its saved session.
+    pub fn restore(accounts: AccountStore, store_path: PathBuf, rows: u16, cols: u16) -> Self {
+        let saved = Store::load(&store_path);
+        let mut app = Self::new(accounts, store_path, rows, cols);
+        for mut record in saved.tabs {
+            let launch = match record.agent {
+                Agent::Claude => {
+                    let account = record
+                        .claude_account
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_ACCOUNT.to_string());
+                    let config_dir = match app.accounts.ensure(&account) {
+                        Ok(dir) => dir,
+                        Err(error) => {
+                            app.last_error =
+                                Some(format!("couldn't restore {}: {error}", record.name));
+                            continue;
+                        }
+                    };
+                    let id = record.claude_session_id.unwrap_or_else(Uuid::new_v4);
+                    let resume = record.claude_session_id.is_some();
+                    record.claude_session_id = Some(id);
+                    record.claude_account = Some(account);
+                    claude_launch(id, resume, None, Some(&config_dir))
+                }
+                // Codex presently exposes `--last` rather than a session id
+                // at creation time. This restores the CLI's latest session.
+                Agent::Codex => codex_launch(true, None),
+            };
+            match Tab::spawn(record.cwd.clone(), launch, rows, cols) {
+                Ok(tab) => {
+                    app.tabs.push(tab);
+                    app.records.push(record);
+                }
+                Err(error) => {
+                    app.last_error = Some(format!("couldn't restore {}: {error}", record.name))
+                }
+            }
+        }
+        if app
+            .accounts
+            .list()
+            .map(|names| names.is_empty())
+            .unwrap_or(true)
+        {
+            app.overlay = Some(Overlay::AccountSetup {
+                name: String::new(),
+            });
+        }
+        app
+    }
+
+    pub fn account_names(&self) -> Vec<String> {
+        self.accounts.list().unwrap_or_default()
+    }
+
+    pub fn open_new_session(&mut self) {
+        let names = self.account_names();
+        if names.is_empty() {
+            self.overlay = Some(Overlay::AccountSetup {
+                name: String::new(),
+            });
+        } else {
+            self.overlay = Some(Overlay::NewSession {
+                agent: Agent::Claude,
+                account_index: 0,
+            });
+        }
+    }
+
+    pub fn open_account_setup(&mut self) {
+        self.overlay = Some(Overlay::AccountSetup {
+            name: String::new(),
+        });
+    }
+
+    pub fn create_account(&mut self, requested_name: String) -> Result<()> {
+        let name = requested_name.trim();
+        if name.is_empty() {
+            anyhow::bail!("give the account a name (for example, personal or work)");
+        }
+        if name.contains('/') || name.contains('\0') {
+            anyhow::bail!("account names cannot contain a slash");
+        }
+        self.accounts.ensure(name)?;
+        self.overlay = Some(Overlay::NewSession {
+            agent: Agent::Claude,
+            account_index: 0,
+        });
+        Ok(())
+    }
+
+    pub fn create_selected_session(&mut self, cwd: PathBuf) -> Result<()> {
+        let Some(Overlay::NewSession {
+            agent,
+            account_index,
+        }) = self.overlay.clone()
+        else {
+            return Ok(());
+        };
+        let names = self.account_names();
+        let name = format!("session-{}", self.tabs.len() + 1);
+        match agent {
+            Agent::Claude => {
+                let account = names
+                    .get(account_index)
+                    .context("no Claude account selected")?;
+                self.new_claude_tab(name, cwd, account.clone())?;
+            }
+            Agent::Codex => self.new_tab(name, cwd, Agent::Codex)?,
+        }
+        self.overlay = None;
+        Ok(())
     }
 
     /// Builds the argv and the record for a brand-new tab, without spawning
@@ -70,6 +202,25 @@ impl App {
 
     pub fn new_tab(&mut self, name: String, cwd: PathBuf, agent: Agent) -> Result<()> {
         let (launch, record) = self.build_new_tab(&name, &cwd, agent)?;
+        let tab = Tab::spawn(cwd, launch, self.rows, self.cols)?;
+        self.tabs.push(tab);
+        self.records.push(record);
+        self.focused = self.tabs.len() - 1;
+        self.persist()
+    }
+
+    pub fn new_claude_tab(&mut self, name: String, cwd: PathBuf, account: String) -> Result<()> {
+        let config_dir = self.accounts.ensure(&account)?;
+        let session_id = Uuid::new_v4();
+        let launch = claude_launch(session_id, false, None, Some(&config_dir));
+        let record = TabRecord {
+            name,
+            cwd: cwd.clone(),
+            agent: Agent::Claude,
+            claude_session_id: Some(session_id),
+            claude_account: Some(account),
+            codex_used: false,
+        };
         let tab = Tab::spawn(cwd, launch, self.rows, self.cols)?;
         self.tabs.push(tab);
         self.records.push(record);

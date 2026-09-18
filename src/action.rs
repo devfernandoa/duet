@@ -2,13 +2,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    NewTab,
-    NewCodexTab,
+    OpenNewSession,
     CloseTab,
     NextTab,
     PrevTab,
     SwitchAgent,
     SwitchAccount,
+    AddAccount,
     RestartTab,
     Quit,
     Forward(Vec<u8>),
@@ -17,13 +17,13 @@ pub enum Action {
 pub fn map_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('t') => return Action::NewTab,
-            KeyCode::Char('n') => return Action::NewCodexTab,
+            KeyCode::Char('t') | KeyCode::Char('n') => return Action::OpenNewSession,
             KeyCode::Char('w') => return Action::CloseTab,
             KeyCode::Right => return Action::NextTab,
             KeyCode::Left => return Action::PrevTab,
             KeyCode::Char('a') => return Action::SwitchAgent,
             KeyCode::Char('g') => return Action::SwitchAccount,
+            KeyCode::Char('o') => return Action::AddAccount,
             KeyCode::Char('r') => return Action::RestartTab,
             KeyCode::Char('q') => return Action::Quit,
             _ => {}
@@ -62,13 +62,13 @@ mod tests {
     #[test]
     fn ctrl_t_maps_to_new_tab() {
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(key), Action::NewTab);
+        assert_eq!(map_key(key), Action::OpenNewSession);
     }
 
     #[test]
     fn ctrl_n_maps_to_new_codex_tab() {
         let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(key), Action::NewCodexTab);
+        assert_eq!(map_key(key), Action::OpenNewSession);
     }
 
     #[test]
@@ -99,6 +99,12 @@ mod tests {
     fn ctrl_g_maps_to_switch_account() {
         let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(map_key(key), Action::SwitchAccount);
+    }
+
+    #[test]
+    fn ctrl_o_maps_to_add_account() {
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(key), Action::AddAccount);
     }
 
     #[test]
