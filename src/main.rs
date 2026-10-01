@@ -1,6 +1,7 @@
 mod account;
 mod agent;
 mod app;
+mod canvas;
 mod handoff;
 mod session;
 mod store;
