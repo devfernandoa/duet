@@ -3,6 +3,7 @@ mod agent;
 mod app;
 mod canvas;
 mod handoff;
+mod link;
 mod node;
 mod session;
 mod store;
@@ -36,6 +37,22 @@ fn build_ui(application: &adw::Application) {
         eprintln!("duet: {error}"); // Task 11 replaces this with an adw::Toast
     }
 
+    app.borrow().canvas.set_link_lines_source({
+        let app = app.clone();
+        move || {
+            let app_ref = app.borrow();
+            app_ref
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let source = app_ref.sessions.get(&link.source)?;
+                    let target = app_ref.sessions.get(&link.target)?;
+                    Some((source.record.position, target.record.position))
+                })
+                .collect()
+        }
+    });
+
     let window = adw::ApplicationWindow::builder()
         .application(application)
         .title("duet")
@@ -47,6 +64,7 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         move || {
             app.borrow_mut().pump_output();
+            app.borrow().canvas.drawing_area.queue_draw();
             glib::ControlFlow::Continue
         }
     });

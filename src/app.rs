@@ -3,7 +3,7 @@ use crate::agent::{Agent, Launch, claude_launch, codex_launch};
 use crate::canvas::Canvas;
 use crate::node::{NoteNode, SessionNode};
 use crate::session::Session;
-use crate::store::{SessionRecord, StickyNoteRecord, Store};
+use crate::store::{LinkRecord, SessionRecord, StickyNoteRecord, Store};
 use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
@@ -36,6 +36,10 @@ pub struct App {
     pub canvas: Canvas,
     pub sessions: HashMap<Uuid, SessionEntry>,
     pub notes: HashMap<Uuid, NoteEntry>,
+    pub links: Vec<LinkRecord>,
+    /// Set while the user has clicked a node's link button and is waiting to
+    /// click a target node to complete the link. `None` otherwise.
+    pub pending_link_source: Option<Uuid>,
     /// The debounce timer for `schedule_persist`, if a save is currently
     /// pending. `None` when no save is scheduled.
     pending_save: Option<glib::SourceId>,
@@ -49,6 +53,8 @@ impl App {
             canvas: Canvas::new(),
             sessions: HashMap::new(),
             notes: HashMap::new(),
+            links: Vec::new(),
+            pending_link_source: None,
             pending_save: None,
         }))
     }
@@ -134,6 +140,7 @@ impl App {
                             }
                         }
                     });
+                    wire_link_controls(app, &node, id);
                     app.borrow_mut().sessions.insert(
                         id,
                         SessionEntry {
@@ -146,6 +153,8 @@ impl App {
                 Err(error) => errors.push(format!("couldn't restore {}: {error}", record.name)),
             }
         }
+
+        app.borrow_mut().links = saved.links;
 
         for note_record in saved.notes {
             let node = NoteNode::new(&note_record.text, &note_record.color);
@@ -180,7 +189,7 @@ impl App {
                 .map(|entry| entry.record.clone())
                 .collect(),
             notes: self.notes.values().map(|entry| entry.record.clone()).collect(),
-            links: Vec::new(), // populated starting in Task 10
+            links: self.links.clone(),
             canvas: crate::store::CanvasRecord {
                 zoom: state.zoom,
                 pan: state.pan,
@@ -189,12 +198,41 @@ impl App {
         store.save(&self.store_path)
     }
 
-    /// Drains every session's PTY output into its own terminal node. Called
-    /// on a timer from `main.rs`.
+    /// Drains every session's PTY output into its own terminal node, then
+    /// forwards each session's chunks to any linked target sessions' input.
+    /// Called on a timer from `main.rs`.
+    ///
+    /// Output draining and forwarding are two separate passes: the first
+    /// collects `(source_id, chunks)` while holding a mutable borrow of
+    /// `self.sessions` via `iter_mut`; the second looks up target sessions
+    /// by id to forward into. Doing the forward inline inside the first loop
+    /// would require a second mutable borrow of the same `HashMap` while the
+    /// first is still live, which the borrow checker rejects.
     pub fn pump_output(&mut self) {
-        for entry in self.sessions.values_mut() {
-            for chunk in entry.session.try_recv_output() {
-                entry.node.feed(&chunk);
+        let mut outgoing: Vec<(Uuid, Vec<Vec<u8>>)> = Vec::new();
+        for (&id, entry) in self.sessions.iter_mut() {
+            let chunks = entry.session.try_recv_output();
+            for chunk in &chunks {
+                entry.node.feed(chunk);
+            }
+            if !chunks.is_empty() {
+                outgoing.push((id, chunks));
+            }
+        }
+        for (source_id, chunks) in outgoing {
+            let targets: Vec<Uuid> = self
+                .links
+                .iter()
+                .filter(|l| l.source == source_id)
+                .map(|l| l.target)
+                .collect();
+            for target_id in targets {
+                if let Some(target_entry) = self.sessions.get_mut(&target_id) {
+                    let _ = crate::link::forward(&chunks, &mut target_entry.session);
+                } else {
+                    // Target session is gone; drop the dangling link.
+                    self.links.retain(|l| l.target != target_id);
+                }
             }
         }
     }
@@ -250,6 +288,7 @@ impl App {
                 }
             }
         });
+        wire_link_controls(app, &node, id);
         app.borrow_mut().sessions.insert(
             id,
             SessionEntry {
@@ -292,6 +331,60 @@ impl App {
         app.borrow_mut().notes.insert(id, NoteEntry { record, node });
         let _ = app.borrow().persist();
     }
+
+    /// Records a link so `pump_output` starts forwarding `source`'s output
+    /// into `target`'s input. A no-op if the link already exists or
+    /// `source == target` (linking a session to itself would feed its own
+    /// output back into its own input).
+    pub fn create_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) {
+        let mut app = app.borrow_mut();
+        if source != target && !app.links.iter().any(|l| l.source == source && l.target == target) {
+            app.links.push(LinkRecord { source, target });
+            let _ = app.persist();
+        }
+    }
+
+    pub fn remove_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) {
+        let mut app = app.borrow_mut();
+        app.links.retain(|l| !(l.source == source && l.target == target));
+        let _ = app.persist();
+    }
+
+    /// Enters "link mode" for `source`: the next node clicked (via
+    /// `complete_link_if_pending`) becomes the link's target.
+    pub fn start_link(app: &Rc<RefCell<App>>, source: Uuid) {
+        app.borrow_mut().pending_link_source = Some(source);
+    }
+
+    /// If a link is pending (from `start_link`), completes it with `target`
+    /// and clears the pending state — clearing happens unconditionally via
+    /// `take()` so a later unrelated click never accidentally creates a link.
+    pub fn complete_link_if_pending(app: &Rc<RefCell<App>>, target: Uuid) {
+        let pending = app.borrow_mut().pending_link_source.take();
+        if let Some(source) = pending {
+            App::create_link(app, source, target);
+        }
+    }
+}
+
+/// Wires a session node's link button (click to enter link mode, sourced
+/// from this node) and its container (click to complete a pending link,
+/// targeting this node). Shared by `restore` and `create_session` so both
+/// paths of session creation get link support.
+fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
+    node.link_button.connect_clicked({
+        let app = Rc::clone(app);
+        move |_| App::start_link(&app, id)
+    });
+
+    let click = gtk4::GestureClick::new();
+    click.connect_pressed({
+        let app = Rc::clone(app);
+        move |_gesture, _n_press, _x, _y| {
+            App::complete_link_if_pending(&app, id);
+        }
+    });
+    node.container.add_controller(click);
 }
 
 fn build_launch_and_record(

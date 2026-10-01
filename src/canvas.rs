@@ -146,6 +146,29 @@ impl Canvas {
         self.fixed.remove(child);
         self.nodes.borrow_mut().retain(|(w, _)| w != child.as_ref());
     }
+
+    /// Registers the draw callback that renders link lines between linked
+    /// nodes. `anchors` is called on every draw and returns each link's
+    /// endpoints as world-space `(from, to)` positions, converted here to
+    /// screen space before stroking.
+    pub fn set_link_lines_source(
+        &self,
+        anchors: impl Fn() -> Vec<((f64, f64), (f64, f64))> + 'static,
+    ) {
+        let state = Rc::clone(&self.state);
+        self.drawing_area.set_draw_func(move |_area, cairo_ctx, _w, _h| {
+            let state = state.borrow();
+            cairo_ctx.set_source_rgb(0.4, 0.6, 1.0);
+            cairo_ctx.set_line_width(2.0);
+            for (from_world, to_world) in anchors() {
+                let from = world_to_screen(from_world, state.pan, state.zoom);
+                let to = world_to_screen(to_world, state.pan, state.zoom);
+                cairo_ctx.move_to(from.0, from.1);
+                cairo_ctx.line_to(to.0, to.1);
+                let _ = cairo_ctx.stroke();
+            }
+        });
+    }
 }
 
 fn apply_transform(

@@ -10,6 +10,7 @@ pub struct SessionNode {
     pub container: gtk4::Box,
     pub title_bar: gtk4::Box,
     pub terminal: vte4::Terminal,
+    pub link_button: gtk4::Button,
 }
 
 impl SessionNode {
@@ -17,8 +18,11 @@ impl SessionNode {
         let title = gtk4::Label::new(Some(name));
         title.add_css_class("heading");
 
+        let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
+
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.append(&title);
+        title_bar.append(&link_button);
 
         let terminal = vte4::Terminal::new();
         terminal.set_size_request(480, 320);
@@ -32,6 +36,7 @@ impl SessionNode {
             container,
             title_bar,
             terminal,
+            link_button,
         }
     }
 
