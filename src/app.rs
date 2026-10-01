@@ -134,9 +134,14 @@ impl App {
                 }
             };
             match Session::spawn(record.cwd.clone(), launch) {
-                Ok(session) => {
+                Ok(mut session) => {
                     let node = SessionNode::new(&record.name);
-                    node.terminal.set_size_request(record.size.0 as i32, record.size.1 as i32);
+                    // Apply the saved size to the terminal's character grid
+                    // *and* to the PTY, so the restored program wraps its
+                    // output at the same column count VTE renders.
+                    if let Some((cols, rows)) = node.resize_grid(record.size.0, record.size.1) {
+                        let _ = session.resize(rows, cols);
+                    }
                     let id = record.id;
                     {
                         let app_ref = app.borrow();
@@ -293,8 +298,13 @@ impl App {
                 viewport_center_world,
             )?
         };
-        let session = Session::spawn(cwd, launch)?;
+        let mut session = Session::spawn(cwd, launch)?;
         let node = SessionNode::new(&name);
+        // Same as `restore`: the stored size is the single source of truth for
+        // both the VTE grid and the PTY size.
+        if let Some((cols, rows)) = node.resize_grid(record.size.0, record.size.1) {
+            let _ = session.resize(rows, cols);
+        }
         let id = record.id;
         {
             let app_ref = app.borrow();
@@ -365,7 +375,9 @@ impl App {
     /// `close_session` itself; this is a second, independent guard so
     /// `create_link` can never persist a link to a session id that doesn't
     /// exist, regardless of what let it get called that way).
-    pub fn create_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) {
+    /// Returns whether a new link was actually recorded, so the caller can
+    /// tell the user something happened (see `complete_link_if_pending`).
+    pub fn create_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
         let mut app = app.borrow_mut();
         if source != target
             && app.sessions.contains_key(&source)
@@ -374,6 +386,26 @@ impl App {
         {
             app.links.push(LinkRecord { source, target });
             let _ = app.persist();
+            return true;
+        }
+        false
+    }
+
+    /// Puts the `link-source` CSS class on exactly the card named by
+    /// `pending_link_source`, and on no other. Link mode previously had *no*
+    /// observable effect whatsoever — `start_link` only wrote a field — so
+    /// clicking the link button genuinely looked like it did nothing.
+    ///
+    /// Written as a full sweep rather than an add-here/remove-there pair so a
+    /// highlight can never be left behind on a card whose pending link was
+    /// cleared by some other path (`close_session`, a completed link).
+    fn refresh_link_highlight(&self) {
+        for (&id, entry) in &self.sessions {
+            if self.pending_link_source == Some(id) {
+                entry.node.container.add_css_class("link-source");
+            } else {
+                entry.node.container.remove_css_class("link-source");
+            }
         }
     }
 
@@ -387,16 +419,33 @@ impl App {
     /// `complete_link_if_pending`) becomes the link's target.
     pub fn start_link(app: &Rc<RefCell<App>>, source: Uuid) {
         app.borrow_mut().pending_link_source = Some(source);
+        app.borrow().refresh_link_highlight();
     }
 
     /// If a link is pending (from `start_link`), completes it with `target`
     /// and clears the pending state — clearing happens unconditionally via
     /// `take()` so a later unrelated click never accidentally creates a link.
-    pub fn complete_link_if_pending(app: &Rc<RefCell<App>>, target: Uuid) {
-        let pending = app.borrow_mut().pending_link_source.take();
-        if let Some(source) = pending {
-            App::create_link(app, source, target);
+    ///
+    /// Returns a description of the link that was created, for the caller to
+    /// surface as a toast. Completing a link otherwise has no visible effect
+    /// at all (nothing in the UI draws `links`), so without this the second
+    /// half of linking looked just as dead as the first.
+    pub fn complete_link_if_pending(app: &Rc<RefCell<App>>, target: Uuid) -> Option<String> {
+        let source = app.borrow_mut().pending_link_source.take()?;
+        let created = App::create_link(app, source, target);
+        let app_ref = app.borrow();
+        app_ref.refresh_link_highlight();
+        if !created {
+            return None;
         }
+        let name = |id: Uuid| {
+            app_ref
+                .sessions
+                .get(&id)
+                .map(|entry| entry.record.name.clone())
+                .unwrap_or_default()
+        };
+        Some(format!("linked {} -> {}", name(source), name(target)))
     }
 
     /// Hands a session off from its current agent to the other one: kills
@@ -520,6 +569,7 @@ impl App {
             if app_mut.pending_link_source == Some(id) {
                 app_mut.pending_link_source = None;
             }
+            app_mut.refresh_link_highlight();
         }
         let _ = app.borrow().persist();
     }
@@ -690,7 +740,6 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     });
     resize.connect_drag_update({
         let app = Rc::clone(app);
-        let terminal = node.terminal.clone();
         let resize_start = Rc::clone(&resize_start);
         move |gesture, _offset_x, _offset_y| {
             let Some((start_size, start_pointer)) = *resize_start.borrow() else {
@@ -707,9 +756,24 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
                     None => return,
                 }
             };
-            terminal.set_size_request(new_size.0 as i32, new_size.1 as i32);
-            if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
-                entry.record.size = new_size;
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.sessions.get_mut(&id) else {
+                return;
+            };
+            entry.record.size = new_size;
+            // Resizing a terminal card means resizing *two* things, not one:
+            // VTE's character grid and the PTY behind it. The old code only
+            // called `set_size_request` on the terminal widget, which (a) is
+            // merely a minimum, so it could never shrink the card below VTE's
+            // natural size, and (b) never told the PTY anything — so the
+            // program inside kept wrapping at the 80 columns `Session::spawn`
+            // opened with while VTE rendered a different grid. That is what
+            // garbled the text. `resize_grid` returns `None` when the grid
+            // hasn't actually changed, which keeps this off the hot path for
+            // sub-character pointer movement instead of firing a `SIGWINCH`
+            // at the agent on every motion event.
+            if let Some((cols, rows)) = entry.node.resize_grid(new_size.0, new_size.1) {
+                let _ = entry.session.resize(rows, cols);
             }
         }
     });
@@ -849,7 +913,13 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
 fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid, toast_overlay: &adw::ToastOverlay) {
     node.link_button.connect_clicked({
         let app = Rc::clone(app);
-        move |_| App::start_link(&app, id)
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            App::start_link(&app, id);
+            toast_overlay.add_toast(adw::Toast::new(
+                "link mode: click another session's terminal to send this one's output into it",
+            ));
+        }
     });
 
     // `switch_agent` kills the old process as its first, unconditional step,
@@ -870,8 +940,11 @@ fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid, toas
     let click = gtk4::GestureClick::new();
     click.connect_pressed({
         let app = Rc::clone(app);
+        let toast_overlay = toast_overlay.clone();
         move |_gesture, _n_press, _x, _y| {
-            App::complete_link_if_pending(&app, id);
+            if let Some(message) = App::complete_link_if_pending(&app, id) {
+                toast_overlay.add_toast(adw::Toast::new(&message));
+            }
         }
     });
     node.terminal.add_controller(click);
@@ -899,7 +972,7 @@ fn build_launch_and_record(
                 claude_session_id: Some(session_id),
                 claude_account: Some(account),
                 position,
-                size: (480.0, 320.0),
+                size: (720.0, 504.0),
             };
             Ok((launch, record))
         }
@@ -913,7 +986,7 @@ fn build_launch_and_record(
                 claude_session_id: None,
                 claude_account: None,
                 position,
-                size: (480.0, 320.0),
+                size: (720.0, 504.0),
             };
             Ok((launch, record))
         }

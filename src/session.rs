@@ -212,6 +212,35 @@ mod tests {
         assert!(session.exit_status().is_none());
     }
 
+    /// The point of `resize` is that the *child* learns its new size — a PTY
+    /// whose size disagrees with what the terminal widget renders is what
+    /// garbles a resized session card. `stty size` asks the kernel for the
+    /// slave side's window size, so this fails if `resize` ever stops
+    /// reaching the child.
+    #[test]
+    fn resize_is_visible_to_the_child_process() {
+        let launch = Launch {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 0.5; stty size".to_string()],
+            envs: vec![],
+        };
+        let mut session = Session::spawn(std::env::temp_dir(), launch).unwrap();
+        session.resize(40, 100).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        for _ in 0..200 {
+            out.extend(session.try_recv_output().into_iter().flatten());
+            if String::from_utf8_lossy(&out).contains('\n') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let reported = String::from_utf8_lossy(&out);
+        assert!(
+            reported.contains("40 100"),
+            "child should see 40 rows x 100 cols, got {reported:?}"
+        );
+    }
+
     #[test]
     fn spawn_with_missing_binary_errors() {
         let launch = Launch {

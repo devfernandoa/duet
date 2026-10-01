@@ -47,3 +47,9 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 
 .resize-handle { background-color: rgba(0, 0, 0, 0.18); border-radius: 3px; margin: 2px; }
 .resize-handle:hover { background-color: rgba(0, 0, 0, 0.32); }
+
+/* The card whose link button was clicked, while it waits for a target click
+   (`App::refresh_link_highlight`). Link mode is otherwise entirely invisible,
+   which is why clicking the chain icon looked like a no-op. `outline` rather
+   than `border` so the highlight doesn't reflow the card's contents. */
+.card.link-source { outline: 2px solid #3584e4; outline-offset: -2px; }

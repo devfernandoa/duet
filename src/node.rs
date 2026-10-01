@@ -11,6 +11,24 @@ use vte4::TerminalExt;
 pub const MIN_NODE_WIDTH: f64 = 220.0;
 pub const MIN_NODE_HEIGHT: f64 = 140.0;
 
+/// Pixel size -> terminal character grid, clamped to what a PTY accepts
+/// (`Session::resize` floors at 2 columns / 1 row). Split out from
+/// `SessionNode::resize_grid` so the arithmetic is testable without a GTK
+/// display. `None` when the cell size is non-positive, which would otherwise
+/// turn a pixel width straight into an absurd column count.
+fn grid_size(width: f64, height: f64, char_width: i64, char_height: i64) -> Option<(u16, u16)> {
+    if char_width <= 0 || char_height <= 0 || !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+    let fit = |pixels: f64, cell: i64, floor: f64| {
+        (pixels / cell as f64).floor().clamp(floor, u16::MAX as f64) as u16
+    };
+    Some((
+        fit(width, char_width, 2.0),
+        fit(height, char_height, 1.0),
+    ))
+}
+
 /// Builds the small bottom-right resize grip shared by `SessionNode` and
 /// `NoteNode`: a plain `Box` overlaid on the node's content widget. Callers
 /// wire a `GestureDrag` onto it (in `app.rs`, which owns canvas/position
@@ -70,8 +88,13 @@ impl SessionNode {
         title_bar.append(&handoff_button);
         title_bar.append(&close_button);
 
+        // Deliberately no `set_size_request` here: a VTE terminal's size is
+        // its character grid, and `set_size_request` only raises the widget's
+        // *minimum*. VTE's natural size (80x24 grid = 722x506px at a 9x21
+        // cell) stayed larger than any request under ~722x506, so `GtkFixed`
+        // kept allocating the natural size and the request had no effect at
+        // all. Callers size the terminal through `resize_grid` instead.
         let terminal = vte4::Terminal::new();
-        terminal.set_size_request(480, 320);
 
         let resize_handle = resize_handle();
         let body = gtk4::Overlay::new();
@@ -94,6 +117,39 @@ impl SessionNode {
             close_button,
             resize_handle,
         }
+    }
+
+    /// Resizes the terminal to the largest character grid that fits
+    /// `width` x `height` pixels, and reports the new grid so the caller can
+    /// resize the PTY to match via `Session::resize`.
+    ///
+    /// Why the grid and not pixels: a `vte4::Terminal` renders a fixed
+    /// character grid, and *two* separate things have to be told about a
+    /// resize. VTE recomputes its own grid from whatever allocation it gets,
+    /// but the PTY it is displaying does not — it keeps whatever size
+    /// `Session::spawn` opened it with (80x24), so the program inside keeps
+    /// wrapping its output at 80 columns while VTE renders a wider grid.
+    /// That mismatch is what garbled the text on resize.
+    ///
+    /// Returns `None` when the grid is already that size (so the caller skips
+    /// a redundant PTY resize — this also throttles `SIGWINCH` during a drag
+    /// to once per character cell crossed, rather than once per motion
+    /// event), or when VTE reports a non-positive cell size and the
+    /// conversion would be meaningless.
+    pub fn resize_grid(&self, width: f64, height: f64) -> Option<(u16, u16)> {
+        let (cols, rows) = grid_size(
+            width,
+            height,
+            self.terminal.char_width(),
+            self.terminal.char_height(),
+        )?;
+        if (i64::from(cols), i64::from(rows))
+            == (self.terminal.column_count(), self.terminal.row_count())
+        {
+            return None;
+        }
+        self.terminal.set_size(i64::from(cols), i64::from(rows));
+        Some((cols, rows))
     }
 
     pub fn feed(&self, bytes: &[u8]) {
@@ -177,3 +233,29 @@ impl NoteNode {
             .to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::grid_size;
+
+    #[test]
+    fn grid_size_floors_to_whole_cells() {
+        // 9x21 is VTE's cell size at this app's default font.
+        assert_eq!(grid_size(722.0, 506.0, 9, 21), Some((80, 24)));
+        // A partial trailing cell is dropped, never rounded up: a column the
+        // PTY reports but VTE cannot fully draw is what misaligns the text.
+        assert_eq!(grid_size(728.0, 524.0, 9, 21), Some((80, 24)));
+    }
+
+    #[test]
+    fn grid_size_clamps_to_what_a_pty_accepts() {
+        assert_eq!(grid_size(0.0, 0.0, 9, 21), Some((2, 1)));
+    }
+
+    #[test]
+    fn grid_size_rejects_unusable_cell_metrics() {
+        assert_eq!(grid_size(722.0, 506.0, 0, 21), None);
+        assert_eq!(grid_size(f64::NAN, 506.0, 9, 21), None);
+    }
+}
+
