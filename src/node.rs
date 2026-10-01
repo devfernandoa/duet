@@ -142,12 +142,12 @@ impl NoteNode {
         text_view.set_bottom_margin(8);
         text_view.set_left_margin(8);
         text_view.set_right_margin(8);
-        // Forces dark, legible text regardless of the system theme (see the
-        // `.note-text`/`textview.note-text text` CSS rules in main.rs) — a
+        // Forces dark, legible text regardless of the system theme. See the
+        // `textview.note-text` rule in style.css for why the `color` has to
+        // sit on this node rather than on the text view's internal `text`
+        // node. The pastel background is set on both nodes, since a
         // GtkTextView otherwise paints its own theme-default background over
-        // whatever color the card behind it sets, which is what made notes
-        // unreadable before this (a plain background-color on `container`
-        // was entirely hidden by the text view's own opaque background).
+        // whatever color the card behind it sets.
         text_view.add_css_class("note-text");
 
         let resize_handle = resize_handle();

@@ -66,36 +66,7 @@ fn build_ui(application: &adw::Application) {
     });
 
     let css = gtk4::CssProvider::new();
-    css.load_from_data(
-        ".note-yellow { background-color: #fff3a0; } \
-         .note-blue { background-color: #cfe8ff; } \
-         .note-green { background-color: #d7f5d0; } \
-         /* GtkTextView paints its own theme background by default, which \
-            otherwise hides the pastel `.note-*` tint entirely and, in dark \
-            mode, renders light text on a dark box regardless of the note's \
-            color. A GTK CSS selector that matches zero nodes produces no \
-            warning (only a syntax error would), so rather than relying on \
-            `background-color: transparent` to let the parent's tint show \
-            through underneath — which assumes a specific paint order this \
-            can't easily confirm without a live run — each note color is set \
-            explicitly, redundantly, on both the `textview` node and its \
-            internal `text` node. Whichever one actually paints the visible \
-            background in this GTK4/libadwaita version, it now paints the \
-            right color directly, instead of depending on transparency. */ \
-         .note-yellow textview, .note-yellow textview text { background-color: #fff3a0; } \
-         .note-blue textview, .note-blue textview text { background-color: #cfe8ff; } \
-         .note-green textview, .note-green textview text { background-color: #d7f5d0; } \
-         textview.note-text text { color: #262626; caret-color: #262626; } \
-         .node-title-bar { padding: 2px 4px; } \
-         /* Tinted to a slightly darker shade of the note's own color rather \
-            than a flat dark overlay, so the title bar reads as part of the \
-            same card instead of a mismatched dark band on a bright note. */ \
-         .note-yellow .note-title-bar { background-color: #f2e48f; min-height: 20px; } \
-         .note-blue .note-title-bar { background-color: #b9dcf2; min-height: 20px; } \
-         .note-green .note-title-bar { background-color: #c4ecba; min-height: 20px; } \
-         .resize-handle { background-color: rgba(0, 0, 0, 0.18); border-radius: 3px; margin: 2px; } \
-         .resize-handle:hover { background-color: rgba(0, 0, 0, 0.32); }",
-    );
+    css.load_from_data(include_str!("style.css"));
     gtk4::style_context_add_provider_for_display(
         &gtk4::prelude::WidgetExt::display(&window),
         &css,

@@ -537,16 +537,60 @@ impl App {
     }
 }
 
-/// Converts a screen-space drag offset (as reported by a `GestureDrag`'s
-/// `drag-update`, relative to the drag's start point) into an absolute
-/// world-space value, given the value's world-space value at drag start and
-/// the canvas's current zoom. Shared by the move and resize handlers below —
-/// moving is "world position at drag start, plus a zoom-scaled offset" and
-/// resizing is "world size at drag start, plus a zoom-scaled offset"; both
-/// are the same formula `Canvas`'s own pan handler already uses (screen
-/// deltas must be divided by zoom to stay in world units).
-fn drag_delta_to_world(start: (f64, f64), offset_screen: (f64, f64), zoom: f64) -> (f64, f64) {
-    (start.0 + offset_screen.0 / zoom, start.1 + offset_screen.1 / zoom)
+/// Expresses `local` — a point in the coordinate space of the widget
+/// `gesture` is attached to — in the canvas `Fixed`'s coordinate space.
+fn canvas_point(
+    gesture: &gtk4::GestureDrag,
+    fixed: &gtk4::Fixed,
+    local: (f64, f64),
+) -> Option<(f64, f64)> {
+    let widget = gesture.widget()?;
+    widget
+        .compute_point(
+            fixed,
+            &gtk4::graphene::Point::new(local.0 as f32, local.1 as f32),
+        )
+        .map(|point| (point.x() as f64, point.y() as f64))
+}
+
+/// How far the pointer has moved, in world units, since the drag began.
+/// `start_pointer` is `canvas_point` of the gesture's start point, captured
+/// once in the `drag-begin` handler.
+///
+/// Why this isn't just `offset / zoom`: a `GestureDrag`'s `offset_x`/
+/// `offset_y` are expressed in the coordinate space of the widget the
+/// gesture is attached to, and GTK re-translates the pointer through that
+/// widget's *current* transform on every event. Every gesture here is
+/// attached to chrome inside a card whose transform the handler changes on
+/// every tick, so the card's own displacement feeds straight back into the
+/// reported offset: with displacement `d` applied and the pointer `m` from
+/// where it started, GTK reports `offset = m - d`, so assigning `d = offset`
+/// settles at `d = m / 2` — the card tracks at half the cursor's speed. The
+/// same recurrence `d_n = m_n - d_(n-1)` has gain -1, so it never damps:
+/// every pointer-sampling irregularity adds a non-decaying alternating
+/// wobble, which is the jitter that grew the further a card was dragged.
+///
+/// Mapping both the start point and the current point into the canvas
+/// `Fixed`'s space cancels the card's displacement exactly and leaves the
+/// true pointer movement. `Fixed` is the right reference because it never
+/// moves — pan and zoom only change its *children's* transforms, which is
+/// why `Canvas`'s own pan gesture (attached to `fixed` itself) never had
+/// this problem. It also makes the `/ zoom` correct: `Fixed`-space units are
+/// screen pixels, whereas the raw gesture offsets were already in the card's
+/// own zoom-scaled space and so were being divided by zoom a second time.
+fn world_drag_delta(
+    gesture: &gtk4::GestureDrag,
+    fixed: &gtk4::Fixed,
+    start_pointer: (f64, f64),
+    zoom: f64,
+) -> Option<(f64, f64)> {
+    let (start_x, start_y) = gesture.start_point()?;
+    let (offset_x, offset_y) = gesture.offset()?;
+    let now = canvas_point(gesture, fixed, (start_x + offset_x, start_y + offset_y))?;
+    Some((
+        (now.0 - start_pointer.0) / zoom,
+        (now.1 - start_pointer.1) / zoom,
+    ))
 }
 
 /// Wires a session card's drag-to-move (`node.drag_handle`), drag-to-resize
@@ -566,24 +610,42 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
         move |_| App::close_session(&app, id)
     });
 
-    let move_start = Rc::new(RefCell::new((0.0, 0.0)));
+    // (world position at drag start, pointer position at drag start in the
+    // canvas `Fixed`'s stationary coordinate space) — see `world_drag_delta`
+    // for why the pointer's start must be captured in that frame.
+    let move_start = Rc::new(RefCell::new(None));
     let drag = gtk4::GestureDrag::new();
     drag.connect_drag_begin({
         let app = Rc::clone(app);
         let move_start = Rc::clone(&move_start);
-        move |gesture, _x, _y| {
+        move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            if let Some(entry) = app.borrow().sessions.get(&id) {
-                *move_start.borrow_mut() = entry.record.position;
-            }
+            let app_ref = app.borrow();
+            *move_start.borrow_mut() = match (
+                app_ref.sessions.get(&id),
+                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
+            ) {
+                (Some(entry), Some(pointer)) => Some((entry.record.position, pointer)),
+                _ => None,
+            };
         }
     });
     drag.connect_drag_update({
         let app = Rc::clone(app);
         let container = node.container.clone();
-        move |_gesture, offset_x, offset_y| {
-            let zoom = app.borrow().canvas.state.borrow().zoom;
-            let new_position = drag_delta_to_world(*move_start.borrow(), (offset_x, offset_y), zoom);
+        let move_start = Rc::clone(&move_start);
+        move |gesture, _offset_x, _offset_y| {
+            let Some((start_position, start_pointer)) = *move_start.borrow() else {
+                return;
+            };
+            let new_position = {
+                let app_ref = app.borrow();
+                let zoom = app_ref.canvas.state.borrow().zoom;
+                match world_drag_delta(gesture, &app_ref.canvas.fixed, start_pointer, zoom) {
+                    Some((dx, dy)) => (start_position.0 + dx, start_position.1 + dy),
+                    None => return,
+                }
+            };
             let mut app_mut = app.borrow_mut();
             app_mut.canvas.reposition_node(&container, new_position);
             if let Some(entry) = app_mut.sessions.get_mut(&id) {
@@ -606,25 +668,45 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     });
     node.drag_handle.add_controller(drag);
 
-    let resize_start = Rc::new(RefCell::new((0.0, 0.0)));
+    // Same shape as `move_start` above: resizing a card moves its own
+    // bottom-right grip, so the gesture's raw offsets suffer the identical
+    // feedback described in `world_drag_delta`.
+    let resize_start = Rc::new(RefCell::new(None));
     let resize = gtk4::GestureDrag::new();
     resize.connect_drag_begin({
         let app = Rc::clone(app);
         let resize_start = Rc::clone(&resize_start);
-        move |gesture, _x, _y| {
+        move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            if let Some(entry) = app.borrow().sessions.get(&id) {
-                *resize_start.borrow_mut() = entry.record.size;
-            }
+            let app_ref = app.borrow();
+            *resize_start.borrow_mut() = match (
+                app_ref.sessions.get(&id),
+                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
+            ) {
+                (Some(entry), Some(pointer)) => Some((entry.record.size, pointer)),
+                _ => None,
+            };
         }
     });
     resize.connect_drag_update({
         let app = Rc::clone(app);
         let terminal = node.terminal.clone();
-        move |_gesture, offset_x, offset_y| {
-            let zoom = app.borrow().canvas.state.borrow().zoom;
-            let (w, h) = drag_delta_to_world(*resize_start.borrow(), (offset_x, offset_y), zoom);
-            let new_size = (w.max(crate::node::MIN_NODE_WIDTH), h.max(crate::node::MIN_NODE_HEIGHT));
+        let resize_start = Rc::clone(&resize_start);
+        move |gesture, _offset_x, _offset_y| {
+            let Some((start_size, start_pointer)) = *resize_start.borrow() else {
+                return;
+            };
+            let new_size = {
+                let app_ref = app.borrow();
+                let zoom = app_ref.canvas.state.borrow().zoom;
+                match world_drag_delta(gesture, &app_ref.canvas.fixed, start_pointer, zoom) {
+                    Some((dx, dy)) => (
+                        (start_size.0 + dx).max(crate::node::MIN_NODE_WIDTH),
+                        (start_size.1 + dy).max(crate::node::MIN_NODE_HEIGHT),
+                    ),
+                    None => return,
+                }
+            };
             terminal.set_size_request(new_size.0 as i32, new_size.1 as i32);
             if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
                 entry.record.size = new_size;
@@ -649,24 +731,39 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
         move |_| App::close_note(&app, id)
     });
 
-    let move_start = Rc::new(RefCell::new((0.0, 0.0)));
+    let move_start = Rc::new(RefCell::new(None));
     let drag = gtk4::GestureDrag::new();
     drag.connect_drag_begin({
         let app = Rc::clone(app);
         let move_start = Rc::clone(&move_start);
-        move |gesture, _x, _y| {
+        move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            if let Some(entry) = app.borrow().notes.get(&id) {
-                *move_start.borrow_mut() = entry.record.position;
-            }
+            let app_ref = app.borrow();
+            *move_start.borrow_mut() = match (
+                app_ref.notes.get(&id),
+                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
+            ) {
+                (Some(entry), Some(pointer)) => Some((entry.record.position, pointer)),
+                _ => None,
+            };
         }
     });
     drag.connect_drag_update({
         let app = Rc::clone(app);
         let container = node.container.clone();
-        move |_gesture, offset_x, offset_y| {
-            let zoom = app.borrow().canvas.state.borrow().zoom;
-            let new_position = drag_delta_to_world(*move_start.borrow(), (offset_x, offset_y), zoom);
+        let move_start = Rc::clone(&move_start);
+        move |gesture, _offset_x, _offset_y| {
+            let Some((start_position, start_pointer)) = *move_start.borrow() else {
+                return;
+            };
+            let new_position = {
+                let app_ref = app.borrow();
+                let zoom = app_ref.canvas.state.borrow().zoom;
+                match world_drag_delta(gesture, &app_ref.canvas.fixed, start_pointer, zoom) {
+                    Some((dx, dy)) => (start_position.0 + dx, start_position.1 + dy),
+                    None => return,
+                }
+            };
             let mut app_mut = app.borrow_mut();
             app_mut.canvas.reposition_node(&container, new_position);
             if let Some(entry) = app_mut.notes.get_mut(&id) {
@@ -683,25 +780,42 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
     });
     node.drag_handle.add_controller(drag);
 
-    let resize_start = Rc::new(RefCell::new((0.0, 0.0)));
+    let resize_start = Rc::new(RefCell::new(None));
     let resize = gtk4::GestureDrag::new();
     resize.connect_drag_begin({
         let app = Rc::clone(app);
         let resize_start = Rc::clone(&resize_start);
-        move |gesture, _x, _y| {
+        move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            if let Some(entry) = app.borrow().notes.get(&id) {
-                *resize_start.borrow_mut() = entry.record.size;
-            }
+            let app_ref = app.borrow();
+            *resize_start.borrow_mut() = match (
+                app_ref.notes.get(&id),
+                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
+            ) {
+                (Some(entry), Some(pointer)) => Some((entry.record.size, pointer)),
+                _ => None,
+            };
         }
     });
     resize.connect_drag_update({
         let app = Rc::clone(app);
         let text_view = node.text_view.clone();
-        move |_gesture, offset_x, offset_y| {
-            let zoom = app.borrow().canvas.state.borrow().zoom;
-            let (w, h) = drag_delta_to_world(*resize_start.borrow(), (offset_x, offset_y), zoom);
-            let new_size = (w.max(crate::node::MIN_NODE_WIDTH), h.max(crate::node::MIN_NODE_HEIGHT));
+        let resize_start = Rc::clone(&resize_start);
+        move |gesture, _offset_x, _offset_y| {
+            let Some((start_size, start_pointer)) = *resize_start.borrow() else {
+                return;
+            };
+            let new_size = {
+                let app_ref = app.borrow();
+                let zoom = app_ref.canvas.state.borrow().zoom;
+                match world_drag_delta(gesture, &app_ref.canvas.fixed, start_pointer, zoom) {
+                    Some((dx, dy)) => (
+                        (start_size.0 + dx).max(crate::node::MIN_NODE_WIDTH),
+                        (start_size.1 + dy).max(crate::node::MIN_NODE_HEIGHT),
+                    ),
+                    None => return,
+                }
+            };
             text_view.set_size_request(new_size.0 as i32, new_size.1 as i32);
             if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
                 entry.record.size = new_size;
@@ -803,17 +917,5 @@ fn build_launch_and_record(
             };
             Ok((launch, record))
         }
-    }
-}
-
-#[cfg(test)]
-mod geometry_tests {
-    use super::*;
-
-    #[test]
-    fn drag_delta_to_world_scales_screen_offset_by_zoom() {
-        assert_eq!(drag_delta_to_world((10.0, 20.0), (30.0, 60.0), 1.0), (40.0, 80.0));
-        assert_eq!(drag_delta_to_world((10.0, 20.0), (30.0, 60.0), 2.0), (25.0, 50.0));
-        assert_eq!(drag_delta_to_world((0.0, 0.0), (0.0, 0.0), 0.5), (0.0, 0.0));
     }
 }
