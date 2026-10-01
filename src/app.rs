@@ -368,9 +368,22 @@ impl App {
 }
 
 /// Wires a session node's link button (click to enter link mode, sourced
-/// from this node) and its container (click to complete a pending link,
+/// from this node) and its terminal (click to complete a pending link,
 /// targeting this node). Shared by `restore` and `create_session` so both
 /// paths of session creation get link support.
+///
+/// The "complete pending link" gesture is attached to `node.terminal`
+/// specifically, not to `node.container`. `link_button` and `terminal` are
+/// siblings (both live under `container`, with `link_button` nested inside
+/// `title_bar`) — if the gesture were attached to `container` instead, a
+/// press on `link_button` would bubble up through `container` and fire the
+/// "complete" handler *before* the button's own `clicked` signal fires on
+/// release, racing against whatever was already pending and potentially
+/// creating an unintended link as a side effect of merely clicking a link
+/// button. Attaching to `terminal` instead means a click on `link_button`
+/// (a different subtree under `container`) is never seen by this gesture at
+/// all, since GTK's bubble phase only walks up a widget's own ancestor
+/// chain, not into sibling subtrees.
 fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     node.link_button.connect_clicked({
         let app = Rc::clone(app);
@@ -384,7 +397,7 @@ fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
             App::complete_link_if_pending(&app, id);
         }
     });
-    node.container.add_controller(click);
+    node.terminal.add_controller(click);
 }
 
 fn build_launch_and_record(
