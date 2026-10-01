@@ -2,6 +2,7 @@ mod account;
 mod agent;
 mod app;
 mod handoff;
+mod session;
 mod store;
 
 use account::AccountStore;

@@ -1,31 +1,42 @@
+//! Owns one agent's PTY and child process. Rendering is the caller's job
+//! (a `vte4::Terminal` fed via `try_recv_output`), not this module's.
+
 use crate::agent::Launch;
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
-use tui_term::vt100;
 
-pub struct Tab {
+const OUTPUT_TAIL_LIMIT: usize = 512;
+
+fn trim_output_tail(text: &mut String) {
+    if text.len() <= OUTPUT_TAIL_LIMIT {
+        return;
+    }
+    let mut start = text.len() - OUTPUT_TAIL_LIMIT;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    *text = text.split_off(start);
+}
+
+pub struct Session {
     pair: PtyPair,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<Vec<u8>>,
-    parser: vt100::Parser,
     exit_status: Option<portable_pty::ExitStatus>,
+    missing_conversation: bool,
+    output_tail: String,
 }
 
-impl Tab {
-    pub fn spawn(cwd: PathBuf, launch: Launch, rows: u16, cols: u16) -> anyhow::Result<Tab> {
-        // A terminal may briefly report 0×0 during startup (notably when it
-        // is launched by a terminal multiplexer). vt100 cannot represent a
-        // zero-sized grid, and a single column cannot hold a wide character.
-        let rows = rows.max(1);
-        let cols = cols.max(2);
+impl Session {
+    pub fn spawn(cwd: PathBuf, launch: Launch) -> anyhow::Result<Session> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
-            rows,
-            cols,
+            rows: 24,
+            cols: 80,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -57,15 +68,14 @@ impl Tab {
             }
         });
 
-        let parser = vt100::Parser::new(rows, cols, 10_000);
-
-        Ok(Tab {
+        Ok(Session {
             pair,
             child,
             writer,
             output_rx: rx,
-            parser,
             exit_status: None,
+            missing_conversation: false,
+            output_tail: String::new(),
         })
     }
 
@@ -82,27 +92,33 @@ impl Tab {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.parser.screen_mut().set_size(rows, cols);
         Ok(())
     }
 
-    pub fn pull_output(&mut self) -> bool {
-        let mut changed = false;
+    /// Drains every output chunk received since the last call. The caller
+    /// (a `vte4::Terminal`, or a linked session's input) decides what to do
+    /// with the bytes; this module only knows about the PTY, not rendering.
+    pub fn try_recv_output(&mut self) -> Vec<Vec<u8>> {
+        let mut chunks = Vec::new();
         while let Ok(chunk) = self.output_rx.try_recv() {
-            self.parser.process(&chunk);
-            changed = true;
+            self.output_tail
+                .push_str(&String::from_utf8_lossy(&chunk).to_ascii_lowercase());
+            trim_output_tail(&mut self.output_tail);
+            let missing_session = self.output_tail.contains("no conversation found")
+                || self.output_tail.contains("session id not found")
+                || (self.output_tail.contains("conversation")
+                    && self.output_tail.contains("does not exist"));
+            if missing_session {
+                self.missing_conversation = true;
+            }
+            chunks.push(chunk);
         }
         if self.exit_status.is_none()
             && let Ok(Some(status)) = self.child.try_wait()
         {
             self.exit_status = Some(status);
-            changed = true;
         }
-        changed
-    }
-
-    pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+        chunks
     }
 
     pub fn exit_status(&self) -> Option<&portable_pty::ExitStatus> {
@@ -112,9 +128,13 @@ impl Tab {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+
+    pub fn missing_conversation(&self) -> bool {
+        self.missing_conversation
+    }
 }
 
-impl Drop for Tab {
+impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -142,44 +162,41 @@ mod tests {
     }
 
     #[test]
-    fn spawn_reads_child_output_into_screen() {
-        let mut tab = Tab::spawn(std::env::temp_dir(), echo_hello(), 24, 80).unwrap();
-
-        let mut seen = String::new();
+    fn spawn_reads_child_output() {
+        let mut session = Session::spawn(std::env::temp_dir(), echo_hello()).unwrap();
+        let mut seen = Vec::new();
         for _ in 0..50 {
-            tab.pull_output();
-            seen = tab.screen().contents();
-            if seen.contains("hello") {
+            seen.extend(session.try_recv_output());
+            let joined: Vec<u8> = seen.iter().flatten().copied().collect();
+            if String::from_utf8_lossy(&joined).contains("hello") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        let joined: Vec<u8> = seen.iter().flatten().copied().collect();
         assert!(
-            seen.contains("hello"),
-            "expected pty output to contain 'hello', got: {seen:?}"
+            String::from_utf8_lossy(&joined).contains("hello"),
+            "expected pty output to contain 'hello'"
         );
     }
 
     #[test]
-    fn resize_updates_screen_dimensions() {
-        let mut tab = Tab::spawn(std::env::temp_dir(), sleeper(), 24, 80).unwrap();
-        tab.resize(30, 100).unwrap();
-        assert_eq!(tab.screen().size(), (30, 100));
-    }
-
-    #[test]
-    fn zero_sized_terminal_is_clamped_to_a_safe_screen() {
-        let tab = Tab::spawn(std::env::temp_dir(), sleeper(), 0, 0).unwrap();
-        assert_eq!(tab.screen().size(), (1, 2));
+    fn trimming_unicode_output_keeps_a_valid_utf8_boundary() {
+        let mut text = "a".repeat(510);
+        text.push_str("🦀xy");
+        trim_output_tail(&mut text);
+        assert!(text.is_char_boundary(0));
+        assert!(text.ends_with("🦀xy"));
+        assert!(text.len() <= OUTPUT_TAIL_LIMIT);
     }
 
     #[test]
     fn pull_output_detects_child_exit() {
-        let mut tab = Tab::spawn(std::env::temp_dir(), echo_hello(), 24, 80).unwrap();
+        let mut session = Session::spawn(std::env::temp_dir(), echo_hello()).unwrap();
         let mut status = None;
         for _ in 0..50 {
-            tab.pull_output();
-            status = tab.exit_status().cloned();
+            session.try_recv_output();
+            status = session.exit_status().cloned();
             if status.is_some() {
                 break;
             }
@@ -190,9 +207,9 @@ mod tests {
 
     #[test]
     fn exit_status_is_none_while_child_is_running() {
-        let mut tab = Tab::spawn(std::env::temp_dir(), sleeper(), 24, 80).unwrap();
-        tab.pull_output();
-        assert!(tab.exit_status().is_none());
+        let mut session = Session::spawn(std::env::temp_dir(), sleeper()).unwrap();
+        session.try_recv_output();
+        assert!(session.exit_status().is_none());
     }
 
     #[test]
@@ -202,7 +219,7 @@ mod tests {
             args: vec![],
             envs: vec![],
         };
-        let result = Tab::spawn(std::env::temp_dir(), launch, 24, 80);
+        let result = Session::spawn(std::env::temp_dir(), launch);
         assert!(result.is_err());
     }
 }
