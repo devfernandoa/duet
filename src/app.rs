@@ -1,9 +1,11 @@
 use crate::account::AccountStore;
 use crate::agent::{Agent, Launch, claude_launch, codex_launch};
 use crate::canvas::Canvas;
+use crate::handoff::{summarize_claude, summarize_codex};
 use crate::node::{NoteNode, SessionNode};
 use crate::session::Session;
 use crate::store::{LinkRecord, SessionRecord, StickyNoteRecord, Store};
+use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
@@ -23,6 +25,10 @@ pub struct SessionEntry {
     pub record: SessionRecord,
     pub session: Session,
     pub node: SessionNode,
+    /// Whether the "exited" status badge has already been shown for this
+    /// session. Set once by `pump_output` the first time `exit_status()`
+    /// becomes `Some`, so the label is set once rather than every tick.
+    pub exit_shown: bool,
 }
 
 pub struct NoteEntry {
@@ -147,6 +153,7 @@ impl App {
                             record,
                             session,
                             node,
+                            exit_shown: false,
                         },
                     );
                 }
@@ -214,6 +221,10 @@ impl App {
             let chunks = entry.session.try_recv_output();
             for chunk in &chunks {
                 entry.node.feed(chunk);
+            }
+            if !entry.exit_shown && entry.session.exit_status().is_some() {
+                entry.node.status_label.set_text("exited");
+                entry.exit_shown = true;
             }
             if !chunks.is_empty() {
                 outgoing.push((id, chunks));
@@ -295,6 +306,7 @@ impl App {
                 record,
                 session,
                 node,
+                exit_shown: false,
             },
         );
         app.borrow().persist()?;
@@ -365,6 +377,117 @@ impl App {
             App::create_link(app, source, target);
         }
     }
+
+    /// Hands a session off from its current agent to the other one: kills
+    /// the running process, asks it (via `handoff.rs`) to summarize the
+    /// conversation, then relaunches the other agent in the *same* node at
+    /// the same canvas position with that summary as its initial prompt. On
+    /// a failed summarize, falls back to a generic "start fresh" prompt
+    /// rather than failing the whole handoff.
+    pub fn switch_agent(app: &Rc<RefCell<App>>, id: Uuid) -> anyhow::Result<()> {
+        let record = {
+            let mut app_mut = app.borrow_mut();
+            let entry = app_mut.sessions.get_mut(&id).context("session not found")?;
+            entry.session.kill();
+            entry.record.clone()
+        };
+
+        let summary_result = match record.agent {
+            Agent::Claude => {
+                let session_id = record
+                    .claude_session_id
+                    .context("session has no Claude session to summarize")?;
+                let config_dir = record
+                    .claude_account
+                    .as_ref()
+                    .map(|a| app.borrow().accounts.config_dir(a));
+                summarize_claude(session_id, config_dir.as_deref(), &record.cwd)
+            }
+            Agent::Codex => summarize_codex(&record.cwd),
+        };
+        let summary = match summary_result {
+            Ok(summary) => summary,
+            Err(_) => "The previous agent session could not be recovered. Start by inspecting the working directory and continue from there.".to_string(),
+        };
+
+        let to = match record.agent {
+            Agent::Claude => Agent::Codex,
+            Agent::Codex => Agent::Claude,
+        };
+        let (launch, updated_record) = {
+            let app_ref = app.borrow();
+            match to {
+                Agent::Claude => {
+                    let account = crate::account::DEFAULT_ACCOUNT.to_string();
+                    let config_dir = app_ref.accounts.ensure(&account)?;
+                    let session_id = Uuid::new_v4();
+                    let launch = claude_launch(session_id, false, Some(&summary), Some(&config_dir));
+                    let mut updated = record.clone();
+                    updated.agent = Agent::Claude;
+                    updated.claude_session_id = Some(session_id);
+                    updated.claude_account = Some(account);
+                    (launch, updated)
+                }
+                Agent::Codex => {
+                    let launch = codex_launch(false, Some(&summary));
+                    let mut updated = record.clone();
+                    updated.agent = Agent::Codex;
+                    updated.claude_session_id = None;
+                    updated.claude_account = None;
+                    (launch, updated)
+                }
+            }
+        };
+        let new_session = Session::spawn(updated_record.cwd.clone(), launch)?;
+        {
+            let mut app_mut = app.borrow_mut();
+            if let Some(entry) = app_mut.sessions.get_mut(&id) {
+                entry.session = new_session;
+                entry.record = updated_record;
+            }
+        }
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// Removes every session using account `name`, then the account's
+    /// on-disk config directory. Uses `canvas.remove_node` (not
+    /// `canvas.fixed.remove` directly) so the node is also dropped from
+    /// `Canvas`'s internal position-tracking list — otherwise it would leak
+    /// there and every future pan/zoom would keep repositioning a widget
+    /// that's no longer in the `Fixed` container.
+    ///
+    /// Note: `AccountStore` has no `remove` method (and isn't touched by
+    /// this task), so the account directory is removed here directly via
+    /// `accounts.config_dir(name)` + `std::fs::remove_dir_all`.
+    pub fn delete_account(app: &Rc<RefCell<App>>, name: &str) -> anyhow::Result<()> {
+        let to_remove: Vec<Uuid> = {
+            let app_ref = app.borrow();
+            app_ref
+                .sessions
+                .iter()
+                .filter(|(_, entry)| entry.record.claude_account.as_deref() == Some(name))
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        {
+            let mut app_mut = app.borrow_mut();
+            for id in &to_remove {
+                if let Some(mut entry) = app_mut.sessions.remove(id) {
+                    entry.session.kill();
+                    app_mut.canvas.remove_node(&entry.node.container);
+                }
+            }
+        }
+        let config_dir = app.borrow().accounts.config_dir(name);
+        if config_dir.exists() {
+            std::fs::remove_dir_all(&config_dir).with_context(|| {
+                format!("couldn't remove account directory {}", config_dir.display())
+            })?;
+        }
+        app.borrow().persist()?;
+        Ok(())
+    }
 }
 
 /// Wires a session node's link button (click to enter link mode, sourced
@@ -388,6 +511,17 @@ fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     node.link_button.connect_clicked({
         let app = Rc::clone(app);
         move |_| App::start_link(&app, id)
+    });
+
+    // Errors are swallowed here (no toast plumbing reaches this helper —
+    // `wire_link_controls` runs in app.rs, before any window/toast-overlay
+    // widget exists), matching the existing ignore-the-Result pattern used a
+    // few lines above for `entry.session.write_input(bytes)`.
+    node.handoff_button.connect_clicked({
+        let app = Rc::clone(app);
+        move |_| {
+            let _ = App::switch_agent(&app, id);
+        }
     });
 
     let click = gtk4::GestureClick::new();

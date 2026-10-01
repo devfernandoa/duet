@@ -11,6 +11,8 @@ pub struct SessionNode {
     pub title_bar: gtk4::Box,
     pub terminal: vte4::Terminal,
     pub link_button: gtk4::Button,
+    pub handoff_button: gtk4::Button,
+    pub status_label: gtk4::Label,
 }
 
 impl SessionNode {
@@ -19,10 +21,14 @@ impl SessionNode {
         title.add_css_class("heading");
 
         let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
+        let handoff_button = gtk4::Button::from_icon_name("media-playlist-shuffle-symbolic");
+        let status_label = gtk4::Label::new(None);
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.append(&title);
         title_bar.append(&link_button);
+        title_bar.append(&handoff_button);
+        title_bar.append(&status_label);
 
         let terminal = vte4::Terminal::new();
         terminal.set_size_request(480, 320);
@@ -37,6 +43,8 @@ impl SessionNode {
             title_bar,
             terminal,
             link_button,
+            handoff_button,
+            status_label,
         }
     }
 
