@@ -37,13 +37,14 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         move || {
             let app_ref = app.borrow();
+            let selected = app_ref.selected_link;
             app_ref
-                .links
-                .iter()
-                .filter_map(|link| {
-                    let source = app_ref.sessions.get(&link.source)?;
-                    let target = app_ref.sessions.get(&link.target)?;
-                    Some((source.record.position, target.record.position))
+                .link_lines()
+                .into_iter()
+                .map(|(link, from, to)| canvas::LinkLine {
+                    from,
+                    to,
+                    selected: selected == Some(link),
                 })
                 .collect()
         }
@@ -88,6 +89,21 @@ fn build_ui(application: &adw::Application) {
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&toolbar_view));
     window.set_content(Some(&toast_overlay));
+
+    // Link lines are drawn, not widgets, so deleting one needs a hit test
+    // against the curve rather than a click on a control: one click selects
+    // (the line thickens and turns orange), a second click on the same line
+    // deletes it. `App::remove_link` existed from the start but had no UI
+    // path to it at all until now.
+    app.borrow().canvas.connect_background_click({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |world| {
+            if let Some(message) = App::click_link_at(&app, world) {
+                toast_overlay.add_toast(adw::Toast::new(&message));
+            }
+        }
+    });
 
     // Restore after the toast overlay exists: restored sessions' handoff
     // buttons are wired (via `wire_link_controls`) to show a toast on

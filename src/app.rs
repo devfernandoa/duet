@@ -52,6 +52,9 @@ pub struct App {
     /// Set while the user has clicked a node's link button and is waiting to
     /// click a target node to complete the link. `None` otherwise.
     pub pending_link_source: Option<Uuid>,
+    /// The link the user clicked on the canvas, highlighted and armed so a
+    /// second click on it deletes it. `None` when nothing is selected.
+    pub selected_link: Option<LinkRecord>,
     /// The debounce timer for `schedule_persist`, if a save is currently
     /// pending. `None` when no save is scheduled.
     pending_save: Option<glib::SourceId>,
@@ -67,6 +70,7 @@ impl App {
             notes: HashMap::new(),
             links: Vec::new(),
             pending_link_source: None,
+            selected_link: None,
             pending_save: None,
         }))
     }
@@ -159,6 +163,7 @@ impl App {
                     });
                     wire_link_controls(app, &node, id, toast_overlay);
                     wire_session_chrome(app, &node, id);
+                    wire_rename(app, &node, id, toast_overlay);
                     app.borrow_mut().sessions.insert(
                         id,
                         SessionEntry {
@@ -332,6 +337,7 @@ impl App {
         });
         wire_link_controls(app, &node, id, toast_overlay);
         wire_session_chrome(app, &node, id);
+        wire_rename(app, &node, id, toast_overlay);
         app.borrow_mut().sessions.insert(
             id,
             SessionEntry {
@@ -422,6 +428,107 @@ impl App {
         }
     }
 
+    /// Every live link's world-space endpoints: out of the source card's
+    /// right edge, into the target card's left edge, each at the card's
+    /// vertical middle. One function so the curve that gets drawn and the
+    /// curve a click is hit-tested against can never disagree.
+    pub fn link_lines(&self) -> Vec<(LinkRecord, (f64, f64), (f64, f64))> {
+        self.links
+            .iter()
+            .filter_map(|&link| {
+                let source = self.sessions.get(&link.source)?;
+                let target = self.sessions.get(&link.target)?;
+                Some((
+                    link,
+                    card_edge(&source.record, true),
+                    card_edge(&target.record, false),
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether any card covers `world` (world-space). Used to keep a click
+    /// that landed on a node from also being treated as a click on a link
+    /// line, since the lines are painted behind the nodes.
+    fn covers_point(&self, world: (f64, f64)) -> bool {
+        let inside = |position: (f64, f64), size: (f64, f64)| {
+            world.0 >= position.0
+                && world.0 <= position.0 + size.0
+                && world.1 >= position.1
+                && world.1 <= position.1 + size.1 + TITLE_BAR_HEIGHT
+        };
+        self.sessions
+            .values()
+            .any(|entry| inside(entry.record.position, entry.record.size))
+            || self
+                .notes
+                .values()
+                .any(|entry| inside(entry.record.position, entry.record.size))
+    }
+
+    /// Click-to-select, click-again-to-delete for link lines — the pattern
+    /// the design spec asks for ("click a link line to select it, then a
+    /// key/button to delete"). A second click rather than a keypress because
+    /// a card's terminal takes the keyboard (more so now that hovering grabs
+    /// focus), so a `Delete` binding would be swallowed by whatever agent is
+    /// running. A click that misses every link just clears the selection.
+    ///
+    /// Returns a toast message when something happened; `None` when the
+    /// click was a plain deselect, which needs no announcement.
+    pub fn click_link_at(app: &Rc<RefCell<App>>, world: (f64, f64)) -> Option<String> {
+        let (hit, previous) = {
+            let app_ref = app.borrow();
+            // A fixed 12px of grab slack on screen, converted to world units
+            // so a link is no harder to hit when zoomed out.
+            let tolerance = 12.0 / app_ref.canvas.state.borrow().zoom;
+            // Links are drawn *behind* the cards, so a click that landed on a
+            // card is never a click on a link — without this, clicking near
+            // the right edge of a terminal (where a link's source anchor is)
+            // would select the link leaving it.
+            let hit = if app_ref.covers_point(world) {
+                None
+            } else {
+                app_ref
+                    .link_lines()
+                    .into_iter()
+                    .map(|(link, from, to)| {
+                        (link, crate::canvas::distance_to_link(from, to, world))
+                    })
+                    .filter(|(_, distance)| *distance <= tolerance)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(link, _)| link)
+            };
+            (hit, app_ref.selected_link)
+        };
+        match hit {
+            None => {
+                app.borrow_mut().selected_link = None;
+                None
+            }
+            Some(link) if previous == Some(link) => {
+                App::remove_link(app, link.source, link.target);
+                app.borrow_mut().selected_link = None;
+                let app_ref = app.borrow();
+                let name = |id: Uuid| {
+                    app_ref
+                        .sessions
+                        .get(&id)
+                        .map(|entry| entry.record.name.clone())
+                        .unwrap_or_default()
+                };
+                Some(format!(
+                    "unlinked {} -> {}",
+                    name(link.source),
+                    name(link.target)
+                ))
+            }
+            Some(link) => {
+                app.borrow_mut().selected_link = Some(link);
+                Some("link selected — click it again to delete".to_string())
+            }
+        }
+    }
+
     pub fn remove_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) {
         let mut app = app.borrow_mut();
         app.links.retain(|l| !(l.source == source && l.target == target));
@@ -459,6 +566,37 @@ impl App {
                 .unwrap_or_default()
         };
         Some(format!("linked {} -> {}", name(source), name(target)))
+    }
+
+    /// Commits an inline title rename (see `wire_rename`). Applies the same
+    /// uniqueness rule as `App::create_session`, since the name is what the
+    /// user identifies a session by and two cards called the same thing would
+    /// be indistinguishable on the canvas. Nothing else keys off the name —
+    /// records are keyed by `Uuid` — so a rename is just the record, the
+    /// label, and a save.
+    pub fn rename_session(app: &Rc<RefCell<App>>, id: Uuid, name: &str) -> anyhow::Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("give this session a name");
+        }
+        {
+            let app_ref = app.borrow();
+            if app_ref
+                .sessions
+                .iter()
+                .any(|(&other, entry)| other != id && entry.record.name == name)
+            {
+                anyhow::bail!("a session named '{name}' already exists");
+            }
+        }
+        {
+            let mut app_mut = app.borrow_mut();
+            let entry = app_mut.sessions.get_mut(&id).context("session not found")?;
+            entry.record.name = name.to_string();
+            entry.node.set_name(name);
+        }
+        app.borrow().persist()?;
+        Ok(())
     }
 
     /// Hands a session off from its current agent to the other one: kills
@@ -582,6 +720,12 @@ impl App {
             if app_mut.pending_link_source == Some(id) {
                 app_mut.pending_link_source = None;
             }
+            if app_mut
+                .selected_link
+                .is_some_and(|l| l.source == id || l.target == id)
+            {
+                app_mut.selected_link = None;
+            }
             app_mut.refresh_link_highlight();
         }
         let _ = app.borrow().persist();
@@ -598,6 +742,89 @@ impl App {
         }
         let _ = app.borrow().persist();
     }
+}
+
+/// Roughly the height a card's title bar adds above its body. Only used to
+/// put a link line's endpoint near the vertical middle of a card rather than
+/// its top edge; a few pixels either way is invisible on a link.
+const TITLE_BAR_HEIGHT: f64 = 28.0;
+
+/// A card's left or right edge at its vertical middle, in world space.
+/// `record.position` is the card's top-left and `record.size` is its *body*
+/// size, hence the title-bar correction.
+fn card_edge(record: &SessionRecord, right: bool) -> (f64, f64) {
+    (
+        if right {
+            record.position.0 + record.size.0
+        } else {
+            record.position.0
+        },
+        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+    )
+}
+
+/// Click-to-rename: the title label swaps for an entry pre-filled with the
+/// current name, Enter commits (through `App::rename_session`, which enforces
+/// the same uniqueness rule as creating a session), Escape reverts without
+/// saving. Replaces the F4 rename dialog the old ratatui UI had, which was
+/// never carried over to the GTK rewrite.
+///
+/// The click gesture goes on the label itself rather than the title bar, for
+/// the same reason `wire_link_controls` attaches to `node.terminal`: a
+/// gesture on the shared ancestor would also fire for presses on the
+/// title bar's buttons and its drag handle.
+fn wire_rename(
+    app: &Rc<RefCell<App>>,
+    node: &SessionNode,
+    id: Uuid,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let click = gtk4::GestureClick::new();
+    click.connect_released({
+        let label = node.title_label.clone();
+        let entry = node.title_entry.clone();
+        move |_gesture, _n_press, _x, _y| crate::node::set_renaming(&label, &entry, true)
+    });
+    node.title_label.add_controller(click);
+
+    let finish = {
+        let label = node.title_label.clone();
+        let entry = node.title_entry.clone();
+        move || crate::node::set_renaming(&label, &entry, false)
+    };
+
+    node.title_entry.connect_activate({
+        let app = Rc::clone(app);
+        let toast_overlay = toast_overlay.clone();
+        let finish = finish.clone();
+        move |entry| {
+            if let Err(error) = App::rename_session(&app, id, &entry.text()) {
+                toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+                // Deliberately stays in edit mode on a rejected name (empty,
+                // or a duplicate) so the typed text isn't thrown away.
+                return;
+            }
+            finish();
+        }
+    });
+
+    let keys = gtk4::EventControllerKey::new();
+    // Capture phase so Escape is seen before `GtkEntry`'s own internal text
+    // widget gets a chance at it; everything else is passed straight through
+    // so normal typing is untouched.
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let finish = finish.clone();
+        move |_controller, key, _code, _modifiers| {
+            if key == gtk4::gdk::Key::Escape {
+                finish();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    node.title_entry.add_controller(keys);
 }
 
 /// A node body's real current size in pre-zoom pixels (GTK allocations are in

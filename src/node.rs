@@ -57,6 +57,47 @@ fn resize_handle() -> gtk4::Box {
     handle
 }
 
+/// Shows a session card's rename entry (pre-filled and focused) in place of
+/// its title label, or puts the label back. A free function taking both
+/// widgets rather than a `SessionNode` method so `app.rs`'s rename wiring can
+/// call it from inside signal handlers that only captured the two widgets —
+/// and so "exactly one of the two is visible" lives in one place either way.
+pub fn set_renaming(label: &gtk4::Label, entry: &gtk4::Entry, renaming: bool) {
+    if renaming {
+        entry.set_text(&label.text());
+    }
+    label.set_visible(!renaming);
+    entry.set_visible(renaming);
+    if renaming {
+        entry.grab_focus();
+    }
+}
+
+/// Collapse/expand a node to just its title bar. Deliberately self-contained
+/// here rather than wired from `app.rs`: it is pure widget visibility with no
+/// bearing on the session, its PTY, or the store. Not persisted — a collapsed
+/// card comes back expanded, which `store.rs` would need a new field to
+/// change and nobody asked for that.
+fn wire_minimize(button: &gtk4::Button, body: &gtk4::Overlay) {
+    let sync = |button: &gtk4::Button, expanded: bool| {
+        button.set_icon_name(if expanded { "go-up-symbolic" } else { "go-down-symbolic" });
+        button.set_tooltip_text(Some(if expanded {
+            "Collapse to title bar"
+        } else {
+            "Expand"
+        }));
+    };
+    sync(button, true);
+    button.connect_clicked({
+        let body = body.clone();
+        move |button| {
+            let expanded = !body.is_visible();
+            body.set_visible(expanded);
+            sync(button, expanded);
+        }
+    });
+}
+
 pub struct SessionNode {
     pub container: gtk4::Box,
     pub title_bar: gtk4::Box,
@@ -67,10 +108,6 @@ pub struct SessionNode {
     /// the two is visible at a time; see `SessionNode::set_renaming`.
     pub title_entry: gtk4::Entry,
     pub terminal: vte4::Terminal,
-    /// The card's collapsible part (terminal + resize grip). Hidden by the
-    /// minimize button, leaving just the title bar.
-    pub body: gtk4::Overlay,
-    pub minimize_button: gtk4::Button,
     pub link_button: gtk4::Button,
     pub handoff_button: gtk4::Button,
     pub status_label: gtk4::Label,
@@ -97,7 +134,6 @@ impl SessionNode {
         // (a 28-character name measured 348px wide), so the card could not be
         // resized narrower than its own title and `record.size` drifted away
         // from the card's real width.
-        title_label.set_tooltip_text(Some("Click to rename"));
         title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         title_label.set_max_width_chars(16);
 
@@ -111,7 +147,6 @@ impl SessionNode {
 
         let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
         minimize_button.add_css_class("flat");
-        minimize_button.set_tooltip_text(Some("Collapse to title bar"));
         let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
         link_button.add_css_class("flat");
         link_button.set_tooltip_text(Some("Link this session's output into another"));
@@ -151,7 +186,15 @@ impl SessionNode {
         let motion = gtk4::EventControllerMotion::new();
         motion.connect_enter({
             let terminal = terminal.clone();
+            let title_entry = title_entry.clone();
             move |_controller, _x, _y| {
+                // One case where hovering must *not* take focus: an inline
+                // rename in progress. The entry sits a few pixels above the
+                // terminal, so drifting the pointer down while typing a new
+                // name would otherwise throw the keystrokes at the agent.
+                if WidgetExt::is_visible(&title_entry) {
+                    return;
+                }
                 terminal.grab_focus();
             }
         });
@@ -167,36 +210,33 @@ impl SessionNode {
         container.append(&body);
         container.add_css_class("card");
 
-        SessionNode {
+        wire_minimize(&minimize_button, &body);
+
+        let node = SessionNode {
             container,
             title_bar,
             title_label,
             title_entry,
             terminal,
-            body,
-            minimize_button,
             link_button,
             handoff_button,
             status_label,
             drag_handle,
             close_button,
             resize_handle,
-        }
+        };
+        node.set_name(name);
+        node
     }
 
-    /// Shows the rename entry (pre-filled with the current name) in place of
-    /// the title label, or puts the label back. Kept here rather than in
-    /// `app.rs` so "exactly one of the two is visible" can't be violated by a
-    /// caller that only toggles one of them.
-    pub fn set_renaming(&self, renaming: bool) {
-        if renaming {
-            self.title_entry.set_text(&self.title_label.text());
-        }
-        self.title_label.set_visible(!renaming);
-        self.title_entry.set_visible(renaming);
-        if renaming {
-            self.title_entry.grab_focus();
-        }
+    /// Sets the displayed name. The label is ellipsized (so a long name
+    /// can't set the card's minimum width — see `new`), which is why the
+    /// full name also goes in the tooltip, together with the hint that
+    /// clicking the label renames the session.
+    pub fn set_name(&self, name: &str) {
+        self.title_label.set_text(name);
+        self.title_label
+            .set_tooltip_text(Some(&format!("{name}\nClick to rename")));
     }
 
     /// Asks the terminal for the largest character grid that fits
@@ -264,9 +304,6 @@ pub struct NoteNode {
     pub container: gtk4::Box,
     pub title_bar: gtk4::Box,
     pub text_view: gtk4::TextView,
-    /// Same role as `SessionNode::body`: the part the minimize button hides.
-    pub body: gtk4::Overlay,
-    pub minimize_button: gtk4::Button,
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
@@ -280,7 +317,6 @@ impl NoteNode {
 
         let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
         minimize_button.add_css_class("flat");
-        minimize_button.set_tooltip_text(Some("Collapse to title bar"));
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
         close_button.set_tooltip_text(Some("Delete note"));
@@ -317,12 +353,12 @@ impl NoteNode {
         container.append(&body);
         container.set_css_classes(&["card", &format!("note-{color}")]);
 
+        wire_minimize(&minimize_button, &body);
+
         NoteNode {
             container,
             title_bar,
             text_view,
-            body,
-            minimize_button,
             drag_handle,
             close_button,
             resize_handle,
