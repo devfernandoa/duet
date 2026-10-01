@@ -45,6 +45,21 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 .node-title { padding: 0 2px; border-radius: 4px; }
 .node-title:hover { background-color: rgba(127, 127, 127, 0.22); }
 
+/* A session card's assigned role (`node::SessionNode::set_role`), shown as
+   a small pill in the title bar next to the name. Neutral by default; one
+   `.role-accent-*` class (matching `role::ACCENTS`) tints it per role. */
+.role-badge {
+    padding: 1px 5px;
+    border-radius: 8px;
+    background-color: rgba(127, 127, 127, 0.35);
+    font-size: 0.85em;
+}
+.role-accent-blue { background-color: rgba(53, 132, 228, 0.45); }
+.role-accent-purple { background-color: rgba(145, 65, 172, 0.45); }
+.role-accent-green { background-color: rgba(46, 194, 126, 0.45); }
+.role-accent-orange { background-color: rgba(230, 97, 0, 0.45); }
+.role-accent-gray { background-color: rgba(119, 118, 123, 0.45); }
+
 /* Tinted to a slightly darker shade of the note's own color rather than a
    flat dark overlay, so the title bar reads as part of the same card. */
 .note-yellow .note-title-bar { background-color: #f2e48f; min-height: 20px; }

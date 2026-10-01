@@ -67,6 +67,14 @@ other" agent — the other providers are plain interactive processes with no
 equivalent resumable-session/summarize hook, so their handoff button reports
 that it's unsupported rather than doing something meaningless.
 
+The same dialog can also assign a role (Developer, Reviewer, Tester, Lead,
+Documentation, or any custom role you've created) to the session. A role's
+instructions become the agent's first prompt when the session launches
+fresh — carried through a handoff to the other agent too — and the role's
+name (with its accent color, if it has one) shows as a badge on the session
+card's title bar. Manage custom roles — create, edit, delete — through the
+roles button or `Ctrl+Shift+R`; built-in roles can't be edited or deleted.
+
 Accounts (used to keep separate Claude logins/config isolated per session)
 are managed through the account-manager dialog rather than ad hoc per-session
 prompts: open it, add a name, and pick it from the account dropdown in the
@@ -81,6 +89,7 @@ any Claude session that doesn't pick another one.
 | New-session button / `Ctrl+T` | Open the new-session dialog (name, working directory, agent, Claude account) |
 | New-note button        | Drop a sticky note at the viewport center |
 | Accounts button / `Ctrl+.`   | Open the account manager (list, create, delete accounts) |
+| Roles button / `Ctrl+Shift+R` | Open the role manager (list built-ins, create/edit/delete custom roles) |
 | Per-card title-bar drag handle | Move just this card (doesn't pan the canvas) |
 | Per-card bottom-right grip | Resize this card |
 | Per-card close button   | Remove this card (kills the process, for a session) |

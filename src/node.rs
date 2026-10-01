@@ -80,7 +80,11 @@ pub fn set_renaming(label: &gtk4::Label, entry: &gtk4::Entry, renaming: bool) {
 /// change and nobody asked for that.
 fn wire_minimize(button: &gtk4::Button, body: &gtk4::Overlay) {
     let sync = |button: &gtk4::Button, expanded: bool| {
-        button.set_icon_name(if expanded { "go-up-symbolic" } else { "go-down-symbolic" });
+        button.set_icon_name(if expanded {
+            "go-up-symbolic"
+        } else {
+            "go-down-symbolic"
+        });
         button.set_tooltip_text(Some(if expanded {
             "Collapse to title bar"
         } else {
@@ -98,6 +102,25 @@ fn wire_minimize(button: &gtk4::Button, body: &gtk4::Overlay) {
     });
 }
 
+/// Builds the role badge shown in a session card's title bar: an icon plus
+/// the role's name, hidden until `SessionNode::set_role` is given a role.
+/// A plain function (not inlined into `SessionNode::new`) so the three
+/// widgets it returns can be stored as fields without repeating the
+/// construction.
+fn role_badge_widgets() -> (gtk4::Box, gtk4::Image, gtk4::Label) {
+    let icon = gtk4::Image::new();
+    icon.set_visible(false);
+    let label = gtk4::Label::new(None);
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    label.set_max_width_chars(10);
+    let badge = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    badge.add_css_class("role-badge");
+    badge.append(&icon);
+    badge.append(&label);
+    badge.set_visible(false);
+    (badge, icon, label)
+}
+
 pub struct SessionNode {
     pub container: gtk4::Box,
     pub title_bar: gtk4::Box,
@@ -107,6 +130,9 @@ pub struct SessionNode {
     /// Swapped in for `title_label` during an inline rename. Exactly one of
     /// the two is visible at a time; see `SessionNode::set_renaming`.
     pub title_entry: gtk4::Entry,
+    role_badge: gtk4::Box,
+    role_icon: gtk4::Image,
+    role_label: gtk4::Label,
     pub terminal: vte4::Terminal,
     pub link_button: gtk4::Button,
     pub handoff_button: gtk4::Button,
@@ -158,10 +184,13 @@ impl SessionNode {
         close_button.add_css_class("flat");
         close_button.set_tooltip_text(Some("Close session"));
 
+        let (role_badge, role_icon, role_label) = role_badge_widgets();
+
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("node-title-bar");
         title_bar.append(&title_label);
         title_bar.append(&title_entry);
+        title_bar.append(&role_badge);
         title_bar.append(&drag_handle);
         title_bar.append(&status_label);
         title_bar.append(&minimize_button);
@@ -216,6 +245,9 @@ impl SessionNode {
             title_bar,
             title_label,
             title_entry,
+            role_badge,
+            role_icon,
+            role_label,
             terminal,
             link_button,
             handoff_button,
@@ -236,6 +268,31 @@ impl SessionNode {
         self.title_label.set_text(name);
         self.title_label
             .set_tooltip_text(Some(&format!("{name}\nClick to rename")));
+    }
+
+    /// Shows the role badge (icon + name) in the title bar, or hides it when
+    /// `name` is `None`. Takes plain strings rather than a `role::Role`, the
+    /// same way `new` takes a plain `&str` name rather than a
+    /// `SessionRecord` — this module stays ignorant of the domain record
+    /// types, which live in `store.rs`/`role.rs` and are resolved by `app.rs`.
+    pub fn set_role(&self, name: Option<&str>, icon: Option<&str>, accent: Option<&str>) {
+        for accent_name in crate::role::ACCENTS {
+            self.role_badge
+                .remove_css_class(&format!("role-accent-{accent_name}"));
+        }
+        let Some(name) = name else {
+            self.role_badge.set_visible(false);
+            return;
+        };
+        self.role_label.set_text(name);
+        self.role_icon.set_icon_name(icon);
+        self.role_icon.set_visible(icon.is_some());
+        if let Some(accent) = accent {
+            self.role_badge
+                .add_css_class(&format!("role-accent-{accent}"));
+        }
+        self.role_badge.set_tooltip_text(Some(name));
+        self.role_badge.set_visible(true);
     }
 
     /// Sizes the terminal to `width` x `height` pixels, rounded down to a
@@ -451,6 +508,3 @@ mod tests {
         );
     }
 }
-
-
-
