@@ -72,7 +72,15 @@ impl Canvas {
             drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
                 let start_pan = *drag_start_pan.borrow();
                 let mut state = state.borrow_mut();
-                state.pan = (start_pan.0 + offset_x, start_pan.1 + offset_y);
+                // `pan` is a world-space (pre-scale) quantity — world_to_screen
+                // computes (world + pan) * zoom — while offset_x/offset_y are
+                // screen-space pixels from the drag gesture. Divide by zoom to
+                // convert the screen-space offset back to world space before
+                // adding it, so pan speed matches the pointer at any zoom.
+                state.pan = (
+                    start_pan.0 + offset_x / state.zoom,
+                    start_pan.1 + offset_y / state.zoom,
+                );
                 retransform_children(&fixed, &nodes.borrow(), &state);
             });
         }
@@ -126,6 +134,17 @@ impl Canvas {
             }
         }
         apply_transform(&self.fixed, &widget, world_pos, &self.state.borrow());
+    }
+
+    /// Removes a child from both the `Fixed` container and the internal
+    /// tracking list used by `retransform_children`. Callers that remove a
+    /// node from the canvas (e.g. deleting a session) must use this instead
+    /// of calling `fixed.remove` directly, or the tracking list keeps a
+    /// strong reference to a widget no longer in the UI (a leak), and future
+    /// pan/zoom keeps calling `set_child_transform` on it.
+    pub fn remove_node(&self, child: &impl IsA<gtk4::Widget>) {
+        self.fixed.remove(child);
+        self.nodes.borrow_mut().retain(|(w, _)| w != child.as_ref());
     }
 }
 
