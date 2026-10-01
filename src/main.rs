@@ -61,7 +61,7 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         move || {
             app.borrow_mut().pump_output();
-            app.borrow().canvas.drawing_area.queue_draw();
+            app.borrow().canvas.links_area.queue_draw();
             glib::ControlFlow::Continue
         }
     });
@@ -165,6 +165,40 @@ fn build_ui(application: &adw::Application) {
     });
     application.add_action(&accounts_action);
     application.set_accels_for_action("app.manage-accounts", &["<Ctrl>period"]);
+
+    // Ctrl+scroll already zoomed, but a modifier+scroll gesture is invisible
+    // in a UI with no menu: the user asked for zoom without ever finding it.
+    // `equal` as well as `plus` so the unshifted "+" key works, and the
+    // keypad names so a numpad does too.
+    for (name, accels, steps) in [
+        ("zoom-in", vec!["<Ctrl>plus", "<Ctrl>equal", "<Ctrl>KP_Add"], 1),
+        (
+            "zoom-out",
+            vec!["<Ctrl>minus", "<Ctrl>KP_Subtract"],
+            -1,
+        ),
+        ("zoom-reset", vec!["<Ctrl>0", "<Ctrl>KP_0"], 0),
+    ] {
+        let zoom_action = gtk4::gio::SimpleAction::new(name, None);
+        zoom_action.connect_activate({
+            let app = app.clone();
+            move |_, _| {
+                {
+                    // Scoped: `schedule_persist` takes a mutable borrow of
+                    // the same `RefCell`, which panics if this one is live.
+                    let app_ref = app.borrow();
+                    if steps == 0 {
+                        app_ref.canvas.reset_view();
+                    } else {
+                        app_ref.canvas.zoom_by_steps(steps);
+                    }
+                }
+                App::schedule_persist(&app);
+            }
+        });
+        application.add_action(&zoom_action);
+        application.set_accels_for_action(&format!("app.{name}"), &accels);
+    }
 
     window.present();
 

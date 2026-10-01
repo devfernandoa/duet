@@ -33,7 +33,15 @@ use std::rc::Rc;
 pub struct Canvas {
     pub overlay: gtk4::Overlay,
     pub fixed: gtk4::Fixed,
-    pub drawing_area: gtk4::DrawingArea,
+    /// Graph-paper backdrop, *behind* the cards. A separate widget from
+    /// `links_area` purely for z-order: `gtk4::Overlay` paints its base child
+    /// first and each added overlay on top, so the only way to get grid →
+    /// cards → link lines is three layers. Drawing the grid in the same
+    /// callback as the links painted it over every card.
+    pub grid_area: gtk4::DrawingArea,
+    /// Link lines, *in front of* the cards — they connect card edges, so a
+    /// line that disappeared under a card would read as broken.
+    pub links_area: gtk4::DrawingArea,
     pub state: Rc<RefCell<CanvasState>>,
     nodes: Rc<RefCell<Vec<(gtk4::Widget, (f64, f64))>>>,
 }
@@ -41,12 +49,17 @@ pub struct Canvas {
 impl Canvas {
     pub fn new() -> Canvas {
         let fixed = gtk4::Fixed::new();
-        let drawing_area = gtk4::DrawingArea::new();
-        drawing_area.set_can_target(false); // let clicks fall through to nodes
+        // Neither drawing area may target: both span the whole canvas, so a
+        // targetable one would swallow every click meant for a card.
+        let grid_area = gtk4::DrawingArea::new();
+        grid_area.set_can_target(false);
+        let links_area = gtk4::DrawingArea::new();
+        links_area.set_can_target(false);
 
         let overlay = gtk4::Overlay::new();
-        overlay.set_child(Some(&fixed));
-        overlay.add_overlay(&drawing_area);
+        overlay.set_child(Some(&grid_area));
+        overlay.add_overlay(&fixed);
+        overlay.add_overlay(&links_area);
 
         let state = Rc::new(RefCell::new(CanvasState::new()));
         let nodes: Rc<RefCell<Vec<(gtk4::Widget, (f64, f64))>>> = Rc::new(RefCell::new(Vec::new()));
@@ -68,6 +81,7 @@ impl Canvas {
             let state = Rc::clone(&state);
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
+            let grid_area = grid_area.clone();
             let drag_start_pan = Rc::clone(&drag_start_pan);
             drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
                 let start_pan = *drag_start_pan.borrow();
@@ -81,25 +95,34 @@ impl Canvas {
                     start_pan.0 + offset_x / state.zoom,
                     start_pan.1 + offset_y / state.zoom,
                 );
-                retransform_children(&fixed, &nodes.borrow(), &state);
+                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
             });
         }
         fixed.add_controller(drag);
 
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        // Capture, not the default bubble phase: a card's VTE terminal handles
+        // scroll itself (scrollback) and stops the event, so in the bubble
+        // phase `fixed` — an ancestor of every card — only ever saw a scroll
+        // that happened over empty canvas. Ctrl+scroll therefore did nothing
+        // wherever there was something to zoom. Capture runs root-to-target,
+        // so this sees the scroll first and still returns `Proceed` for a
+        // plain scroll, leaving the terminal's own scrollback intact.
+        scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
         {
             let state = Rc::clone(&state);
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
+            let grid_area = grid_area.clone();
             scroll.connect_scroll(move |controller, _dx, dy| {
                 if controller
                     .current_event_state()
                     .contains(gdk::ModifierType::CONTROL_MASK)
                 {
                     let mut state = state.borrow_mut();
-                    state.zoom *= if dy < 0.0 { 1.1 } else { 0.9 };
+                    state.zoom *= if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
                     state.clamp_zoom();
-                    retransform_children(&fixed, &nodes.borrow(), &state);
+                    apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -108,13 +131,41 @@ impl Canvas {
         }
         fixed.add_controller(scroll);
 
+        {
+            let state = Rc::clone(&state);
+            grid_area.set_draw_func(move |_area, cairo_ctx, width, height| {
+                draw_grid(cairo_ctx, width as f64, height as f64, &state.borrow());
+            });
+        }
+
         Canvas {
             overlay,
             fixed,
-            drawing_area,
+            grid_area,
+            links_area,
             state,
             nodes,
         }
+    }
+
+    /// Multiplies the zoom by `ZOOM_STEP` (`steps` positive zooms in,
+    /// negative out), the keyboard equivalent of Ctrl+scroll. Wired to
+    /// Ctrl+Plus/Ctrl+Minus in `main.rs`, because a modifier+scroll gesture
+    /// is not discoverable — the user asked to be able to zoom without ever
+    /// finding the one that already existed.
+    pub fn zoom_by_steps(&self, steps: i32) {
+        let mut state = self.state.borrow_mut();
+        state.zoom *= ZOOM_STEP.powi(steps);
+        state.clamp_zoom();
+        apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
+    }
+
+    /// Back to 1:1 at the world origin (Ctrl+0) — the way out of "I zoomed
+    /// or panned until I couldn't find my cards".
+    pub fn reset_view(&self) {
+        let mut state = self.state.borrow_mut();
+        *state = CanvasState::new();
+        apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
     }
 
     pub fn add_node(&self, child: &impl IsA<gtk4::Widget>, world_pos: (f64, f64)) {
@@ -147,15 +198,13 @@ impl Canvas {
         self.nodes.borrow_mut().retain(|(w, _)| w != child.as_ref());
     }
 
-    /// Registers the one draw callback for everything painted *behind* the
-    /// nodes: the world-space grid, then the link lines. `anchors` is called
-    /// on every draw and returns each link's world-space endpoints plus
-    /// whether it is currently selected.
+    /// Registers the draw callback for the link lines, which paint on top of
+    /// the cards. `anchors` is called on every draw and returns each link's
+    /// world-space endpoints plus whether it is currently selected.
     pub fn set_link_lines_source(&self, anchors: impl Fn() -> Vec<LinkLine> + 'static) {
         let state = Rc::clone(&self.state);
-        self.drawing_area.set_draw_func(move |_area, cairo_ctx, width, height| {
+        self.links_area.set_draw_func(move |_area, cairo_ctx, _width, _height| {
             let state = *state.borrow();
-            draw_grid(cairo_ctx, width as f64, height as f64, &state);
             for link in anchors() {
                 draw_link(cairo_ctx, &link, &state);
             }
@@ -164,8 +213,8 @@ impl Canvas {
 
     /// Calls `on_click` with the clicked point in *world* coordinates, for
     /// hit-testing things that are drawn rather than built out of widgets
-    /// (link lines). Attached to `fixed` rather than to `drawing_area`
-    /// because `drawing_area` covers the whole canvas with `can_target` off
+    /// (link lines). Attached to `fixed` rather than to `links_area` because
+    /// both drawing areas cover the whole canvas with `can_target` off
     /// precisely so node clicks still work — turning that on would swallow
     /// every click meant for a card. The gesture never claims its sequence,
     /// so `Canvas`'s own pan drag on the same widget is unaffected.
@@ -206,6 +255,10 @@ pub struct LinkLine {
 /// an empty canvas gives the eye nothing to measure movement against.
 const GRID_MINOR: f64 = 100.0;
 const GRID_MAJOR: f64 = 500.0;
+
+/// Multiplicative zoom per step, shared by Ctrl+scroll and Ctrl+Plus/Minus
+/// so the two agree on what "one notch" means.
+const ZOOM_STEP: f64 = 1.1;
 
 /// The four control points of a link's cubic Bezier, in world space. The
 /// handles stick straight out sideways from each card edge, which is what
@@ -358,15 +411,24 @@ fn apply_transform(
     fixed.set_child_transform(child, Some(&transform));
 }
 
-/// Re-applies every tracked child's transform after pan/zoom changes, using
+/// Re-applies every tracked child's transform after a pan/zoom change, using
 /// each child's known world position (tracked in `Canvas::nodes` as of
 /// `add_node`/`reposition_node`) rather than its current screen transform —
 /// this keeps both pan and zoom exact, including zoom re-centering on the
 /// canvas origin rather than the pointer (v1: simplest thing that works).
-fn retransform_children(fixed: &gtk4::Fixed, nodes: &[(gtk4::Widget, (f64, f64))], state: &CanvasState) {
+/// Also repaints the grid, which is drawn in world space and so is only ever
+/// stale for exactly these changes — `reposition_node` moves one card and
+/// deliberately does not come through here.
+fn apply_view(
+    fixed: &gtk4::Fixed,
+    grid_area: &gtk4::DrawingArea,
+    nodes: &[(gtk4::Widget, (f64, f64))],
+    state: &CanvasState,
+) {
     for (child, world_pos) in nodes {
         apply_transform(fixed, child, *world_pos, state);
     }
+    grid_area.queue_draw();
 }
 
 #[cfg(test)]
