@@ -905,9 +905,71 @@ fn world_drag_delta(
     ))
 }
 
-/// Wires a session card's drag-to-move (`node.drag_handle`), drag-to-resize
-/// (`node.resize_handle`), and close button (`node.close_button`). Shared by
-/// `restore` and `create_session`, same as `wire_link_controls`.
+/// Milestone-1 seam for generic canvas nodes: the part of `SessionEntry`/
+/// `NoteEntry` that `wire_node_chrome` needs, so a card's drag-to-move/
+/// resize/close wiring is written once instead of once per node kind. A
+/// future node kind (file tree, browser, ...) implements this instead of
+/// copying a ~140-line function; it does not touch how sessions or notes are
+/// stored, spawned, or persisted, which stay genuinely different per kind
+/// (a session owns a `Session`/PTY; a note does not) and are left alone.
+trait CardEntry {
+    fn position(&self) -> (f64, f64);
+    fn set_position(&mut self, position: (f64, f64));
+    fn size(&self) -> (f64, f64);
+    fn set_size(&mut self, size: (f64, f64));
+    /// Applies a size mid-drag. A note just requests a widget size; a session
+    /// additionally keeps the VTE character grid in step — see
+    /// `SessionNode::request_grid`.
+    fn apply_resize(&self, size: (f64, f64));
+}
+
+impl CardEntry for SessionEntry {
+    fn position(&self) -> (f64, f64) {
+        self.record.position
+    }
+    fn set_position(&mut self, position: (f64, f64)) {
+        self.record.position = position;
+    }
+    fn size(&self) -> (f64, f64) {
+        self.record.size
+    }
+    fn set_size(&mut self, size: (f64, f64)) {
+        self.record.size = size;
+    }
+    fn apply_resize(&self, size: (f64, f64)) {
+        self.node.request_grid(size.0, size.1);
+    }
+}
+
+impl CardEntry for NoteEntry {
+    fn position(&self) -> (f64, f64) {
+        self.record.position
+    }
+    fn set_position(&mut self, position: (f64, f64)) {
+        self.record.position = position;
+    }
+    fn size(&self) -> (f64, f64) {
+        self.record.size
+    }
+    fn set_size(&mut self, size: (f64, f64)) {
+        self.record.size = size;
+    }
+    fn apply_resize(&self, size: (f64, f64)) {
+        self.node
+            .text_view
+            .set_size_request(size.0 as i32, size.1 as i32);
+    }
+}
+
+/// Wires a card's drag-to-move (`drag_handle`), drag-to-resize
+/// (`resize_handle`), and `close_button` — the chrome shared by every node
+/// kind on the canvas. `entries` and `on_close` are the only places this
+/// function knows which kind it's wiring: a plain field accessor
+/// (`|app| &mut app.sessions`-shaped, written as a free function so it has no
+/// captures) and `App::close_session`/`App::close_note`. `resizable_widget`
+/// is the widget whose *real* GTK allocation a resize should anchor to and
+/// snap back to (`allocated_size`'s doc explains why that differs from the
+/// stored record).
 ///
 /// Both gestures call `gesture.set_state(Claimed)` in their `drag-begin`
 /// handler. Without this, the same press would also bubble up to `Canvas`'s
@@ -916,10 +978,20 @@ fn world_drag_delta(
 /// widget's ancestor chain during the bubble phase unless one of them claims
 /// the event sequence — so without claiming, moving/resizing a card would
 /// simultaneously pan the whole canvas underneath it.
-fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
-    node.close_button.connect_clicked({
+fn wire_node_chrome<T: CardEntry + 'static>(
+    app: &Rc<RefCell<App>>,
+    container: &gtk4::Box,
+    drag_handle: &gtk4::Box,
+    resize_handle: &gtk4::Box,
+    close_button: &gtk4::Button,
+    resizable_widget: gtk4::Widget,
+    id: Uuid,
+    entries: fn(&mut App) -> &mut HashMap<Uuid, T>,
+    on_close: fn(&Rc<RefCell<App>>, Uuid),
+) {
+    close_button.connect_clicked({
         let app = Rc::clone(app);
-        move |_| App::close_session(&app, id)
+        move |_| on_close(&app, id)
     });
 
     // (world position at drag start, pointer position at drag start in the
@@ -932,19 +1004,18 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
         let move_start = Rc::clone(&move_start);
         move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let app_ref = app.borrow();
-            *move_start.borrow_mut() = match (
-                app_ref.sessions.get(&id),
-                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
-            ) {
-                (Some(entry), Some(pointer)) => Some((entry.record.position, pointer)),
+            let mut app_mut = app.borrow_mut();
+            let pointer = canvas_point(gesture, &app_mut.canvas.fixed, (x, y));
+            let position = entries(&mut app_mut).get(&id).map(CardEntry::position);
+            *move_start.borrow_mut() = match (position, pointer) {
+                (Some(position), Some(pointer)) => Some((position, pointer)),
                 _ => None,
             };
         }
     });
     drag.connect_drag_update({
         let app = Rc::clone(app);
-        let container = node.container.clone();
+        let container = container.clone();
         let move_start = Rc::clone(&move_start);
         move |gesture, _offset_x, _offset_y| {
             let Some((start_position, start_pointer)) = *move_start.borrow() else {
@@ -960,8 +1031,8 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
             };
             let mut app_mut = app.borrow_mut();
             app_mut.canvas.reposition_node(&container, new_position);
-            if let Some(entry) = app_mut.sessions.get_mut(&id) {
-                entry.record.position = new_position;
+            if let Some(entry) = entries(&mut app_mut).get_mut(&id) {
+                entry.set_position(new_position);
             }
         }
     });
@@ -978,7 +1049,7 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
         let app = Rc::clone(app);
         move |_gesture, _x, _y| App::schedule_persist(&app)
     });
-    node.drag_handle.add_controller(drag);
+    drag_handle.add_controller(drag);
 
     // Same shape as `move_start` above: resizing a card moves its own
     // bottom-right grip, so the gesture's raw offsets suffer the identical
@@ -987,20 +1058,19 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     let resize = gtk4::GestureDrag::new();
     resize.connect_drag_begin({
         let app = Rc::clone(app);
-        let terminal = node.terminal.clone();
+        let resizable_widget = resizable_widget.clone();
         let resize_start = Rc::clone(&resize_start);
         move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let app_ref = app.borrow();
-            *resize_start.borrow_mut() = match (
-                app_ref.sessions.get(&id),
-                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
-            ) {
-                // The terminal's *real* allocation, not `record.size` — see
-                // `allocated_size` for why the two drift and why starting
-                // from the record made a shrunken card un-growable.
-                (Some(entry), Some(pointer)) => Some((
-                    allocated_size(&terminal).unwrap_or(entry.record.size),
+            let mut app_mut = app.borrow_mut();
+            let pointer = canvas_point(gesture, &app_mut.canvas.fixed, (x, y));
+            // The widget's *real* allocation, not the stored record — see
+            // `allocated_size` for why the two drift and why starting from
+            // the record made a shrunken card un-growable.
+            let fallback_size = entries(&mut app_mut).get(&id).map(CardEntry::size);
+            *resize_start.borrow_mut() = match (fallback_size, pointer) {
+                (Some(fallback_size), Some(pointer)) => Some((
+                    allocated_size(&resizable_widget).unwrap_or(fallback_size),
                     pointer,
                 )),
                 _ => None,
@@ -1026,13 +1096,11 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
                 }
             };
             let mut app_mut = app.borrow_mut();
-            let Some(entry) = app_mut.sessions.get_mut(&id) else {
+            let Some(entry) = entries(&mut app_mut).get_mut(&id) else {
                 return;
             };
-            entry.record.size = new_size;
-            // Only a size *request*. The PTY follows VTE's real grid from
-            // `pump_output` instead — see `SessionNode::request_grid`.
-            entry.node.request_grid(new_size.0, new_size.1);
+            entry.set_size(new_size);
+            entry.apply_resize(new_size);
         }
     });
     // Same reasoning as the move gesture above: persist once at drag-end,
@@ -1043,140 +1111,57 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     // record-vs-reality mismatch described on `allocated_size`.
     resize.connect_drag_end({
         let app = Rc::clone(app);
-        let terminal = node.terminal.clone();
+        let resizable_widget = resizable_widget.clone();
         move |_gesture, _x, _y| {
-            if let Some(size) = allocated_size(&terminal) {
-                if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
-                    entry.record.size = size;
+            if let Some(size) = allocated_size(&resizable_widget) {
+                let mut app_mut = app.borrow_mut();
+                if let Some(entry) = entries(&mut app_mut).get_mut(&id) {
+                    entry.set_size(size);
                 }
             }
             App::schedule_persist(&app);
         }
     });
-    node.resize_handle.add_controller(resize);
+    resize_handle.add_controller(resize);
 }
 
-/// Note equivalent of `wire_session_chrome` — same drag-to-move/resize/close
-/// wiring, against `app.notes` and `node.text_view` instead of
-/// `app.sessions`/`node.terminal`.
+fn sessions_map(app: &mut App) -> &mut HashMap<Uuid, SessionEntry> {
+    &mut app.sessions
+}
+
+fn notes_map(app: &mut App) -> &mut HashMap<Uuid, NoteEntry> {
+    &mut app.notes
+}
+
+/// Wires a session card's move/resize/close chrome via `wire_node_chrome`.
+/// Shared by `restore` and `create_session`, same as `wire_link_controls`.
+fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
+    wire_node_chrome(
+        app,
+        &node.container,
+        &node.drag_handle,
+        &node.resize_handle,
+        &node.close_button,
+        node.terminal.clone().upcast(),
+        id,
+        sessions_map,
+        App::close_session,
+    );
+}
+
+/// Note equivalent of `wire_session_chrome`, via the same `wire_node_chrome`.
 fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
-    node.close_button.connect_clicked({
-        let app = Rc::clone(app);
-        move |_| App::close_note(&app, id)
-    });
-
-    let move_start = Rc::new(RefCell::new(None));
-    let drag = gtk4::GestureDrag::new();
-    drag.connect_drag_begin({
-        let app = Rc::clone(app);
-        let move_start = Rc::clone(&move_start);
-        move |gesture, x, y| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let app_ref = app.borrow();
-            *move_start.borrow_mut() = match (
-                app_ref.notes.get(&id),
-                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
-            ) {
-                (Some(entry), Some(pointer)) => Some((entry.record.position, pointer)),
-                _ => None,
-            };
-        }
-    });
-    drag.connect_drag_update({
-        let app = Rc::clone(app);
-        let container = node.container.clone();
-        let move_start = Rc::clone(&move_start);
-        move |gesture, _offset_x, _offset_y| {
-            let Some((start_position, start_pointer)) = *move_start.borrow() else {
-                return;
-            };
-            let new_position = {
-                let app_ref = app.borrow();
-                let zoom = app_ref.canvas.state.borrow().zoom;
-                match world_drag_delta(gesture, &app_ref.canvas.fixed, start_pointer, zoom) {
-                    Some((dx, dy)) => (start_position.0 + dx, start_position.1 + dy),
-                    None => return,
-                }
-            };
-            let mut app_mut = app.borrow_mut();
-            app_mut.canvas.reposition_node(&container, new_position);
-            if let Some(entry) = app_mut.notes.get_mut(&id) {
-                entry.record.position = new_position;
-            }
-        }
-    });
-    // See the matching comment in `wire_session_chrome`: persisting on every
-    // `drag-update` tick (rather than once here, at drag end) is what made
-    // dragging visibly stutter instead of smoothly tracking the cursor.
-    drag.connect_drag_end({
-        let app = Rc::clone(app);
-        move |_gesture, _x, _y| App::schedule_persist(&app)
-    });
-    node.drag_handle.add_controller(drag);
-
-    let resize_start = Rc::new(RefCell::new(None));
-    let resize = gtk4::GestureDrag::new();
-    resize.connect_drag_begin({
-        let app = Rc::clone(app);
-        let text_view = node.text_view.clone();
-        let resize_start = Rc::clone(&resize_start);
-        move |gesture, x, y| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let app_ref = app.borrow();
-            *resize_start.borrow_mut() = match (
-                app_ref.notes.get(&id),
-                canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
-            ) {
-                // Same reasoning as `wire_session_chrome`: anchor the drag to
-                // the body's real allocation, not the stored record.
-                (Some(entry), Some(pointer)) => Some((
-                    allocated_size(&text_view).unwrap_or(entry.record.size),
-                    pointer,
-                )),
-                _ => None,
-            };
-        }
-    });
-    resize.connect_drag_update({
-        let app = Rc::clone(app);
-        let text_view = node.text_view.clone();
-        let resize_start = Rc::clone(&resize_start);
-        move |gesture, _offset_x, _offset_y| {
-            let Some((start_size, start_pointer)) = *resize_start.borrow() else {
-                return;
-            };
-            let new_size = {
-                let app_ref = app.borrow();
-                let zoom = app_ref.canvas.state.borrow().zoom;
-                match world_drag_delta(gesture, &app_ref.canvas.fixed, start_pointer, zoom) {
-                    Some((dx, dy)) => (
-                        (start_size.0 + dx).max(crate::node::MIN_NODE_WIDTH),
-                        (start_size.1 + dy).max(crate::node::MIN_NODE_HEIGHT),
-                    ),
-                    None => return,
-                }
-            };
-            text_view.set_size_request(new_size.0 as i32, new_size.1 as i32);
-            if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
-                entry.record.size = new_size;
-            }
-        }
-    });
-    // See `wire_session_chrome`'s matching handler: persist once, and snap
-    // the record to the body's real size.
-    resize.connect_drag_end({
-        let app = Rc::clone(app);
-        let text_view = node.text_view.clone();
-        move |_gesture, _x, _y| {
-            if let Some(size) = allocated_size(&text_view) {
-                if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
-                    entry.record.size = size;
-                }
-            }
-            App::schedule_persist(&app);
-        }
-    });
-    node.resize_handle.add_controller(resize);
+    wire_node_chrome(
+        app,
+        &node.container,
+        &node.drag_handle,
+        &node.resize_handle,
+        &node.close_button,
+        node.text_view.clone().upcast(),
+        id,
+        notes_map,
+        App::close_note,
+    );
 }
 
 /// Wires a session node's link button (click to enter link mode, sourced
