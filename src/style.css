@@ -31,6 +31,20 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 
 .node-title-bar { padding: 2px 4px; }
 
+/* Adwaita's default button metrics (34x34) made a card's title bar alone
+   ~320px wide and 34px tall, which is a lot of chrome on a small card and
+   sets a floor on how narrow a card can be dragged. Compact, evenly sized
+   icon buttons across both node kinds. */
+.node-title-bar button, .note-title-bar button {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0 2px;
+}
+
+/* Click-to-rename affordance on a session card's title. */
+.node-title { padding: 0 2px; border-radius: 4px; }
+.node-title:hover { background-color: rgba(127, 127, 127, 0.22); }
+
 /* Tinted to a slightly darker shade of the note's own color rather than a
    flat dark overlay, so the title bar reads as part of the same card. */
 .note-yellow .note-title-bar { background-color: #f2e48f; min-height: 20px; }
@@ -45,8 +59,19 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 .note-title-bar button, .note-title-bar button image { color: #1f1f1f; }
 .note-title-bar button:hover { background-color: rgba(0, 0, 0, 0.12); }
 
-.resize-handle { background-color: rgba(0, 0, 0, 0.18); border-radius: 3px; margin: 2px; }
-.resize-handle:hover { background-color: rgba(0, 0, 0, 0.32); }
+/* The grip sits on top of a `vte4::Terminal`, whose background is black, so
+   the old `rgba(0, 0, 0, 0.18)` fill was all but invisible there — the only
+   control that can resize a card was effectively unfindable, which is half of
+   why a shrunken card read as impossible to drag back up. A translucent light
+   fill with a dark outline stays visible against both a black terminal and a
+   pastel sticky note. */
+.resize-handle {
+    background-color: rgba(255, 255, 255, 0.4);
+    border: 1px solid rgba(0, 0, 0, 0.5);
+    border-radius: 3px;
+    margin: 2px;
+}
+.resize-handle:hover { background-color: rgba(255, 255, 255, 0.85); }
 
 /* The card whose link button was clicked, while it waits for a target click
    (`App::refresh_link_highlight`). Link mode is otherwise entirely invisible,

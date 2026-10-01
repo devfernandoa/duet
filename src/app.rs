@@ -26,6 +26,11 @@ pub struct SessionEntry {
     pub record: SessionRecord,
     pub session: Session,
     pub node: SessionNode,
+    /// The character grid last pushed to this session's PTY, so
+    /// `pump_output`'s sync only sends a `SIGWINCH` when the grid actually
+    /// changed. `None` means "never synced" (the PTY still has
+    /// `Session::spawn`'s 80x24).
+    pub pty_grid: Option<(u16, u16)>,
     /// Whether the "exited" status badge has already been shown for this
     /// session. Set once by `pump_output` the first time `exit_status()`
     /// becomes `Some`, so the label is set once rather than every tick.
@@ -134,14 +139,11 @@ impl App {
                 }
             };
             match Session::spawn(record.cwd.clone(), launch) {
-                Ok(mut session) => {
+                Ok(session) => {
                     let node = SessionNode::new(&record.name);
-                    // Apply the saved size to the terminal's character grid
-                    // *and* to the PTY, so the restored program wraps its
-                    // output at the same column count VTE renders.
-                    if let Some((cols, rows)) = node.resize_grid(record.size.0, record.size.1) {
-                        let _ = session.resize(rows, cols);
-                    }
+                    // Ask for the saved size; `pump_output` syncs the PTY to
+                    // whatever grid VTE actually ends up rendering.
+                    node.request_grid(record.size.0, record.size.1);
                     let id = record.id;
                     {
                         let app_ref = app.borrow();
@@ -163,6 +165,7 @@ impl App {
                             record,
                             session,
                             node,
+                            pty_grid: None,
                             exit_shown: false,
                         },
                     );
@@ -231,6 +234,19 @@ impl App {
     pub fn pump_output(&mut self) {
         let mut outgoing: Vec<(Uuid, Vec<Vec<u8>>)> = Vec::new();
         for (&id, entry) in self.sessions.iter_mut() {
+            // The one authoritative place the PTY is sized, from VTE's real
+            // post-allocation grid. Every other path (resize drag, restore,
+            // create, collapse/expand, a font change) only ever asks the
+            // terminal for a size request — see `SessionNode::request_grid`
+            // for why a request is not what VTE ends up rendering, and why
+            // resizing the PTY to the *requested* grid garbles the text of a
+            // card narrower than its own title bar.
+            if let Some(grid) = entry.node.actual_grid() {
+                if entry.pty_grid != Some(grid) {
+                    let _ = entry.session.resize(grid.1, grid.0);
+                    entry.pty_grid = Some(grid);
+                }
+            }
             let chunks = entry.session.try_recv_output();
             for chunk in &chunks {
                 entry.node.feed(chunk);
@@ -298,13 +314,9 @@ impl App {
                 viewport_center_world,
             )?
         };
-        let mut session = Session::spawn(cwd, launch)?;
+        let session = Session::spawn(cwd, launch)?;
         let node = SessionNode::new(&name);
-        // Same as `restore`: the stored size is the single source of truth for
-        // both the VTE grid and the PTY size.
-        if let Some((cols, rows)) = node.resize_grid(record.size.0, record.size.1) {
-            let _ = session.resize(rows, cols);
-        }
+        node.request_grid(record.size.0, record.size.1);
         let id = record.id;
         {
             let app_ref = app.borrow();
@@ -326,6 +338,7 @@ impl App {
                 record,
                 session,
                 node,
+                pty_grid: None,
                 exit_shown: false,
             },
         );
@@ -587,6 +600,28 @@ impl App {
     }
 }
 
+/// A node body's real current size in pre-zoom pixels (GTK allocations are in
+/// the widget's own untransformed space, so this is directly comparable to the
+/// `size` stored in a record), or `None` if it isn't allocated yet.
+///
+/// Resize drags use this rather than `record.size` as their starting point,
+/// which is the fix for the "card shrank and can't be dragged back up" state.
+/// The two quantities drift apart, because a card's rendered width is
+/// `max(record.size.0, title-bar minimum)`: a 28-character session name
+/// measured 348px of title bar, so a card whose record said 220 actually drew
+/// 348 wide. Starting a resize from the stale 220 meant the first 128px of
+/// rightward drag changed nothing visible at all, and every fresh drag
+/// restarted from the same stale number — the card read as un-growable. The
+/// title label is now ellipsized (see `SessionNode::new`) so the title bar
+/// stops forcing a minimum, but anchoring the drag to the real size is what
+/// makes the gesture self-correcting regardless of where a mismatch comes
+/// from (grid rounding, a future wider title bar, a restored record).
+fn allocated_size(widget: &impl IsA<gtk4::Widget>) -> Option<(f64, f64)> {
+    let widget = widget.as_ref();
+    let (width, height) = (widget.width(), widget.height());
+    (width > 0 && height > 0).then_some((width as f64, height as f64))
+}
+
 /// Expresses `local` — a point in the coordinate space of the widget
 /// `gesture` is attached to — in the canvas `Fixed`'s coordinate space.
 fn canvas_point(
@@ -725,6 +760,7 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
     let resize = gtk4::GestureDrag::new();
     resize.connect_drag_begin({
         let app = Rc::clone(app);
+        let terminal = node.terminal.clone();
         let resize_start = Rc::clone(&resize_start);
         move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
@@ -733,7 +769,13 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
                 app_ref.sessions.get(&id),
                 canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
             ) {
-                (Some(entry), Some(pointer)) => Some((entry.record.size, pointer)),
+                // The terminal's *real* allocation, not `record.size` — see
+                // `allocated_size` for why the two drift and why starting
+                // from the record made a shrunken card un-growable.
+                (Some(entry), Some(pointer)) => Some((
+                    allocated_size(&terminal).unwrap_or(entry.record.size),
+                    pointer,
+                )),
                 _ => None,
             };
         }
@@ -761,27 +803,28 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
                 return;
             };
             entry.record.size = new_size;
-            // Resizing a terminal card means resizing *two* things, not one:
-            // VTE's character grid and the PTY behind it. The old code only
-            // called `set_size_request` on the terminal widget, which (a) is
-            // merely a minimum, so it could never shrink the card below VTE's
-            // natural size, and (b) never told the PTY anything — so the
-            // program inside kept wrapping at the 80 columns `Session::spawn`
-            // opened with while VTE rendered a different grid. That is what
-            // garbled the text. `resize_grid` returns `None` when the grid
-            // hasn't actually changed, which keeps this off the hot path for
-            // sub-character pointer movement instead of firing a `SIGWINCH`
-            // at the agent on every motion event.
-            if let Some((cols, rows)) = entry.node.resize_grid(new_size.0, new_size.1) {
-                let _ = entry.session.resize(rows, cols);
-            }
+            // Only a size *request*. The PTY follows VTE's real grid from
+            // `pump_output` instead — see `SessionNode::request_grid`.
+            entry.node.request_grid(new_size.0, new_size.1);
         }
     });
     // Same reasoning as the move gesture above: persist once at drag-end,
-    // not on every resize tick.
+    // not on every resize tick. The record is also snapped back to the card's
+    // real size here, so what gets persisted is a size the card can actually
+    // render — otherwise a card dragged below its title bar's minimum width
+    // would save the smaller requested number and restore into the same
+    // record-vs-reality mismatch described on `allocated_size`.
     resize.connect_drag_end({
         let app = Rc::clone(app);
-        move |_gesture, _x, _y| App::schedule_persist(&app)
+        let terminal = node.terminal.clone();
+        move |_gesture, _x, _y| {
+            if let Some(size) = allocated_size(&terminal) {
+                if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
+                    entry.record.size = size;
+                }
+            }
+            App::schedule_persist(&app);
+        }
     });
     node.resize_handle.add_controller(resize);
 }
@@ -848,6 +891,7 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
     let resize = gtk4::GestureDrag::new();
     resize.connect_drag_begin({
         let app = Rc::clone(app);
+        let text_view = node.text_view.clone();
         let resize_start = Rc::clone(&resize_start);
         move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
@@ -856,7 +900,12 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
                 app_ref.notes.get(&id),
                 canvas_point(gesture, &app_ref.canvas.fixed, (x, y)),
             ) {
-                (Some(entry), Some(pointer)) => Some((entry.record.size, pointer)),
+                // Same reasoning as `wire_session_chrome`: anchor the drag to
+                // the body's real allocation, not the stored record.
+                (Some(entry), Some(pointer)) => Some((
+                    allocated_size(&text_view).unwrap_or(entry.record.size),
+                    pointer,
+                )),
                 _ => None,
             };
         }
@@ -886,9 +935,19 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
             }
         }
     });
+    // See `wire_session_chrome`'s matching handler: persist once, and snap
+    // the record to the body's real size.
     resize.connect_drag_end({
         let app = Rc::clone(app);
-        move |_gesture, _x, _y| App::schedule_persist(&app)
+        let text_view = node.text_view.clone();
+        move |_gesture, _x, _y| {
+            if let Some(size) = allocated_size(&text_view) {
+                if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
+                    entry.record.size = size;
+                }
+            }
+            App::schedule_persist(&app);
+        }
     });
     node.resize_handle.add_controller(resize);
 }

@@ -7,15 +7,25 @@ use gtk4::prelude::*;
 use vte4::TerminalExt;
 
 /// Minimum size (pixels, pre-zoom) either a session card's terminal or a
-/// note's text area can be resized down to via `resize_handle`.
+/// note's text area can be resized down to via `resize_handle`. This floor is
+/// what keeps the resize grip reachable: at 220x140 the grip still sits on a
+/// body large enough to hold it clear of the title bar.
 pub const MIN_NODE_WIDTH: f64 = 220.0;
 pub const MIN_NODE_HEIGHT: f64 = 140.0;
 
-/// Pixel size -> terminal character grid, clamped to what a PTY accepts
-/// (`Session::resize` floors at 2 columns / 1 row). Split out from
-/// `SessionNode::resize_grid` so the arithmetic is testable without a GTK
-/// display. `None` when the cell size is non-positive, which would otherwise
-/// turn a pixel width straight into an absurd column count.
+/// Character-grid floor, independent of the pixel floor above. The pixel
+/// floor normally dominates (220x140 is a 24x6 grid at a 9x21 cell), but a
+/// large font or a high-DPI cell size could make MIN_NODE_* map to a
+/// degenerate grid, and a 2x1 terminal is worse than useless — it makes
+/// almost any program's output unreadable and `SIGWINCH`-thrashes the agent.
+const MIN_GRID_COLS: f64 = 10.0;
+const MIN_GRID_ROWS: f64 = 3.0;
+
+/// Pixel size -> terminal character grid, floored at `MIN_GRID_COLS` x
+/// `MIN_GRID_ROWS`. Split out from `SessionNode::request_grid` so the
+/// arithmetic is testable without a GTK display. `None` when the cell size is
+/// non-positive, which would otherwise turn a pixel width straight into an
+/// absurd column count.
 fn grid_size(width: f64, height: f64, char_width: i64, char_height: i64) -> Option<(u16, u16)> {
     if char_width <= 0 || char_height <= 0 || !width.is_finite() || !height.is_finite() {
         return None;
@@ -24,8 +34,8 @@ fn grid_size(width: f64, height: f64, char_width: i64, char_height: i64) -> Opti
         (pixels / cell as f64).floor().clamp(floor, u16::MAX as f64) as u16
     };
     Some((
-        fit(width, char_width, 2.0),
-        fit(height, char_height, 1.0),
+        fit(width, char_width, MIN_GRID_COLS),
+        fit(height, char_height, MIN_GRID_ROWS),
     ))
 }
 
@@ -36,7 +46,10 @@ fn grid_size(width: f64, height: f64, char_width: i64, char_height: i64) -> Opti
 /// purely cosmetic widget setup.
 fn resize_handle() -> gtk4::Box {
     let handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    handle.set_size_request(14, 14);
+    // 16px rather than 14: this is the only way to resize a card, and at the
+    // minimum card size it is the only chrome on the body at all, so it needs
+    // a hit area that is comfortable to find without zooming in.
+    handle.set_size_request(16, 16);
     handle.set_halign(gtk4::Align::End);
     handle.set_valign(gtk4::Align::End);
     handle.add_css_class("resize-handle");
@@ -47,7 +60,17 @@ fn resize_handle() -> gtk4::Box {
 pub struct SessionNode {
     pub container: gtk4::Box,
     pub title_bar: gtk4::Box,
+    /// The session's name, shown when not being renamed. Click it to rename
+    /// (wired in `app.rs`, which owns the uniqueness rule and persistence).
+    pub title_label: gtk4::Label,
+    /// Swapped in for `title_label` during an inline rename. Exactly one of
+    /// the two is visible at a time; see `SessionNode::set_renaming`.
+    pub title_entry: gtk4::Entry,
     pub terminal: vte4::Terminal,
+    /// The card's collapsible part (terminal + resize grip). Hidden by the
+    /// minimize button, leaving just the title bar.
+    pub body: gtk4::Overlay,
+    pub minimize_button: gtk4::Button,
     pub link_button: gtk4::Button,
     pub handoff_button: gtk4::Button,
     pub status_label: gtk4::Label,
@@ -66,24 +89,47 @@ pub struct SessionNode {
 
 impl SessionNode {
     pub fn new(name: &str) -> SessionNode {
-        let title = gtk4::Label::new(Some(name));
-        title.add_css_class("heading");
+        let title_label = gtk4::Label::new(Some(name));
+        title_label.add_css_class("heading");
+        title_label.add_css_class("node-title");
+        title_label.set_cursor_from_name(Some("pointer"));
+        // A long session name otherwise sets the whole card's minimum width
+        // (a 28-character name measured 348px wide), so the card could not be
+        // resized narrower than its own title and `record.size` drifted away
+        // from the card's real width.
+        title_label.set_tooltip_text(Some("Click to rename"));
+        title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title_label.set_max_width_chars(16);
+
+        let title_entry = gtk4::Entry::new();
+        title_entry.set_visible(false);
+        title_entry.set_max_width_chars(16);
 
         let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         drag_handle.set_hexpand(true);
         drag_handle.set_cursor_from_name(Some("grab"));
 
+        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
+        minimize_button.add_css_class("flat");
+        minimize_button.set_tooltip_text(Some("Collapse to title bar"));
         let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
+        link_button.add_css_class("flat");
+        link_button.set_tooltip_text(Some("Link this session's output into another"));
         let handoff_button = gtk4::Button::from_icon_name("media-playlist-shuffle-symbolic");
+        handoff_button.add_css_class("flat");
+        handoff_button.set_tooltip_text(Some("Hand off to the other agent"));
         let status_label = gtk4::Label::new(None);
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
+        close_button.set_tooltip_text(Some("Close session"));
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("node-title-bar");
-        title_bar.append(&title);
+        title_bar.append(&title_label);
+        title_bar.append(&title_entry);
         title_bar.append(&drag_handle);
         title_bar.append(&status_label);
+        title_bar.append(&minimize_button);
         title_bar.append(&link_button);
         title_bar.append(&handoff_button);
         title_bar.append(&close_button);
@@ -93,8 +139,23 @@ impl SessionNode {
         // *minimum*. VTE's natural size (80x24 grid = 722x506px at a 9x21
         // cell) stayed larger than any request under ~722x506, so `GtkFixed`
         // kept allocating the natural size and the request had no effect at
-        // all. Callers size the terminal through `resize_grid` instead.
+        // all. Callers size the terminal through `request_grid` instead.
         let terminal = vte4::Terminal::new();
+
+        // Focus-follows-mouse ("sloppy focus"): hovering a card's terminal is
+        // enough to start typing into it, no click needed. An
+        // `EventControllerMotion` is deliberately used rather than a click
+        // gesture — it only observes crossing/motion events and never claims
+        // a button sequence, so it cannot race the drag/resize `GestureDrag`s
+        // or the link-completion `GestureClick` that also live on this card.
+        let motion = gtk4::EventControllerMotion::new();
+        motion.connect_enter({
+            let terminal = terminal.clone();
+            move |_controller, _x, _y| {
+                terminal.grab_focus();
+            }
+        });
+        terminal.add_controller(motion);
 
         let resize_handle = resize_handle();
         let body = gtk4::Overlay::new();
@@ -109,7 +170,11 @@ impl SessionNode {
         SessionNode {
             container,
             title_bar,
+            title_label,
+            title_entry,
             terminal,
+            body,
+            minimize_button,
             link_button,
             handoff_button,
             status_label,
@@ -119,37 +184,65 @@ impl SessionNode {
         }
     }
 
-    /// Resizes the terminal to the largest character grid that fits
-    /// `width` x `height` pixels, and reports the new grid so the caller can
-    /// resize the PTY to match via `Session::resize`.
+    /// Shows the rename entry (pre-filled with the current name) in place of
+    /// the title label, or puts the label back. Kept here rather than in
+    /// `app.rs` so "exactly one of the two is visible" can't be violated by a
+    /// caller that only toggles one of them.
+    pub fn set_renaming(&self, renaming: bool) {
+        if renaming {
+            self.title_entry.set_text(&self.title_label.text());
+        }
+        self.title_label.set_visible(!renaming);
+        self.title_entry.set_visible(renaming);
+        if renaming {
+            self.title_entry.grab_focus();
+        }
+    }
+
+    /// Asks the terminal for the largest character grid that fits
+    /// `width` x `height` pixels. A no-op when the grid is already that size,
+    /// so a resize drag doesn't queue a relayout on every motion event, and
+    /// when VTE reports a non-positive cell size (the pixel -> grid
+    /// conversion would be meaningless).
     ///
-    /// Why the grid and not pixels: a `vte4::Terminal` renders a fixed
-    /// character grid, and *two* separate things have to be told about a
-    /// resize. VTE recomputes its own grid from whatever allocation it gets,
-    /// but the PTY it is displaying does not — it keeps whatever size
-    /// `Session::spawn` opened it with (80x24), so the program inside keeps
-    /// wrapping its output at 80 columns while VTE renders a wider grid.
-    /// That mismatch is what garbled the text on resize.
-    ///
-    /// Returns `None` when the grid is already that size (so the caller skips
-    /// a redundant PTY resize — this also throttles `SIGWINCH` during a drag
-    /// to once per character cell crossed, rather than once per motion
-    /// event), or when VTE reports a non-positive cell size and the
-    /// conversion would be meaningless.
-    pub fn resize_grid(&self, width: f64, height: f64) -> Option<(u16, u16)> {
-        let (cols, rows) = grid_size(
+    /// This is only a *request*. `vte_terminal_set_size` sets the widget's
+    /// size request, but VTE recomputes its real grid from whatever
+    /// allocation its parent then hands it — and the card's title bar sets a
+    /// minimum width of its own (~300px of buttons), so a narrower request is
+    /// simply overruled and the terminal silently gains columns. Nothing here
+    /// touches the PTY for that reason: `App::pump_output` syncs the PTY from
+    /// `column_count()`/`row_count()`, the only grid numbers that are
+    /// actually true. Telling the PTY what was *requested* instead is what
+    /// re-introduced the garbled-text mismatch at small card sizes.
+    pub fn request_grid(&self, width: f64, height: f64) {
+        let Some((cols, rows)) = grid_size(
             width,
             height,
             self.terminal.char_width(),
             self.terminal.char_height(),
-        )?;
+        ) else {
+            return;
+        };
         if (i64::from(cols), i64::from(rows))
-            == (self.terminal.column_count(), self.terminal.row_count())
+            != (self.terminal.column_count(), self.terminal.row_count())
         {
+            self.terminal.set_size(i64::from(cols), i64::from(rows));
+        }
+    }
+
+    /// The terminal's real character grid as `(cols, rows)` — what VTE is
+    /// actually rendering after allocation, which is what the PTY must match.
+    /// `None` while the terminal isn't mapped (a collapsed card, or before
+    /// first allocation), since a hidden widget's grid says nothing about
+    /// what the program inside should wrap to.
+    pub fn actual_grid(&self) -> Option<(u16, u16)> {
+        if !self.terminal.is_mapped() {
             return None;
         }
-        self.terminal.set_size(i64::from(cols), i64::from(rows));
-        Some((cols, rows))
+        let cols = u16::try_from(self.terminal.column_count()).ok()?;
+        let rows = u16::try_from(self.terminal.row_count()).ok()?;
+        (f64::from(cols) >= MIN_GRID_COLS && f64::from(rows) >= MIN_GRID_ROWS)
+            .then_some((cols, rows))
     }
 
     pub fn feed(&self, bytes: &[u8]) {
@@ -171,6 +264,9 @@ pub struct NoteNode {
     pub container: gtk4::Box,
     pub title_bar: gtk4::Box,
     pub text_view: gtk4::TextView,
+    /// Same role as `SessionNode::body`: the part the minimize button hides.
+    pub body: gtk4::Overlay,
+    pub minimize_button: gtk4::Button,
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
@@ -182,12 +278,17 @@ impl NoteNode {
         drag_handle.set_hexpand(true);
         drag_handle.set_cursor_from_name(Some("grab"));
 
+        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
+        minimize_button.add_css_class("flat");
+        minimize_button.set_tooltip_text(Some("Collapse to title bar"));
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
+        close_button.set_tooltip_text(Some("Delete note"));
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("note-title-bar");
         title_bar.append(&drag_handle);
+        title_bar.append(&minimize_button);
         title_bar.append(&close_button);
 
         let text_view = gtk4::TextView::new();
@@ -220,6 +321,8 @@ impl NoteNode {
             container,
             title_bar,
             text_view,
+            body,
+            minimize_button,
             drag_handle,
             close_button,
             resize_handle,
@@ -247,9 +350,16 @@ mod tests {
         assert_eq!(grid_size(728.0, 524.0, 9, 21), Some((80, 24)));
     }
 
+    /// The floor is what stops a card from reaching a degenerate terminal
+    /// state it can't usefully be dragged back out of.
     #[test]
-    fn grid_size_clamps_to_what_a_pty_accepts() {
-        assert_eq!(grid_size(0.0, 0.0, 9, 21), Some((2, 1)));
+    fn grid_size_never_goes_below_the_usable_floor() {
+        assert_eq!(grid_size(0.0, 0.0, 9, 21), Some((10, 3)));
+        // A cell size big enough that even MIN_NODE_* maps below the floor.
+        assert_eq!(
+            grid_size(super::MIN_NODE_WIDTH, super::MIN_NODE_HEIGHT, 40, 80),
+            Some((10, 3))
+        );
     }
 
     #[test]
@@ -258,4 +368,6 @@ mod tests {
         assert_eq!(grid_size(f64::NAN, 506.0, 9, 21), None);
     }
 }
+
+
 
