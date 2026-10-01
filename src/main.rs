@@ -12,6 +12,9 @@ use adw::prelude::*;
 use app::App;
 use gtk4::glib;
 use libadwaita as adw;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 const APP_ID: &str = "dev.fernandoa.duet";
@@ -39,7 +42,6 @@ fn build_ui(application: &adw::Application) {
         .default_width(1200)
         .default_height(800)
         .build();
-    window.set_content(Some(&app.borrow().canvas.overlay));
 
     glib::timeout_add_local(Duration::from_millis(33), {
         let app = app.clone();
@@ -49,5 +51,88 @@ fn build_ui(application: &adw::Application) {
         }
     });
 
+    let header = adw::HeaderBar::new();
+    let new_session_button = gtk4::Button::from_icon_name("tab-new-symbolic");
+    header.pack_start(&new_session_button);
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&app.borrow().canvas.overlay));
+    window.set_content(Some(&toolbar_view));
+
+    new_session_button.connect_clicked({
+        let app = app.clone();
+        let window = window.clone();
+        move |_| open_new_session_dialog(&app, &window)
+    });
+
+    let action = gtk4::gio::SimpleAction::new("new-session", None);
+    action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        move |_, _| open_new_session_dialog(&app, &window)
+    });
+    application.add_action(&action);
+    application.set_accels_for_action("app.new-session", &["<Ctrl>T"]);
+
     window.present();
+}
+
+fn open_new_session_dialog(app: &Rc<RefCell<App>>, parent: &adw::ApplicationWindow) {
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(400)
+        .title("New session")
+        .build();
+
+    let name_entry = gtk4::Entry::builder().placeholder_text("Session name").build();
+    let cwd_entry = gtk4::Entry::builder()
+        .text(std::env::current_dir().unwrap_or_default().display().to_string())
+        .build();
+    let agent_dropdown = gtk4::DropDown::from_strings(&["Claude", "Codex"]);
+
+    let create_button = gtk4::Button::with_label("Create");
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    body.append(&name_entry);
+    body.append(&cwd_entry);
+    body.append(&agent_dropdown);
+    body.append(&create_button);
+    dialog.set_content(Some(&body));
+
+    create_button.connect_clicked({
+        let app = app.clone();
+        let dialog = dialog.clone();
+        let name_entry = name_entry.clone();
+        let cwd_entry = cwd_entry.clone();
+        let agent_dropdown = agent_dropdown.clone();
+        move |_| {
+            let agent = if agent_dropdown.selected() == 0 {
+                agent::Agent::Claude
+            } else {
+                agent::Agent::Codex
+            };
+            let viewport_center = {
+                let app_ref = app.borrow();
+                let state = app_ref.canvas.state.borrow();
+                canvas::screen_to_world((600.0, 400.0), state.pan, state.zoom)
+            };
+            let result = App::create_session(
+                &app,
+                name_entry.text().to_string(),
+                PathBuf::from(cwd_entry.text().to_string()),
+                agent,
+                None,
+                viewport_center,
+            );
+            if result.is_ok() {
+                dialog.close();
+            }
+            // Error display (a toast) is added in Task 11 alongside the
+            // other error-reporting work; for now a failed create just
+            // leaves the dialog open so the user can fix the input.
+        }
+    });
+
+    dialog.present();
 }

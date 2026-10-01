@@ -1,12 +1,12 @@
 use crate::account::AccountStore;
-use crate::agent::{Agent, claude_launch, codex_launch};
+use crate::agent::{Agent, Launch, claude_launch, codex_launch};
 use crate::canvas::Canvas;
 use crate::node::SessionNode;
 use crate::session::Session;
 use crate::store::{SessionRecord, Store};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -136,6 +136,112 @@ impl App {
             for chunk in entry.session.try_recv_output() {
                 entry.node.feed(&chunk);
             }
+        }
+    }
+
+    /// Spawns a brand-new Session + SessionNode at `viewport_center_world`,
+    /// inserts it, wires its commit signal (same pattern as `restore`), and
+    /// persists the store. Used by the new-session dialog in `main.rs`.
+    pub fn create_session(
+        app: &Rc<RefCell<App>>,
+        name: String,
+        cwd: PathBuf,
+        agent: Agent,
+        claude_account: Option<String>,
+        viewport_center_world: (f64, f64),
+    ) -> anyhow::Result<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("give this session a name");
+        }
+        if !cwd.is_dir() {
+            anyhow::bail!("directory does not exist: {}", cwd.display());
+        }
+        {
+            let app_ref = app.borrow();
+            if app_ref.sessions.values().any(|entry| entry.record.name == name) {
+                anyhow::bail!("a session named '{name}' already exists");
+            }
+        }
+
+        let (launch, record) = {
+            let app_ref = app.borrow();
+            build_launch_and_record(
+                &app_ref,
+                &name,
+                &cwd,
+                agent,
+                claude_account,
+                viewport_center_world,
+            )?
+        };
+        let session = Session::spawn(cwd, launch)?;
+        let node = SessionNode::new(&name);
+        let id = record.id;
+        {
+            let app_ref = app.borrow();
+            app_ref.canvas.add_node(&node.container, viewport_center_world);
+        }
+        node.connect_commit({
+            let app = Rc::clone(app);
+            move |bytes| {
+                if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
+                    let _ = entry.session.write_input(bytes);
+                }
+            }
+        });
+        app.borrow_mut().sessions.insert(
+            id,
+            SessionEntry {
+                record,
+                session,
+                node,
+            },
+        );
+        app.borrow().persist()?;
+        Ok(())
+    }
+}
+
+fn build_launch_and_record(
+    app: &App,
+    name: &str,
+    cwd: &Path,
+    agent: Agent,
+    claude_account: Option<String>,
+    position: (f64, f64),
+) -> anyhow::Result<(Launch, SessionRecord)> {
+    match agent {
+        Agent::Claude => {
+            let account = claude_account.unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
+            let config_dir = app.accounts.ensure(&account)?;
+            let session_id = Uuid::new_v4();
+            let launch = claude_launch(session_id, false, None, Some(&config_dir));
+            let record = SessionRecord {
+                id: Uuid::new_v4(),
+                name: name.to_string(),
+                cwd: cwd.to_path_buf(),
+                agent,
+                claude_session_id: Some(session_id),
+                claude_account: Some(account),
+                position,
+                size: (480.0, 320.0),
+            };
+            Ok((launch, record))
+        }
+        Agent::Codex => {
+            let launch = codex_launch(false, None);
+            let record = SessionRecord {
+                id: Uuid::new_v4(),
+                name: name.to_string(),
+                cwd: cwd.to_path_buf(),
+                agent,
+                claude_session_id: None,
+                claude_account: None,
+                position,
+                size: (480.0, 320.0),
+            };
+            Ok((launch, record))
         }
     }
 }
