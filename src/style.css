@@ -1,0 +1,80 @@
+/* Loaded by main.rs via include_str! at STYLE_PROVIDER_PRIORITY_APPLICATION.
+   Kept as a real .css file rather than an escaped Rust string literal so the
+   rules can be read (and diagnosed) as CSS. */
+
+/* Sticky notes are deliberately light pastel cards, so their text and chrome
+   must stay dark and legible even in a dark system theme (which this app
+   usually runs under — libadwaita's dark foreground here is #eedfdd).
+
+   The `color` below MUST be on the `textview` node itself, not on its
+   internal `text` node. GtkTextView does not draw its text with the `text`
+   node's color at all: `gtk_text_view_set_attributes_from_style`
+   (gtk/gtktextview.c) does
+
+       style = gtk_css_node_get_style (gtk_widget_get_css_node (text_view));
+       *values->appearance.fg_rgba = *gtk_css_color_value_get_rgba (style->used->color);
+
+   i.e. the Pango foreground comes from the *widget* node's `color`. Two
+   earlier fixes styled `textview.note-text text { color: ... }` and had no
+   visible effect for exactly this reason. The same function also reads
+   `style->used->background_color` from the widget node, while the `text`
+   node paints the view background — so the background is set on both nodes,
+   and the color only on the widget node (where it is actually read). */
+textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
+
+.note-yellow { background-color: #fff3a0; }
+.note-blue { background-color: #cfe8ff; }
+.note-green { background-color: #d7f5d0; }
+.note-yellow textview, .note-yellow textview text { background-color: #fff3a0; }
+.note-blue textview, .note-blue textview text { background-color: #cfe8ff; }
+.note-green textview, .note-green textview text { background-color: #d7f5d0; }
+
+.node-title-bar { padding: 2px 4px; }
+
+/* Adwaita's default button metrics (34x34) made a card's title bar alone
+   ~320px wide and 34px tall, which is a lot of chrome on a small card and
+   sets a floor on how narrow a card can be dragged. Compact, evenly sized
+   icon buttons across both node kinds. */
+.node-title-bar button, .note-title-bar button {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0 2px;
+}
+
+/* Click-to-rename affordance on a session card's title. */
+.node-title { padding: 0 2px; border-radius: 4px; }
+.node-title:hover { background-color: rgba(127, 127, 127, 0.22); }
+
+/* Tinted to a slightly darker shade of the note's own color rather than a
+   flat dark overlay, so the title bar reads as part of the same card. */
+.note-yellow .note-title-bar { background-color: #f2e48f; min-height: 20px; }
+.note-blue .note-title-bar { background-color: #b9dcf2; min-height: 20px; }
+.note-green .note-title-bar { background-color: #c4ecba; min-height: 20px; }
+
+/* The close "x" is a symbolic icon, recolored from the `color` of the
+   GtkImage inside the button. A button does not inherit `color` from the
+   note card (Adwaita sets it explicitly on `button`), so it is set here --
+   otherwise the x is drawn in the dark theme's near-white foreground on top
+   of a pale title bar. */
+.note-title-bar button, .note-title-bar button image { color: #1f1f1f; }
+.note-title-bar button:hover { background-color: rgba(0, 0, 0, 0.12); }
+
+/* The grip sits on top of a `vte4::Terminal`, whose background is black, so
+   the old `rgba(0, 0, 0, 0.18)` fill was all but invisible there — the only
+   control that can resize a card was effectively unfindable, which is half of
+   why a shrunken card read as impossible to drag back up. A translucent light
+   fill with a dark outline stays visible against both a black terminal and a
+   pastel sticky note. */
+.resize-handle {
+    background-color: rgba(255, 255, 255, 0.4);
+    border: 1px solid rgba(0, 0, 0, 0.5);
+    border-radius: 3px;
+    margin: 2px;
+}
+.resize-handle:hover { background-color: rgba(255, 255, 255, 0.85); }
+
+/* The card whose link button was clicked, while it waits for a target click
+   (`App::refresh_link_highlight`). Link mode is otherwise entirely invisible,
+   which is why clicking the chain icon looked like a no-op. `outline` rather
+   than `border` so the highlight doesn't reflow the card's contents. */
+.card.link-source { outline: 2px solid #3584e4; outline-offset: -2px; }
