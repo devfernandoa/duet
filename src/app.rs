@@ -8,6 +8,7 @@ use crate::store::{LinkRecord, SessionRecord, StickyNoteRecord, Store};
 use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
+use libadwaita as adw;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -88,7 +89,9 @@ impl App {
     /// commit signal back to its own session. Spawn failures are collected
     /// and returned so the caller can show them (e.g. as a toast) rather
     /// than losing the other sessions that did restore successfully.
-    pub fn restore(app: &Rc<RefCell<App>>) -> Vec<String> {
+    /// `toast_overlay` is threaded down into `wire_link_controls` so a later
+    /// failed handoff on a restored session can surface its own toast.
+    pub fn restore(app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) -> Vec<String> {
         let (saved, load_warning) = {
             let app_ref = app.borrow();
             Store::load_with_warning(&app_ref.store_path)
@@ -146,7 +149,7 @@ impl App {
                             }
                         }
                     });
-                    wire_link_controls(app, &node, id);
+                    wire_link_controls(app, &node, id, toast_overlay);
                     app.borrow_mut().sessions.insert(
                         id,
                         SessionEntry {
@@ -258,6 +261,7 @@ impl App {
         agent: Agent,
         claude_account: Option<String>,
         viewport_center_world: (f64, f64),
+        toast_overlay: &adw::ToastOverlay,
     ) -> anyhow::Result<()> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -299,7 +303,7 @@ impl App {
                 }
             }
         });
-        wire_link_controls(app, &node, id);
+        wire_link_controls(app, &node, id, toast_overlay);
         app.borrow_mut().sessions.insert(
             id,
             SessionEntry {
@@ -451,15 +455,11 @@ impl App {
     }
 
     /// Removes every session using account `name`, then the account's
-    /// on-disk config directory. Uses `canvas.remove_node` (not
-    /// `canvas.fixed.remove` directly) so the node is also dropped from
-    /// `Canvas`'s internal position-tracking list — otherwise it would leak
-    /// there and every future pan/zoom would keep repositioning a widget
-    /// that's no longer in the `Fixed` container.
-    ///
-    /// Note: `AccountStore` has no `remove` method (and isn't touched by
-    /// this task), so the account directory is removed here directly via
-    /// `accounts.config_dir(name)` + `std::fs::remove_dir_all`.
+    /// on-disk config directory via `AccountStore::remove`. Uses
+    /// `canvas.remove_node` (not `canvas.fixed.remove` directly) so the node
+    /// is also dropped from `Canvas`'s internal position-tracking list —
+    /// otherwise it would leak there and every future pan/zoom would keep
+    /// repositioning a widget that's no longer in the `Fixed` container.
     pub fn delete_account(app: &Rc<RefCell<App>>, name: &str) -> anyhow::Result<()> {
         let to_remove: Vec<Uuid> = {
             let app_ref = app.borrow();
@@ -479,12 +479,7 @@ impl App {
                 }
             }
         }
-        let config_dir = app.borrow().accounts.config_dir(name);
-        if config_dir.exists() {
-            std::fs::remove_dir_all(&config_dir).with_context(|| {
-                format!("couldn't remove account directory {}", config_dir.display())
-            })?;
-        }
+        app.borrow().accounts.remove(name)?;
         app.borrow().persist()?;
         Ok(())
     }
@@ -507,20 +502,24 @@ impl App {
 /// (a different subtree under `container`) is never seen by this gesture at
 /// all, since GTK's bubble phase only walks up a widget's own ancestor
 /// chain, not into sibling subtrees.
-fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
+fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid, toast_overlay: &adw::ToastOverlay) {
     node.link_button.connect_clicked({
         let app = Rc::clone(app);
         move |_| App::start_link(&app, id)
     });
 
-    // Errors are swallowed here (no toast plumbing reaches this helper —
-    // `wire_link_controls` runs in app.rs, before any window/toast-overlay
-    // widget exists), matching the existing ignore-the-Result pattern used a
-    // few lines above for `entry.session.write_input(bytes)`.
+    // `switch_agent` kills the old process as its first, unconditional step,
+    // before any of the fallible work (summarize, account setup, spawning
+    // the new process) runs — so a failure here can leave the card's process
+    // dead with no other signal. Surface it as a toast rather than swallowing
+    // it, matching `App::restore`/the new-session dialog's error handling.
     node.handoff_button.connect_clicked({
         let app = Rc::clone(app);
+        let toast_overlay = toast_overlay.clone();
         move |_| {
-            let _ = App::switch_agent(&app, id);
+            if let Err(error) = App::switch_agent(&app, id) {
+                toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+            }
         }
     });
 

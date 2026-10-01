@@ -32,7 +32,6 @@ fn build_ui(application: &adw::Application) {
     let store_path = store::default_store_path().expect("data directory available");
     let accounts_dir = store::default_accounts_dir().expect("data directory available");
     let app = App::new(AccountStore::new(accounts_dir), store_path);
-    let errors = App::restore(&app);
 
     app.borrow().canvas.set_link_lines_source({
         let app = app.clone();
@@ -93,6 +92,11 @@ fn build_ui(application: &adw::Application) {
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&toolbar_view));
     window.set_content(Some(&toast_overlay));
+
+    // Restore after the toast overlay exists: restored sessions' handoff
+    // buttons are wired (via `wire_link_controls`) to show a toast on
+    // failure, and `restore`'s own load/spawn errors are also toasted below.
+    let errors = App::restore(&app, &toast_overlay);
 
     new_session_button.connect_clicked({
         let app = app.clone();
@@ -218,6 +222,7 @@ fn open_new_session_dialog(
                 agent,
                 None,
                 viewport_center,
+                &toast_overlay,
             );
             match result {
                 Ok(()) => dialog.close(),
