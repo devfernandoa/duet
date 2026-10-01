@@ -1,9 +1,10 @@
 use crate::account::AccountStore;
 use crate::agent::{Agent, Launch, claude_launch, codex_launch};
 use crate::canvas::Canvas;
-use crate::node::SessionNode;
+use crate::node::{NoteNode, SessionNode};
 use crate::session::Session;
-use crate::store::{SessionRecord, Store};
+use crate::store::{SessionRecord, StickyNoteRecord, Store};
+use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,11 +17,17 @@ pub struct SessionEntry {
     pub node: SessionNode,
 }
 
+pub struct NoteEntry {
+    pub record: StickyNoteRecord,
+    pub node: NoteNode,
+}
+
 pub struct App {
     pub accounts: AccountStore,
     pub store_path: PathBuf,
     pub canvas: Canvas,
     pub sessions: HashMap<Uuid, SessionEntry>,
+    pub notes: HashMap<Uuid, NoteEntry>,
 }
 
 impl App {
@@ -30,6 +37,7 @@ impl App {
             store_path,
             canvas: Canvas::new(),
             sessions: HashMap::new(),
+            notes: HashMap::new(),
         }))
     }
 
@@ -108,6 +116,28 @@ impl App {
                 Err(error) => errors.push(format!("couldn't restore {}: {error}", record.name)),
             }
         }
+
+        for note_record in saved.notes {
+            let node = NoteNode::new(&note_record.text, &note_record.color);
+            {
+                let app_ref = app.borrow();
+                app_ref.canvas.add_node(&node.container, note_record.position);
+            }
+            let id = note_record.id;
+            node.text_view.buffer().connect_changed({
+                let app = Rc::clone(app);
+                move |_| {
+                    if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
+                        entry.record.text = entry.node.text();
+                    }
+                    let _ = app.borrow().persist();
+                }
+            });
+            app.borrow_mut()
+                .notes
+                .insert(id, NoteEntry { record: note_record, node });
+        }
+
         errors
     }
 
@@ -119,7 +149,7 @@ impl App {
                 .values()
                 .map(|entry| entry.record.clone())
                 .collect(),
-            notes: Vec::new(), // populated starting in Task 9
+            notes: self.notes.values().map(|entry| entry.record.clone()).collect(),
             links: Vec::new(), // populated starting in Task 10
             canvas: crate::store::CanvasRecord {
                 zoom: state.zoom,
@@ -200,6 +230,37 @@ impl App {
         );
         app.borrow().persist()?;
         Ok(())
+    }
+
+    /// Spawns a blank yellow sticky note at `position`, inserts it, wires its
+    /// text buffer's `changed` signal to update its own record and persist
+    /// (same id-capture pattern as `create_session`'s commit signal), and
+    /// persists the store.
+    pub fn create_note(app: &Rc<RefCell<App>>, position: (f64, f64)) {
+        let id = Uuid::new_v4();
+        let node = NoteNode::new("", "yellow");
+        {
+            let app_ref = app.borrow();
+            app_ref.canvas.add_node(&node.container, position);
+        }
+        node.text_view.buffer().connect_changed({
+            let app = Rc::clone(app);
+            move |_| {
+                if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
+                    entry.record.text = entry.node.text();
+                }
+                let _ = app.borrow().persist();
+            }
+        });
+        let record = StickyNoteRecord {
+            id,
+            text: String::new(),
+            position,
+            size: (220.0, 160.0),
+            color: "yellow".to_string(),
+        };
+        app.borrow_mut().notes.insert(id, NoteEntry { record, node });
+        let _ = app.borrow().persist();
     }
 }
 

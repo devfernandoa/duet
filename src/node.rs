@@ -45,3 +45,32 @@ impl SessionNode {
         });
     }
 }
+
+/// A sticky note on the canvas: a plain text view in a color-tinted card, with
+/// no PTY/process knowledge (unlike `SessionNode`).
+pub struct NoteNode {
+    pub container: gtk4::Box,
+    pub text_view: gtk4::TextView,
+}
+
+impl NoteNode {
+    pub fn new(initial_text: &str, color: &str) -> NoteNode {
+        let text_view = gtk4::TextView::new();
+        text_view.buffer().set_text(initial_text);
+        text_view.set_wrap_mode(gtk4::WrapMode::Word);
+        text_view.set_size_request(220, 160);
+
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        container.append(&text_view);
+        container.set_css_classes(&["card", &format!("note-{color}")]);
+
+        NoteNode { container, text_view }
+    }
+
+    pub fn text(&self) -> String {
+        let buffer = self.text_view.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string()
+    }
+}

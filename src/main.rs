@@ -51,9 +51,23 @@ fn build_ui(application: &adw::Application) {
         }
     });
 
+    let css = gtk4::CssProvider::new();
+    css.load_from_data(
+        ".note-yellow { background-color: #fff3a0; } \
+         .note-blue { background-color: #cfe8ff; } \
+         .note-green { background-color: #d7f5d0; }",
+    );
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(&window),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
     let header = adw::HeaderBar::new();
     let new_session_button = gtk4::Button::from_icon_name("tab-new-symbolic");
     header.pack_start(&new_session_button);
+    let new_note_button = gtk4::Button::from_icon_name("text-editor-symbolic");
+    header.pack_start(&new_note_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -64,6 +78,28 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         let window = window.clone();
         move |_| open_new_session_dialog(&app, &window)
+    });
+
+    new_note_button.connect_clicked({
+        let app = app.clone();
+        let window = window.clone();
+        move |_| {
+            let position = {
+                let (width, height) = (window.width(), window.height());
+                let screen_center = if width > 0 && height > 0 {
+                    (width as f64 / 2.0, height as f64 / 2.0)
+                } else {
+                    // Defensive fallback: only reachable if the window hasn't
+                    // been allocated a size yet, which shouldn't happen since
+                    // window.present() runs before this button can be clicked.
+                    (600.0, 400.0)
+                };
+                let app_ref = app.borrow();
+                let state = app_ref.canvas.state.borrow();
+                canvas::screen_to_world(screen_center, state.pan, state.zoom)
+            };
+            App::create_note(&app, position);
+        }
     });
 
     let action = gtk4::gio::SimpleAction::new("new-session", None);
