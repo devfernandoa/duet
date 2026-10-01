@@ -4,7 +4,9 @@ use crate::canvas::Canvas;
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::node::{NoteNode, SessionNode};
 use crate::session::Session;
-use crate::store::{LinkRecord, SessionRecord, StickyNoteRecord, Store};
+use crate::store::{
+    CanvasRecord, LinkRecord, SessionRecord, StickyNoteRecord, Store, WorkspaceRecord,
+};
 use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -46,6 +48,19 @@ pub struct App {
     pub accounts: AccountStore,
     pub store_path: PathBuf,
     pub canvas: Canvas,
+    /// The *active* workspace's identity. Its sessions/notes/links/canvas are
+    /// the live state below (`sessions`, `notes`, `links`, `canvas`'s own pan/
+    /// zoom) — only one workspace is ever loaded into real GTK widgets and
+    /// PTYs at a time.
+    pub workspace_id: Uuid,
+    pub workspace_name: String,
+    pub workspace_root: PathBuf,
+    /// Every OTHER workspace's full persisted state: not live (no widgets, no
+    /// PTYs), just the records needed to spawn it back in if the user
+    /// switches to it. `switch_workspace`/`create_workspace`/
+    /// `delete_workspace` are the only places that move a workspace between
+    /// "this" (live) and an entry here (dormant).
+    pub inactive_workspaces: Vec<WorkspaceRecord>,
     pub sessions: HashMap<Uuid, SessionEntry>,
     pub notes: HashMap<Uuid, NoteEntry>,
     pub links: Vec<LinkRecord>,
@@ -66,6 +81,14 @@ impl App {
             accounts,
             store_path,
             canvas: Canvas::new(),
+            // Overwritten by `restore` if the store already has workspaces;
+            // kept as-is (empty) on a brand-new install, so the very first
+            // save still writes one real, named workspace rather than a
+            // special-cased empty shape.
+            workspace_id: Uuid::new_v4(),
+            workspace_name: "Default".to_string(),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            inactive_workspaces: Vec::new(),
             sessions: HashMap::new(),
             notes: HashMap::new(),
             links: Vec::new(),
@@ -93,13 +116,17 @@ impl App {
         app.borrow_mut().pending_save = Some(source_id);
     }
 
-    /// Loads the store and spawns one Session + SessionNode per saved
-    /// record, placed at its saved canvas position, wiring each node's
-    /// commit signal back to its own session. Spawn failures are collected
-    /// and returned so the caller can show them (e.g. as a toast) rather
-    /// than losing the other sessions that did restore successfully.
-    /// `toast_overlay` is threaded down into `wire_link_controls` so a later
-    /// failed handoff on a restored session can surface its own toast.
+    /// Loads the store, makes the saved `active_workspace` (or the first
+    /// workspace, if that id isn't found) the live one, and spawns its
+    /// sessions/notes into the canvas — "reopen the most recently used
+    /// workspace" is just restoring whatever was active when last saved.
+    /// Every other workspace's records are kept dormant in
+    /// `inactive_workspaces` until switched to. A brand-new install (no store
+    /// file yet, so `saved.workspaces` is empty) keeps the placeholder
+    /// workspace `App::new` already set up, rather than special-casing "no
+    /// workspace" anywhere else. `toast_overlay` is threaded down into
+    /// `spawn_workspace_contents` so a later failed handoff on a restored
+    /// session can surface its own toast.
     pub fn restore(app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) -> Vec<String> {
         let (saved, load_warning) = {
             let app_ref = app.borrow();
@@ -107,123 +134,301 @@ impl App {
         };
         let mut errors: Vec<String> = load_warning.into_iter().collect();
 
-        {
-            let app_ref = app.borrow();
-            let mut state = app_ref.canvas.state.borrow_mut();
-            state.zoom = saved.canvas.zoom;
-            state.pan = saved.canvas.pan;
+        if saved.workspaces.is_empty() {
+            return errors;
         }
 
-        for record in saved.sessions {
-            let launch = {
-                let app_ref = app.borrow();
-                match record.agent {
-                    Agent::Claude => {
-                        let account = record
-                            .claude_account
-                            .clone()
-                            .unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
-                        match app_ref.accounts.ensure(&account) {
-                            Ok(dir) => {
-                                let id = record.claude_session_id.unwrap_or_else(Uuid::new_v4);
-                                claude_launch(
-                                    id,
-                                    record.claude_session_id.is_some(),
-                                    None,
-                                    Some(&dir),
-                                )
-                            }
-                            Err(error) => {
-                                errors.push(format!("couldn't restore {}: {error}", record.name));
-                                continue;
-                            }
-                        }
-                    }
-                    Agent::Codex => codex_launch(true, None),
-                }
-            };
-            match Session::spawn(record.cwd.clone(), launch) {
-                Ok(session) => {
-                    let node = SessionNode::new(&record.name);
-                    // Ask for the saved size; `pump_output` syncs the PTY to
-                    // whatever grid VTE actually ends up rendering.
-                    node.request_grid(record.size.0, record.size.1);
-                    let id = record.id;
-                    {
-                        let app_ref = app.borrow();
-                        app_ref.canvas.add_node(&node.container, record.position);
-                    }
-                    node.connect_commit({
-                        let app = Rc::clone(app);
-                        move |bytes| {
-                            if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
-                                let _ = entry.session.write_input(bytes);
-                            }
-                        }
-                    });
-                    wire_link_controls(app, &node, id, toast_overlay);
-                    wire_session_chrome(app, &node, id);
-                    wire_rename(app, &node, id, toast_overlay);
-                    app.borrow_mut().sessions.insert(
-                        id,
-                        SessionEntry {
-                            record,
-                            session,
-                            node,
-                            pty_grid: None,
-                            exit_shown: false,
-                        },
-                    );
-                }
-                Err(error) => errors.push(format!("couldn't restore {}: {error}", record.name)),
-            }
-        }
+        let mut workspaces = saved.workspaces;
+        let active_index = saved
+            .active_workspace
+            .and_then(|id| workspaces.iter().position(|w| w.id == id))
+            .unwrap_or(0);
+        let active = workspaces.remove(active_index);
 
-        app.borrow_mut().links = saved.links;
+        app.borrow_mut().inactive_workspaces = workspaces;
+        App::activate_workspace(app, &active);
 
-        for note_record in saved.notes {
-            let node = NoteNode::new(&note_record.text, &note_record.color);
-            node.text_view
-                .set_size_request(note_record.size.0 as i32, note_record.size.1 as i32);
-            {
-                let app_ref = app.borrow();
-                app_ref.canvas.add_node(&node.container, note_record.position);
-            }
-            let id = note_record.id;
-            node.text_view.buffer().connect_changed({
-                let app = Rc::clone(app);
-                move |_| {
-                    if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
-                        entry.record.text = entry.node.text();
-                    }
-                    App::schedule_persist(&app);
-                }
-            });
-            wire_note_chrome(app, &node, id);
-            app.borrow_mut()
-                .notes
-                .insert(id, NoteEntry { record: note_record, node });
-        }
-
+        errors.extend(spawn_workspace_contents(
+            app,
+            active.sessions,
+            active.notes,
+            active.links,
+            toast_overlay,
+        ));
         errors
     }
 
     pub fn persist(&self) -> std::io::Result<()> {
-        let state = self.canvas.state.borrow();
+        let mut workspaces = self.inactive_workspaces.clone();
+        workspaces.push(self.snapshot_active_workspace());
         let store = Store {
+            workspaces,
+            active_workspace: Some(self.workspace_id),
+        };
+        store.save(&self.store_path)
+    }
+
+    /// The active workspace's current live state, as a `WorkspaceRecord` —
+    /// what gets written to disk for it, and what gets tucked into
+    /// `inactive_workspaces` when switching away from it.
+    fn snapshot_active_workspace(&self) -> WorkspaceRecord {
+        let state = self.canvas.state.borrow();
+        WorkspaceRecord {
+            id: self.workspace_id,
+            name: self.workspace_name.clone(),
+            root_dir: self.workspace_root.clone(),
             sessions: self
                 .sessions
                 .values()
                 .map(|entry| entry.record.clone())
                 .collect(),
-            notes: self.notes.values().map(|entry| entry.record.clone()).collect(),
+            notes: self
+                .notes
+                .values()
+                .map(|entry| entry.record.clone())
+                .collect(),
             links: self.links.clone(),
-            canvas: crate::store::CanvasRecord {
+            canvas: CanvasRecord {
                 zoom: state.zoom,
                 pan: state.pan,
             },
+        }
+    }
+
+    /// Lists every workspace (the active one included) as `(id, name)`,
+    /// sorted by name — a stable order independent of which one happens to
+    /// be active, so "the first several workspaces" (for the Ctrl+1..9
+    /// shortcuts) means the same thing from one switch to the next.
+    pub fn workspace_list(&self) -> Vec<(Uuid, String)> {
+        let mut list: Vec<(Uuid, String)> =
+            std::iter::once((self.workspace_id, self.workspace_name.clone()))
+                .chain(
+                    self.inactive_workspaces
+                        .iter()
+                        .map(|w| (w.id, w.name.clone())),
+                )
+                .collect();
+        list.sort_by_key(|(_, name)| name.to_lowercase());
+        list
+    }
+
+    /// Kills every live session's process and clears the canvas of the
+    /// active workspace's nodes, without saving its state anywhere — callers
+    /// are responsible for snapshotting first if the workspace should come
+    /// back later (`switch_workspace`, `create_workspace`) or deliberately
+    /// skip that if it's being deleted (`delete_workspace`).
+    fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
+        let (session_entries, note_entries) = {
+            let mut app_mut = app.borrow_mut();
+            (
+                app_mut.sessions.drain().collect::<Vec<_>>(),
+                app_mut.notes.drain().collect::<Vec<_>>(),
+            )
         };
-        store.save(&self.store_path)
+        let mut app_mut = app.borrow_mut();
+        for (_, mut entry) in session_entries {
+            entry.session.kill();
+            app_mut.canvas.remove_node(&entry.node.container);
+        }
+        for (_, entry) in note_entries {
+            app_mut.canvas.remove_node(&entry.node.container);
+        }
+        app_mut.links.clear();
+        app_mut.pending_link_source = None;
+        app_mut.selected_link = None;
+    }
+
+    /// Replaces or inserts `record` into `inactive_workspaces` by id — the
+    /// "put this workspace back on the shelf" half of switching away from it.
+    fn stash_workspace(app: &Rc<RefCell<App>>, record: WorkspaceRecord) {
+        let mut app_mut = app.borrow_mut();
+        if let Some(existing) = app_mut
+            .inactive_workspaces
+            .iter_mut()
+            .find(|w| w.id == record.id)
+        {
+            *existing = record;
+        } else {
+            app_mut.inactive_workspaces.push(record);
+        }
+    }
+
+    /// Applies a `WorkspaceRecord`'s identity and canvas pan/zoom to `App`
+    /// and its live `Canvas` state — but does NOT spawn its sessions/notes;
+    /// that's `spawn_workspace_contents`'s job, called separately right after
+    /// this by every caller. Factored out because "which workspace is
+    /// active" and "what its canvas looks like" must always change together,
+    /// and previously changed together by copy-pasted blocks across
+    /// `restore`, `switch_workspace`, and `delete_workspace`.
+    fn activate_workspace(app: &Rc<RefCell<App>>, record: &WorkspaceRecord) {
+        let mut app_mut = app.borrow_mut();
+        app_mut.workspace_id = record.id;
+        app_mut.workspace_name = record.name.clone();
+        app_mut.workspace_root = record.root_dir.clone();
+        let mut state = app_mut.canvas.state.borrow_mut();
+        state.zoom = record.canvas.zoom;
+        state.pan = record.canvas.pan;
+    }
+
+    /// Makes `target_id` the active workspace: pulls its record out of
+    /// `inactive_workspaces` *first* (so an unknown/stale `target_id` leaves
+    /// the current workspace completely untouched rather than torn down for
+    /// a switch that can't complete), then snapshots and stashes the current
+    /// workspace and spawns the target's sessions/notes into the now-cleared
+    /// canvas. A no-op if `target_id` is already active. Persists on success.
+    pub fn switch_workspace(
+        app: &Rc<RefCell<App>>,
+        target_id: Uuid,
+        toast_overlay: &adw::ToastOverlay,
+    ) -> Vec<String> {
+        if app.borrow().workspace_id == target_id {
+            return Vec::new();
+        }
+
+        let target = {
+            let mut app_mut = app.borrow_mut();
+            let position = app_mut
+                .inactive_workspaces
+                .iter()
+                .position(|w| w.id == target_id);
+            position.map(|index| app_mut.inactive_workspaces.remove(index))
+        };
+        let Some(target) = target else {
+            return vec!["that workspace no longer exists".to_string()];
+        };
+
+        let outgoing = app.borrow().snapshot_active_workspace();
+        App::teardown_active_workspace(app);
+        App::stash_workspace(app, outgoing);
+
+        App::activate_workspace(app, &target);
+        let errors = spawn_workspace_contents(
+            app,
+            target.sessions,
+            target.notes,
+            target.links,
+            toast_overlay,
+        );
+        let _ = app.borrow().persist();
+        errors
+    }
+
+    /// Creates a brand-new, empty workspace and switches to it immediately —
+    /// there is no separate "create" state a user would ever see with nothing
+    /// open. Rejects an empty or duplicate name, the same rule `create_session`
+    /// already applies to session names.
+    pub fn create_workspace(
+        app: &Rc<RefCell<App>>,
+        name: String,
+        root_dir: PathBuf,
+    ) -> anyhow::Result<Uuid> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("give this workspace a name");
+        }
+        {
+            let app_ref = app.borrow();
+            let duplicate = app_ref.workspace_name == name
+                || app_ref.inactive_workspaces.iter().any(|w| w.name == name);
+            if duplicate {
+                anyhow::bail!("a workspace named '{name}' already exists");
+            }
+        }
+
+        let outgoing = app.borrow().snapshot_active_workspace();
+        App::teardown_active_workspace(app);
+        App::stash_workspace(app, outgoing);
+
+        let new_id = Uuid::new_v4();
+        {
+            let mut app_mut = app.borrow_mut();
+            app_mut.workspace_id = new_id;
+            app_mut.workspace_name = name;
+            app_mut.workspace_root = root_dir;
+        }
+        {
+            let app_ref = app.borrow();
+            *app_ref.canvas.state.borrow_mut() = crate::canvas::CanvasState::new();
+        }
+        app.borrow().persist()?;
+        Ok(new_id)
+    }
+
+    /// Renames a workspace, active or dormant, enforcing the same
+    /// non-empty/unique rule as `create_workspace`.
+    pub fn rename_workspace(
+        app: &Rc<RefCell<App>>,
+        id: Uuid,
+        new_name: &str,
+    ) -> anyhow::Result<()> {
+        let new_name = new_name.trim().to_string();
+        if new_name.is_empty() {
+            anyhow::bail!("give this workspace a name");
+        }
+        {
+            let mut app_mut = app.borrow_mut();
+            let duplicate = (app_mut.workspace_id != id && app_mut.workspace_name == new_name)
+                || app_mut
+                    .inactive_workspaces
+                    .iter()
+                    .any(|w| w.id != id && w.name == new_name);
+            if duplicate {
+                anyhow::bail!("a workspace named '{new_name}' already exists");
+            }
+            if app_mut.workspace_id == id {
+                app_mut.workspace_name = new_name;
+            } else if let Some(workspace) =
+                app_mut.inactive_workspaces.iter_mut().find(|w| w.id == id)
+            {
+                workspace.name = new_name;
+            } else {
+                anyhow::bail!("workspace not found");
+            }
+        }
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// Deletes a workspace — killing its sessions first if it's the active
+    /// one — after confirming at least one other workspace exists to fall
+    /// back to (switching to the first remaining one, by the same stable
+    /// order as `workspace_list`). The caller (a UI confirmation dialog) is
+    /// responsible for asking the user first; this performs the deletion
+    /// unconditionally.
+    pub fn delete_workspace(
+        app: &Rc<RefCell<App>>,
+        id: Uuid,
+        toast_overlay: &adw::ToastOverlay,
+    ) -> anyhow::Result<()> {
+        let is_active = app.borrow().workspace_id == id;
+        if app.borrow().inactive_workspaces.is_empty() {
+            anyhow::bail!("can't delete the only workspace");
+        }
+
+        if is_active {
+            App::teardown_active_workspace(app);
+            let next = {
+                let mut app_mut = app.borrow_mut();
+                // The same stable, active-independent order as
+                // `workspace_list`, so "fall back to the first remaining
+                // workspace" means the same thing a user would see in the
+                // switcher.
+                let index = app_mut
+                    .inactive_workspaces
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, w)| w.name.to_lowercase())
+                    .map(|(index, _)| index)
+                    .context("just checked inactive_workspaces is non-empty")?;
+                app_mut.inactive_workspaces.remove(index)
+            };
+            App::activate_workspace(app, &next);
+            spawn_workspace_contents(app, next.sessions, next.notes, next.links, toast_overlay);
+        } else {
+            app.borrow_mut().inactive_workspaces.retain(|w| w.id != id);
+        }
+        app.borrow().persist()?;
+        Ok(())
     }
 
     /// Drains every session's PTY output into its own terminal node, then
@@ -1219,6 +1424,111 @@ fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid, toas
         }
     });
     node.terminal.add_controller(click);
+}
+
+/// Spawns one `Session` + `SessionNode` per `sessions` record and one
+/// `NoteNode` per `notes` record into the (already-cleared) canvas, wiring
+/// each exactly as `restore` always has, then sets `links` as the active
+/// workspace's link list. Shared by every path that makes a workspace's
+/// saved records live: the initial `restore`, and `switch_workspace`/
+/// `delete_workspace` activating a different workspace. Spawn failures are
+/// collected and returned rather than aborting the rest of the workspace.
+fn spawn_workspace_contents(
+    app: &Rc<RefCell<App>>,
+    sessions: Vec<SessionRecord>,
+    notes: Vec<StickyNoteRecord>,
+    links: Vec<LinkRecord>,
+    toast_overlay: &adw::ToastOverlay,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for record in sessions {
+        let launch = {
+            let app_ref = app.borrow();
+            match record.agent {
+                Agent::Claude => {
+                    let account = record
+                        .claude_account
+                        .clone()
+                        .unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
+                    match app_ref.accounts.ensure(&account) {
+                        Ok(dir) => {
+                            let id = record.claude_session_id.unwrap_or_else(Uuid::new_v4);
+                            claude_launch(id, record.claude_session_id.is_some(), None, Some(&dir))
+                        }
+                        Err(error) => {
+                            errors.push(format!("couldn't restore {}: {error}", record.name));
+                            continue;
+                        }
+                    }
+                }
+                Agent::Codex => codex_launch(true, None),
+            }
+        };
+        match Session::spawn(record.cwd.clone(), launch) {
+            Ok(session) => {
+                let node = SessionNode::new(&record.name);
+                // Ask for the saved size; `pump_output` syncs the PTY to
+                // whatever grid VTE actually ends up rendering.
+                node.request_grid(record.size.0, record.size.1);
+                let id = record.id;
+                {
+                    let app_ref = app.borrow();
+                    app_ref.canvas.add_node(&node.container, record.position);
+                }
+                node.connect_commit({
+                    let app = Rc::clone(app);
+                    move |bytes| {
+                        if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
+                            let _ = entry.session.write_input(bytes);
+                        }
+                    }
+                });
+                wire_link_controls(app, &node, id, toast_overlay);
+                wire_session_chrome(app, &node, id);
+                wire_rename(app, &node, id, toast_overlay);
+                app.borrow_mut().sessions.insert(
+                    id,
+                    SessionEntry {
+                        record,
+                        session,
+                        node,
+                        pty_grid: None,
+                        exit_shown: false,
+                    },
+                );
+            }
+            Err(error) => errors.push(format!("couldn't restore {}: {error}", record.name)),
+        }
+    }
+
+    app.borrow_mut().links = links;
+
+    for note_record in notes {
+        let node = NoteNode::new(&note_record.text, &note_record.color);
+        node.text_view
+            .set_size_request(note_record.size.0 as i32, note_record.size.1 as i32);
+        {
+            let app_ref = app.borrow();
+            app_ref.canvas.add_node(&node.container, note_record.position);
+        }
+        let id = note_record.id;
+        node.text_view.buffer().connect_changed({
+            let app = Rc::clone(app);
+            move |_| {
+                if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
+                    entry.record.text = entry.node.text();
+                }
+                App::schedule_persist(&app);
+            }
+        });
+        wire_note_chrome(app, &node, id);
+        app.borrow_mut()
+            .notes
+            .insert(id, NoteEntry { record: note_record, node });
+    }
+
+    errors
 }
 
 fn build_launch_and_record(

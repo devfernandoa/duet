@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
+use uuid::Uuid;
 
 const APP_ID: &str = "dev.fernandoa.duet";
 
@@ -81,6 +82,15 @@ fn build_ui(application: &adw::Application) {
     header.pack_start(&new_note_button);
     let accounts_button = gtk4::Button::from_icon_name("system-users-symbolic");
     header.pack_start(&accounts_button);
+    let workspace_icon = gtk4::Image::from_icon_name("view-paged-symbolic");
+    let workspace_label = gtk4::Label::new(None);
+    let workspace_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    workspace_box.append(&workspace_icon);
+    workspace_box.append(&workspace_label);
+    let workspace_button = gtk4::Button::new();
+    workspace_button.set_child(Some(&workspace_box));
+    workspace_button.set_tooltip_text(Some("Switch workspace"));
+    header.pack_end(&workspace_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -109,6 +119,12 @@ fn build_ui(application: &adw::Application) {
     // buttons are wired (via `wire_link_controls`) to show a toast on
     // failure, and `restore`'s own load/spawn errors are also toasted below.
     let errors = App::restore(&app, &toast_overlay);
+    sync_workspace_button(&workspace_label, &app);
+    // Writes back immediately rather than waiting for the first edit, so a
+    // migration from an older single-canvas store.json (see `store::Store`'s
+    // pre-workspace migration) is durable on disk right away instead of only
+    // in memory until something happens to trigger a save.
+    let _ = app.borrow().persist();
 
     new_session_button.connect_clicked({
         let app = app.clone();
@@ -122,6 +138,14 @@ fn build_ui(application: &adw::Application) {
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| open_account_manager_dialog(&app, &window, &toast_overlay)
+    });
+
+    workspace_button.connect_clicked({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        let workspace_label = workspace_label.clone();
+        move |_| open_workspace_switcher_dialog(&app, &window, &toast_overlay, &workspace_label)
     });
 
     new_note_button.connect_clicked({
@@ -200,6 +224,37 @@ fn build_ui(application: &adw::Application) {
         application.set_accels_for_action(&format!("app.{name}"), &accels);
     }
 
+    // Ctrl+1..9 jump straight to the Nth workspace in `workspace_list`'s
+    // stable (name-sorted) order — "quickly switching among the first
+    // several workspaces" without opening the switcher dialog. Silently does
+    // nothing past however many workspaces actually exist.
+    for index in 1..=9u32 {
+        let action = gtk4::gio::SimpleAction::new(&format!("switch-workspace-{index}"), None);
+        action.connect_activate({
+            let app = app.clone();
+            let toast_overlay = toast_overlay.clone();
+            let workspace_label = workspace_label.clone();
+            move |_, _| {
+                let target = app
+                    .borrow()
+                    .workspace_list()
+                    .get((index - 1) as usize)
+                    .map(|(id, _)| *id);
+                if let Some(id) = target {
+                    for error in App::switch_workspace(&app, id, &toast_overlay) {
+                        toast_overlay.add_toast(adw::Toast::new(&error));
+                    }
+                    sync_workspace_button(&workspace_label, &app);
+                }
+            }
+        });
+        application.add_action(&action);
+        application.set_accels_for_action(
+            &format!("app.switch-workspace-{index}"),
+            &[&format!("<Ctrl>{index}")],
+        );
+    }
+
     window.present();
 
     for error in errors {
@@ -220,8 +275,10 @@ fn open_new_session_dialog(
         .build();
 
     let name_entry = gtk4::Entry::builder().placeholder_text("Session name").build();
+    // The active workspace's root directory, not just the process's cwd —
+    // that's the whole point of a per-workspace default.
     let cwd_entry = gtk4::Entry::builder()
-        .text(std::env::current_dir().unwrap_or_default().display().to_string())
+        .text(app.borrow().workspace_root.display().to_string())
         .build();
     let agent_dropdown = gtk4::DropDown::from_strings(&["Claude", "Codex"]);
 
@@ -521,6 +578,377 @@ fn confirm_delete_account(
                     toast_overlay.add_toast(adw::Toast::new(&format!("couldn't delete account: {error}")));
                 }
                 populate_accounts(&group, &account_rows, &app, &toast_overlay, &dialog_parent);
+            }
+        }
+    });
+    confirm.present();
+}
+
+/// Reflects the active workspace's name on the header-bar switcher button.
+/// Called after `App::restore` and after anything that can change which
+/// workspace is active or its name (switch, create, rename, delete).
+fn sync_workspace_button(label: &gtk4::Label, app: &Rc<RefCell<App>>) {
+    label.set_text(&app.borrow().workspace_name);
+}
+
+/// Workspace switcher: same shape as `open_account_manager_dialog` (a titled
+/// window, an `adw::PreferencesGroup` of rows, an `adw::EntryRow` to create a
+/// new one) — each row is a workspace, click one to switch to it, with a
+/// rename and (when more than one workspace exists) a delete button per row.
+fn open_workspace_switcher_dialog(
+    app: &Rc<RefCell<App>>,
+    parent: &adw::ApplicationWindow,
+    toast_overlay: &adw::ToastOverlay,
+    workspace_label: &gtk4::Label,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(420)
+        .title("Workspaces")
+        .build();
+
+    let header = adw::HeaderBar::new();
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+
+    let workspaces_group = adw::PreferencesGroup::new();
+    workspaces_group.set_title("Workspaces");
+    workspaces_group.set_description(Some(
+        "Each workspace keeps its own canvas: sessions, notes, and links, \
+         independently saved.",
+    ));
+
+    let new_name_row = adw::EntryRow::new();
+    new_name_row.set_title("New workspace name");
+    let add_button = gtk4::Button::from_icon_name("list-add-symbolic");
+    add_button.add_css_class("flat");
+    add_button.set_valign(gtk4::Align::Center);
+    new_name_row.add_suffix(&add_button);
+    workspaces_group.add(&new_name_row);
+
+    let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+    page_box.set_margin_top(16);
+    page_box.set_margin_bottom(16);
+    page_box.set_margin_start(16);
+    page_box.set_margin_end(16);
+    page_box.append(&workspaces_group);
+    toolbar_view.set_content(Some(&page_box));
+    dialog.set_content(Some(&toolbar_view));
+
+    // Same reason as `account_rows` in `open_account_manager_dialog`:
+    // `AdwPreferencesGroup`'s own widget-tree children don't correspond 1:1
+    // to the rows added via `add()`, so the rows this function added are
+    // tracked explicitly to clear and rebuild them on every change.
+    let workspace_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    populate_workspaces(
+        &workspaces_group,
+        &workspace_rows,
+        app,
+        toast_overlay,
+        &dialog,
+        workspace_label,
+    );
+
+    let create_from_entry = {
+        let app = app.clone();
+        let workspaces_group = workspaces_group.clone();
+        let workspace_rows = workspace_rows.clone();
+        let new_name_row = new_name_row.clone();
+        let toast_overlay = toast_overlay.clone();
+        let dialog = dialog.clone();
+        let workspace_label = workspace_label.clone();
+        move || {
+            let name = new_name_row.text().to_string();
+            if name.trim().is_empty() {
+                return;
+            }
+            // The new workspace's default root directory is simply wherever
+            // duet was launched from — there's no directory-chooser UI here,
+            // to keep this dialog to "name in, workspace out" (a session's
+            // own working directory can always be set to anything anyway).
+            let root_dir = std::env::current_dir().unwrap_or_default();
+            match App::create_workspace(&app, name, root_dir) {
+                Ok(_) => {
+                    new_name_row.set_text("");
+                    sync_workspace_button(&workspace_label, &app);
+                    populate_workspaces(
+                        &workspaces_group,
+                        &workspace_rows,
+                        &app,
+                        &toast_overlay,
+                        &dialog,
+                        &workspace_label,
+                    );
+                }
+                Err(error) => {
+                    toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+                }
+            }
+        }
+    };
+    add_button.connect_clicked({
+        let create_from_entry = create_from_entry.clone();
+        move |_| create_from_entry()
+    });
+    new_name_row.connect_entry_activated(move |_| create_from_entry());
+
+    dialog.present();
+}
+
+/// Clears and repopulates the workspace rows tracked in `workspace_rows` (see
+/// `open_workspace_switcher_dialog`'s doc comment for why they're tracked
+/// explicitly), from `App::workspace_list`. The active workspace's row is
+/// shown but not clickable-to-switch (switching to the workspace you're
+/// already in is a no-op); every other row switches on click. The delete
+/// button is omitted entirely when only one workspace exists, since
+/// `App::delete_workspace` refuses that anyway and a button that always fails
+/// would just be confusing.
+fn populate_workspaces(
+    group: &adw::PreferencesGroup,
+    workspace_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    app: &Rc<RefCell<App>>,
+    toast_overlay: &adw::ToastOverlay,
+    dialog_parent: &adw::Window,
+    workspace_label: &gtk4::Label,
+) {
+    for row in workspace_rows.borrow_mut().drain(..) {
+        group.remove(&row);
+    }
+
+    let active_id = app.borrow().workspace_id;
+    let workspaces = app.borrow().workspace_list();
+    let can_delete = workspaces.len() > 1;
+
+    for (id, name) in workspaces {
+        let row = adw::ActionRow::new();
+        row.set_title(&name);
+        if id == active_id {
+            row.set_subtitle("Current workspace");
+        } else {
+            row.set_activatable(true);
+            row.connect_activated({
+                let app = app.clone();
+                let toast_overlay = toast_overlay.clone();
+                let group = group.clone();
+                let workspace_rows = workspace_rows.clone();
+                let dialog_parent = dialog_parent.clone();
+                let workspace_label = workspace_label.clone();
+                move |_| {
+                    for error in App::switch_workspace(&app, id, &toast_overlay) {
+                        toast_overlay.add_toast(adw::Toast::new(&error));
+                    }
+                    sync_workspace_button(&workspace_label, &app);
+                    populate_workspaces(
+                        &group,
+                        &workspace_rows,
+                        &app,
+                        &toast_overlay,
+                        &dialog_parent,
+                        &workspace_label,
+                    );
+                }
+            });
+        }
+
+        let rename_button = gtk4::Button::from_icon_name("document-edit-symbolic");
+        rename_button.add_css_class("flat");
+        rename_button.set_valign(gtk4::Align::Center);
+        rename_button.set_tooltip_text(Some("Rename"));
+        rename_button.connect_clicked({
+            let app = app.clone();
+            let toast_overlay = toast_overlay.clone();
+            let group = group.clone();
+            let workspace_rows = workspace_rows.clone();
+            let dialog_parent = dialog_parent.clone();
+            let workspace_label = workspace_label.clone();
+            let name = name.clone();
+            move |_| {
+                prompt_rename_workspace(
+                    &app,
+                    id,
+                    &name,
+                    &dialog_parent,
+                    &toast_overlay,
+                    &group,
+                    &workspace_rows,
+                    &workspace_label,
+                )
+            }
+        });
+        row.add_suffix(&rename_button);
+
+        if can_delete {
+            let delete_button = gtk4::Button::from_icon_name("user-trash-symbolic");
+            delete_button.add_css_class("flat");
+            delete_button.add_css_class("destructive-action");
+            delete_button.set_valign(gtk4::Align::Center);
+            delete_button.set_tooltip_text(Some("Delete workspace"));
+            delete_button.connect_clicked({
+                let app = app.clone();
+                let group = group.clone();
+                let workspace_rows = workspace_rows.clone();
+                let toast_overlay = toast_overlay.clone();
+                let dialog_parent = dialog_parent.clone();
+                let workspace_label = workspace_label.clone();
+                let name = name.clone();
+                move |_| {
+                    confirm_delete_workspace(
+                        &app,
+                        id,
+                        &name,
+                        &group,
+                        &workspace_rows,
+                        &toast_overlay,
+                        &dialog_parent,
+                        &workspace_label,
+                    )
+                }
+            });
+            row.add_suffix(&delete_button);
+        }
+
+        group.add(&row);
+        workspace_rows.borrow_mut().push(row);
+    }
+}
+
+/// A small titled window (matching `open_new_session_dialog`'s shape) with a
+/// single pre-filled entry, for renaming one workspace. On success,
+/// re-syncs the header button and repopulates the switcher dialog's rows.
+fn prompt_rename_workspace(
+    app: &Rc<RefCell<App>>,
+    id: Uuid,
+    current_name: &str,
+    parent: &adw::Window,
+    toast_overlay: &adw::ToastOverlay,
+    group: &adw::PreferencesGroup,
+    workspace_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    workspace_label: &gtk4::Label,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(320)
+        .title("Rename workspace")
+        .build();
+
+    let entry = gtk4::Entry::builder().text(current_name).build();
+    let rename_button = gtk4::Button::with_label("Rename");
+    rename_button.add_css_class("suggested-action");
+
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    body.set_margin_top(16);
+    body.set_margin_bottom(16);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
+    body.append(&entry);
+    body.append(&rename_button);
+    dialog.set_content(Some(&body));
+
+    let commit = {
+        let app = app.clone();
+        let dialog = dialog.clone();
+        let entry = entry.clone();
+        let toast_overlay = toast_overlay.clone();
+        let group = group.clone();
+        let workspace_rows = workspace_rows.clone();
+        let parent = parent.clone();
+        let workspace_label = workspace_label.clone();
+        move || match App::rename_workspace(&app, id, &entry.text()) {
+            Ok(()) => {
+                dialog.close();
+                sync_workspace_button(&workspace_label, &app);
+                populate_workspaces(
+                    &group,
+                    &workspace_rows,
+                    &app,
+                    &toast_overlay,
+                    &parent,
+                    &workspace_label,
+                );
+            }
+            Err(error) => toast_overlay.add_toast(adw::Toast::new(&error.to_string())),
+        }
+    };
+    rename_button.connect_clicked({
+        let commit = commit.clone();
+        move |_| commit()
+    });
+    entry.connect_activate(move |_| commit());
+
+    dialog.present();
+}
+
+/// Asks "Delete workspace '{name}'? This will close N session(s)." before
+/// calling `App::delete_workspace` — the same confirm-before-destroy pattern
+/// as `confirm_delete_account`. `session_count` is read from the live
+/// sessions map when deleting the active workspace, or from the dormant
+/// record's saved session list otherwise, since an inactive workspace's
+/// sessions aren't running processes to begin with.
+fn confirm_delete_workspace(
+    app: &Rc<RefCell<App>>,
+    id: Uuid,
+    name: &str,
+    group: &adw::PreferencesGroup,
+    workspace_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    toast_overlay: &adw::ToastOverlay,
+    dialog_parent: &adw::Window,
+    workspace_label: &gtk4::Label,
+) {
+    let session_count = {
+        let app_ref = app.borrow();
+        if app_ref.workspace_id == id {
+            app_ref.sessions.len()
+        } else {
+            app_ref
+                .inactive_workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .map(|w| w.sessions.len())
+                .unwrap_or(0)
+        }
+    };
+    let body = if session_count == 0 {
+        "No sessions will be affected.".to_string()
+    } else if session_count == 1 {
+        "This will close 1 session.".to_string()
+    } else {
+        format!("This will close {session_count} sessions.")
+    };
+
+    let confirm = adw::MessageDialog::new(
+        Some(dialog_parent),
+        Some(&format!("Delete workspace \"{name}\"?")),
+        Some(&body),
+    );
+    confirm.add_response("cancel", "Cancel");
+    confirm.add_response("delete", "Delete");
+    confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("cancel"));
+    confirm.set_close_response("cancel");
+    confirm.connect_response(None, {
+        let app = app.clone();
+        let group = group.clone();
+        let workspace_rows = workspace_rows.clone();
+        let toast_overlay = toast_overlay.clone();
+        let dialog_parent = dialog_parent.clone();
+        let workspace_label = workspace_label.clone();
+        move |_dialog, response| {
+            if response == "delete" {
+                if let Err(error) = App::delete_workspace(&app, id, &toast_overlay) {
+                    toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+                }
+                sync_workspace_button(&workspace_label, &app);
+                populate_workspaces(
+                    &group,
+                    &workspace_rows,
+                    &app,
+                    &toast_overlay,
+                    &dialog_parent,
+                    &workspace_label,
+                );
             }
         }
     });
