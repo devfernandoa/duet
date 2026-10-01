@@ -107,6 +107,20 @@ fn migrate_legacy(legacy: LegacyStore) -> Store {
     }
 }
 
+fn backup_corrupt_file(path: &Path, reason: &str) -> (Store, Option<String>) {
+    let backup = path.with_extension("corrupt.json");
+    let backup_note = match std::fs::copy(path, &backup) {
+        Ok(_) => format!(" A backup was saved to {}.", backup.display()),
+        Err(_) => String::new(),
+    };
+    (
+        Store::default(),
+        Some(format!(
+            "Couldn't read the saved workspace ({reason}).{backup_note}"
+        )),
+    )
+}
+
 impl Store {
     #[cfg(test)]
     pub fn load(path: &Path) -> Store {
@@ -125,39 +139,36 @@ impl Store {
                         match serde_json::from_value::<LegacyStore>(value) {
                             Ok(legacy) => return (migrate_legacy(legacy), None),
                             Err(error) => {
-                                let backup = path.with_extension("corrupt.json");
-                                let backup_note = match std::fs::copy(path, &backup) {
-                                    Ok(_) => format!(" A backup was saved to {}.", backup.display()),
-                                    Err(_) => String::new(),
-                                };
-                                return (
-                                    Store::default(),
-                                    Some(format!(
-                                        "Couldn't read the saved workspace ({error}).{backup_note}"
-                                    )),
-                                );
+                                return backup_corrupt_file(path, &error.to_string());
                             }
                         }
                     }
-                    // Otherwise try new format
-                    if let Ok(store) = serde_json::from_value::<Store>(value) {
-                        return (store, None);
+
+                    // Check if it's a JSON object with at least one recognized key
+                    if let Some(obj) = value.as_object() {
+                        let has_recognized_key = obj.contains_key("sessions")
+                            || obj.contains_key("notes")
+                            || obj.contains_key("links")
+                            || obj.contains_key("canvas");
+
+                        if has_recognized_key {
+                            // It looks like a new format Store; try to deserialize
+                            if let Ok(store) = serde_json::from_value::<Store>(value) {
+                                return (store, None);
+                            }
+                        } else {
+                            // Valid JSON object but has no recognized keys and no "tabs"
+                            // This is ambiguous/truncated data — treat as corrupt
+                            return backup_corrupt_file(path, "unrecognized JSON structure");
+                        }
+                    } else {
+                        // JSON is not an object (e.g., array, string, number, null)
+                        return backup_corrupt_file(path, "JSON is not an object");
                     }
                 }
 
-                // If all else fails, it's corrupt
-                let error = "Invalid JSON or unrecognized format";
-                let backup = path.with_extension("corrupt.json");
-                let backup_note = match std::fs::copy(path, &backup) {
-                    Ok(_) => format!(" A backup was saved to {}.", backup.display()),
-                    Err(_) => String::new(),
-                };
-                (
-                    Store::default(),
-                    Some(format!(
-                        "Couldn't read the saved workspace ({error}).{backup_note}"
-                    )),
-                )
+                // If JSON parsing itself failed, it's corrupt
+                backup_corrupt_file(path, "Invalid JSON")
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Store::default(), None),
             Err(error) => (
@@ -290,5 +301,14 @@ mod tests {
         assert_eq!(store.sessions[0].position, (0.0, 0.0));
         assert_eq!(store.sessions[1].position, (520.0, 0.0));
         assert_eq!(store.canvas.zoom, 1.0);
+    }
+
+    #[test]
+    fn load_of_ambiguous_json_object_is_treated_as_corrupt() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert!(Store::load(&path).sessions.is_empty());
+        assert!(path.with_extension("corrupt.json").exists());
     }
 }
