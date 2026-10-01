@@ -70,15 +70,29 @@ fn build_ui(application: &adw::Application) {
         ".note-yellow { background-color: #fff3a0; } \
          .note-blue { background-color: #cfe8ff; } \
          .note-green { background-color: #d7f5d0; } \
-         .note-title-bar { background-color: rgba(0, 0, 0, 0.08); min-height: 20px; } \
-         .node-title-bar { padding: 2px 4px; } \
          /* GtkTextView paints its own theme background by default, which \
             otherwise hides the pastel `.note-*` tint entirely and, in dark \
             mode, renders light text on a dark box regardless of the note's \
-            color. Forcing both layers transparent/dark here is what makes \
-            notes legible and actually show their tint. */ \
-         textview.note-text, textview.note-text text { background-color: transparent; } \
+            color. A GTK CSS selector that matches zero nodes produces no \
+            warning (only a syntax error would), so rather than relying on \
+            `background-color: transparent` to let the parent's tint show \
+            through underneath — which assumes a specific paint order this \
+            can't easily confirm without a live run — each note color is set \
+            explicitly, redundantly, on both the `textview` node and its \
+            internal `text` node. Whichever one actually paints the visible \
+            background in this GTK4/libadwaita version, it now paints the \
+            right color directly, instead of depending on transparency. */ \
+         .note-yellow textview, .note-yellow textview text { background-color: #fff3a0; } \
+         .note-blue textview, .note-blue textview text { background-color: #cfe8ff; } \
+         .note-green textview, .note-green textview text { background-color: #d7f5d0; } \
          textview.note-text text { color: #262626; caret-color: #262626; } \
+         .node-title-bar { padding: 2px 4px; } \
+         /* Tinted to a slightly darker shade of the note's own color rather \
+            than a flat dark overlay, so the title bar reads as part of the \
+            same card instead of a mismatched dark band on a bright note. */ \
+         .note-yellow .note-title-bar { background-color: #f2e48f; min-height: 20px; } \
+         .note-blue .note-title-bar { background-color: #b9dcf2; min-height: 20px; } \
+         .note-green .note-title-bar { background-color: #c4ecba; min-height: 20px; } \
          .resize-handle { background-color: rgba(0, 0, 0, 0.18); border-radius: 3px; margin: 2px; } \
          .resize-handle:hover { background-color: rgba(0, 0, 0, 0.32); }",
     );
@@ -343,7 +357,7 @@ fn open_account_manager_dialog(
     // clear and rebuild just the account rows on every change.
     let account_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
-    populate_accounts(&accounts_group, &account_rows, app, toast_overlay);
+    populate_accounts(&accounts_group, &account_rows, app, toast_overlay, &dialog);
 
     let create_from_entry = {
         let app = app.clone();
@@ -351,6 +365,7 @@ fn open_account_manager_dialog(
         let account_rows = account_rows.clone();
         let new_name_row = new_name_row.clone();
         let toast_overlay = toast_overlay.clone();
+        let dialog = dialog.clone();
         move || {
             let name = new_name_row.text().to_string();
             let name = name.trim();
@@ -360,7 +375,7 @@ fn open_account_manager_dialog(
             match app.borrow().accounts.ensure(name) {
                 Ok(_) => {
                     new_name_row.set_text("");
-                    populate_accounts(&accounts_group, &account_rows, &app, &toast_overlay);
+                    populate_accounts(&accounts_group, &account_rows, &app, &toast_overlay, &dialog);
                 }
                 Err(error) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("couldn't create account: {error}")));
@@ -383,16 +398,21 @@ fn open_account_manager_dialog(
 /// its doc comment in `open_account_manager_dialog` for why they must be
 /// tracked explicitly rather than enumerated from `group`'s own widget
 /// tree), from `app.accounts.list()`, wiring a destructive trash button per
-/// row to `App::delete_account`. The `default` account has no delete button
-/// — it's the implicit fallback every Claude session uses when no other
-/// account is picked, so removing it from here would just be confusing. A
-/// plain function (not a closure) so the per-row delete handler can call it
-/// again by name after a deletion, without needing to capture itself.
+/// row. The `default` account has no delete button — it's the implicit
+/// fallback every Claude session uses when no other account is picked, so
+/// removing it from here would just be confusing. `dialog_parent` is the
+/// account-manager window itself, used as the `transient_for` anchor for the
+/// delete-confirmation dialog each trash button opens (see
+/// `confirm_delete_account` below) — `App::delete_account` is never called
+/// directly from a click here, only after the user confirms. A plain
+/// function (not a closure) so the per-row delete handler can call it again
+/// by name after a deletion, without needing to capture itself.
 fn populate_accounts(
     group: &adw::PreferencesGroup,
     account_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
     app: &Rc<RefCell<App>>,
     toast_overlay: &adw::ToastOverlay,
+    dialog_parent: &adw::Window,
 ) {
     for row in account_rows.borrow_mut().drain(..) {
         group.remove(&row);
@@ -420,17 +440,68 @@ fn populate_accounts(
                 let group = group.clone();
                 let account_rows = account_rows.clone();
                 let toast_overlay = toast_overlay.clone();
+                let dialog_parent = dialog_parent.clone();
                 let name = name.clone();
-                move |_| {
-                    if let Err(error) = App::delete_account(&app, &name) {
-                        toast_overlay.add_toast(adw::Toast::new(&format!("couldn't delete account: {error}")));
-                    }
-                    populate_accounts(&group, &account_rows, &app, &toast_overlay);
-                }
+                move |_| confirm_delete_account(&app, &name, &group, &account_rows, &toast_overlay, &dialog_parent)
             });
             row.add_suffix(&delete_button);
         }
         group.add(&row);
         account_rows.borrow_mut().push(row);
     }
+}
+
+/// Asks "Delete account '{name}'? This will close N active session(s)." (via
+/// `adw::MessageDialog` — this libadwaita version only has the pre-1.5
+/// `MessageDialog`/`ResponseAppearance` API in scope, not the newer
+/// `AlertDialog`, since `Cargo.toml` enables the `v1_4` feature and
+/// `AlertDialog` needs `v1_5`) before actually calling `App::delete_account`.
+/// Added because the trash button previously deleted — and killed every live
+/// session using that account — on a single unconfirmed click, despite being
+/// styled as a destructive action.
+fn confirm_delete_account(
+    app: &Rc<RefCell<App>>,
+    name: &str,
+    group: &adw::PreferencesGroup,
+    account_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    toast_overlay: &adw::ToastOverlay,
+    dialog_parent: &adw::Window,
+) {
+    let session_count = app
+        .borrow()
+        .sessions
+        .values()
+        .filter(|entry| entry.record.claude_account.as_deref() == Some(name))
+        .count();
+    let body = if session_count == 0 {
+        "No active sessions use this account.".to_string()
+    } else if session_count == 1 {
+        "This will close 1 active session.".to_string()
+    } else {
+        format!("This will close {session_count} active sessions.")
+    };
+
+    let confirm = adw::MessageDialog::new(Some(dialog_parent), Some(&format!("Delete account \"{name}\"?")), Some(&body));
+    confirm.add_response("cancel", "Cancel");
+    confirm.add_response("delete", "Delete");
+    confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("cancel"));
+    confirm.set_close_response("cancel");
+    confirm.connect_response(None, {
+        let app = app.clone();
+        let group = group.clone();
+        let account_rows = account_rows.clone();
+        let toast_overlay = toast_overlay.clone();
+        let dialog_parent = dialog_parent.clone();
+        let name = name.to_string();
+        move |_dialog, response| {
+            if response == "delete" {
+                if let Err(error) = App::delete_account(&app, &name) {
+                    toast_overlay.add_toast(adw::Toast::new(&format!("couldn't delete account: {error}")));
+                }
+                populate_accounts(&group, &account_rows, &app, &toast_overlay, &dialog_parent);
+            }
+        }
+    });
+    confirm.present();
 }

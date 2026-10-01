@@ -356,12 +356,22 @@ impl App {
     }
 
     /// Records a link so `pump_output` starts forwarding `source`'s output
-    /// into `target`'s input. A no-op if the link already exists or
+    /// into `target`'s input. A no-op if the link already exists,
     /// `source == target` (linking a session to itself would feed its own
-    /// output back into its own input).
+    /// output back into its own input), or either id no longer names a live
+    /// session — this last check is defense in depth against a stale
+    /// `pending_link_source` surviving the source session's closure (the
+    /// primary fix for that is clearing `pending_link_source` in
+    /// `close_session` itself; this is a second, independent guard so
+    /// `create_link` can never persist a link to a session id that doesn't
+    /// exist, regardless of what let it get called that way).
     pub fn create_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) {
         let mut app = app.borrow_mut();
-        if source != target && !app.links.iter().any(|l| l.source == source && l.target == target) {
+        if source != target
+            && app.sessions.contains_key(&source)
+            && app.sessions.contains_key(&target)
+            && !app.links.iter().any(|l| l.source == source && l.target == target)
+        {
             app.links.push(LinkRecord { source, target });
             let _ = app.persist();
         }
@@ -492,8 +502,13 @@ impl App {
     }
 
     /// Removes a single session from the canvas (its per-card close button):
-    /// kills the process, drops the node via `canvas.remove_node`, and drops
-    /// any link to/from it so `pump_output` never looks it up again.
+    /// kills the process, drops the node via `canvas.remove_node`, drops any
+    /// link to/from it so `pump_output` never looks it up again, and clears
+    /// `pending_link_source` if it was this session — otherwise clicking
+    /// this session's link button and then closing it (instead of completing
+    /// the link) would leave `pending_link_source == Some(id)` dangling, and
+    /// the next unrelated click-to-complete on any other session would call
+    /// `create_link` with a source id that no longer exists.
     pub fn close_session(app: &Rc<RefCell<App>>, id: Uuid) {
         {
             let mut app_mut = app.borrow_mut();
@@ -502,6 +517,9 @@ impl App {
                 app_mut.canvas.remove_node(&entry.node.container);
             }
             app_mut.links.retain(|l| l.source != id && l.target != id);
+            if app_mut.pending_link_source == Some(id) {
+                app_mut.pending_link_source = None;
+            }
         }
         let _ = app.borrow().persist();
     }
@@ -566,15 +584,25 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
         move |_gesture, offset_x, offset_y| {
             let zoom = app.borrow().canvas.state.borrow().zoom;
             let new_position = drag_delta_to_world(*move_start.borrow(), (offset_x, offset_y), zoom);
-            {
-                let mut app_mut = app.borrow_mut();
-                app_mut.canvas.reposition_node(&container, new_position);
-                if let Some(entry) = app_mut.sessions.get_mut(&id) {
-                    entry.record.position = new_position;
-                }
+            let mut app_mut = app.borrow_mut();
+            app_mut.canvas.reposition_node(&container, new_position);
+            if let Some(entry) = app_mut.sessions.get_mut(&id) {
+                entry.record.position = new_position;
             }
-            App::schedule_persist(&app);
         }
+    });
+    // Persisting is deliberately NOT done in `drag-update` above: that fires
+    // on every single pointer-motion tick during the drag (potentially
+    // hundreds of times a second), and `schedule_persist` cancels and
+    // re-registers a GLib main-loop timeout source on every call — doing
+    // that on the hottest possible path made dragging visibly stutter
+    // instead of smoothly tracking the cursor. `Canvas`'s own pan-drag
+    // (`canvas.rs`) never persists mid-gesture either, for the same reason;
+    // this matches that proven-smooth pattern by only persisting once, here,
+    // when the drag actually ends.
+    drag.connect_drag_end({
+        let app = Rc::clone(app);
+        move |_gesture, _x, _y| App::schedule_persist(&app)
     });
     node.drag_handle.add_controller(drag);
 
@@ -601,8 +629,13 @@ fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
             if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
                 entry.record.size = new_size;
             }
-            App::schedule_persist(&app);
         }
+    });
+    // Same reasoning as the move gesture above: persist once at drag-end,
+    // not on every resize tick.
+    resize.connect_drag_end({
+        let app = Rc::clone(app);
+        move |_gesture, _x, _y| App::schedule_persist(&app)
     });
     node.resize_handle.add_controller(resize);
 }
@@ -634,15 +667,19 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
         move |_gesture, offset_x, offset_y| {
             let zoom = app.borrow().canvas.state.borrow().zoom;
             let new_position = drag_delta_to_world(*move_start.borrow(), (offset_x, offset_y), zoom);
-            {
-                let mut app_mut = app.borrow_mut();
-                app_mut.canvas.reposition_node(&container, new_position);
-                if let Some(entry) = app_mut.notes.get_mut(&id) {
-                    entry.record.position = new_position;
-                }
+            let mut app_mut = app.borrow_mut();
+            app_mut.canvas.reposition_node(&container, new_position);
+            if let Some(entry) = app_mut.notes.get_mut(&id) {
+                entry.record.position = new_position;
             }
-            App::schedule_persist(&app);
         }
+    });
+    // See the matching comment in `wire_session_chrome`: persisting on every
+    // `drag-update` tick (rather than once here, at drag end) is what made
+    // dragging visibly stutter instead of smoothly tracking the cursor.
+    drag.connect_drag_end({
+        let app = Rc::clone(app);
+        move |_gesture, _x, _y| App::schedule_persist(&app)
     });
     node.drag_handle.add_controller(drag);
 
@@ -669,8 +706,11 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
             if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
                 entry.record.size = new_size;
             }
-            App::schedule_persist(&app);
         }
+    });
+    resize.connect_drag_end({
+        let app = Rc::clone(app);
+        move |_gesture, _x, _y| App::schedule_persist(&app)
     });
     node.resize_handle.add_controller(resize);
 }
