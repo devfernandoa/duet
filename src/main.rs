@@ -5,6 +5,7 @@ mod canvas;
 mod handoff;
 mod link;
 mod node;
+mod role;
 mod session;
 mod store;
 
@@ -22,9 +23,7 @@ use uuid::Uuid;
 const APP_ID: &str = "dev.fernandoa.duet";
 
 fn main() -> glib::ExitCode {
-    let application = adw::Application::builder()
-        .application_id(APP_ID)
-        .build();
+    let application = adw::Application::builder().application_id(APP_ID).build();
     application.connect_activate(build_ui);
     application.run()
 }
@@ -82,6 +81,9 @@ fn build_ui(application: &adw::Application) {
     header.pack_start(&new_note_button);
     let accounts_button = gtk4::Button::from_icon_name("system-users-symbolic");
     header.pack_start(&accounts_button);
+    let roles_button = gtk4::Button::from_icon_name("preferences-system-symbolic");
+    roles_button.set_tooltip_text(Some("Manage agent roles"));
+    header.pack_start(&roles_button);
     let workspace_icon = gtk4::Image::from_icon_name("view-paged-symbolic");
     let workspace_label = gtk4::Label::new(None);
     let workspace_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -140,6 +142,13 @@ fn build_ui(application: &adw::Application) {
         move |_| open_account_manager_dialog(&app, &window, &toast_overlay)
     });
 
+    roles_button.connect_clicked({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| open_role_manager_dialog(&app, &window, &toast_overlay)
+    });
+
     workspace_button.connect_clicked({
         let app = app.clone();
         let window = window.clone();
@@ -190,17 +199,27 @@ fn build_ui(application: &adw::Application) {
     application.add_action(&accounts_action);
     application.set_accels_for_action("app.manage-accounts", &["<Ctrl>period"]);
 
+    let roles_action = gtk4::gio::SimpleAction::new("manage-roles", None);
+    roles_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| open_role_manager_dialog(&app, &window, &toast_overlay)
+    });
+    application.add_action(&roles_action);
+    application.set_accels_for_action("app.manage-roles", &["<Ctrl><Shift>R"]);
+
     // Ctrl+scroll already zoomed, but a modifier+scroll gesture is invisible
     // in a UI with no menu: the user asked for zoom without ever finding it.
     // `equal` as well as `plus` so the unshifted "+" key works, and the
     // keypad names so a numpad does too.
     for (name, accels, steps) in [
-        ("zoom-in", vec!["<Ctrl>plus", "<Ctrl>equal", "<Ctrl>KP_Add"], 1),
         (
-            "zoom-out",
-            vec!["<Ctrl>minus", "<Ctrl>KP_Subtract"],
-            -1,
+            "zoom-in",
+            vec!["<Ctrl>plus", "<Ctrl>equal", "<Ctrl>KP_Add"],
+            1,
         ),
+        ("zoom-out", vec!["<Ctrl>minus", "<Ctrl>KP_Subtract"], -1),
         ("zoom-reset", vec!["<Ctrl>0", "<Ctrl>KP_0"], 0),
     ] {
         let zoom_action = gtk4::gio::SimpleAction::new(name, None);
@@ -274,7 +293,9 @@ fn open_new_session_dialog(
         .title("New session")
         .build();
 
-    let name_entry = gtk4::Entry::builder().placeholder_text("Session name").build();
+    let name_entry = gtk4::Entry::builder()
+        .placeholder_text("Session name")
+        .build();
     // The active workspace's root directory, not just the process's cwd —
     // that's the whole point of a per-workspace default.
     let cwd_entry = gtk4::Entry::builder()
@@ -308,6 +329,20 @@ fn open_new_session_dialog(
     let account_label = gtk4::Label::new(Some("Claude account"));
     account_label.set_xalign(0.0);
 
+    // Role picker: index 0 is always "No role" (`role_ids[0] == None`), then
+    // every built-in role followed by every custom one, in `App::roles`'
+    // order.
+    let roles = app.borrow().roles();
+    let mut role_names: Vec<String> = vec!["No role".to_string()];
+    role_names.extend(roles.iter().map(|role| role.name.clone()));
+    let role_ids: Vec<Option<Uuid>> = std::iter::once(None)
+        .chain(roles.iter().map(|role| Some(role.id)))
+        .collect();
+    let role_dropdown =
+        gtk4::DropDown::from_strings(&role_names.iter().map(String::as_str).collect::<Vec<_>>());
+    let role_label = gtk4::Label::new(Some("Role"));
+    role_label.set_xalign(0.0);
+
     let create_button = gtk4::Button::with_label("Create");
     create_button.add_css_class("suggested-action");
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -317,6 +352,8 @@ fn open_new_session_dialog(
     body.append(&account_label);
     body.append(&account_dropdown);
     body.append(&custom_command_entry);
+    body.append(&role_label);
+    body.append(&role_dropdown);
     body.append(&create_button);
     dialog.set_content(Some(&body));
 
@@ -348,6 +385,8 @@ fn open_new_session_dialog(
         let agent_dropdown = agent_dropdown.clone();
         let account_dropdown = account_dropdown.clone();
         let custom_command_entry = custom_command_entry.clone();
+        let role_dropdown = role_dropdown.clone();
+        let role_ids = role_ids.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| {
             let agent = match agent_dropdown.selected() {
@@ -368,7 +407,13 @@ fn open_new_session_dialog(
             };
             // Ignored entirely by every non-Claude path; only read when
             // `agent` is `Agent::Claude`.
-            let claude_account = account_names.get(account_dropdown.selected() as usize).cloned();
+            let claude_account = account_names
+                .get(account_dropdown.selected() as usize)
+                .cloned();
+            let role_id = role_ids
+                .get(role_dropdown.selected() as usize)
+                .copied()
+                .flatten();
             let viewport_center = {
                 let (width, height) = (parent.width(), parent.height());
                 let screen_center = if width > 0 && height > 0 {
@@ -389,6 +434,7 @@ fn open_new_session_dialog(
                 PathBuf::from(cwd_entry.text().to_string()),
                 agent,
                 claude_account,
+                role_id,
                 viewport_center,
                 &toast_overlay,
             );
@@ -478,10 +524,18 @@ fn open_account_manager_dialog(
             match app.borrow().accounts.ensure(name) {
                 Ok(_) => {
                     new_name_row.set_text("");
-                    populate_accounts(&accounts_group, &account_rows, &app, &toast_overlay, &dialog);
+                    populate_accounts(
+                        &accounts_group,
+                        &account_rows,
+                        &app,
+                        &toast_overlay,
+                        &dialog,
+                    );
                 }
                 Err(error) => {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("couldn't create account: {error}")));
+                    toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "couldn't create account: {error}"
+                    )));
                 }
             }
         }
@@ -545,7 +599,16 @@ fn populate_accounts(
                 let toast_overlay = toast_overlay.clone();
                 let dialog_parent = dialog_parent.clone();
                 let name = name.clone();
-                move |_| confirm_delete_account(&app, &name, &group, &account_rows, &toast_overlay, &dialog_parent)
+                move |_| {
+                    confirm_delete_account(
+                        &app,
+                        &name,
+                        &group,
+                        &account_rows,
+                        &toast_overlay,
+                        &dialog_parent,
+                    )
+                }
             });
             row.add_suffix(&delete_button);
         }
@@ -584,7 +647,11 @@ fn confirm_delete_account(
         format!("This will close {session_count} active sessions.")
     };
 
-    let confirm = adw::MessageDialog::new(Some(dialog_parent), Some(&format!("Delete account \"{name}\"?")), Some(&body));
+    let confirm = adw::MessageDialog::new(
+        Some(dialog_parent),
+        Some(&format!("Delete account \"{name}\"?")),
+        Some(&body),
+    );
     confirm.add_response("cancel", "Cancel");
     confirm.add_response("delete", "Delete");
     confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
@@ -600,13 +667,345 @@ fn confirm_delete_account(
         move |_dialog, response| {
             if response == "delete" {
                 if let Err(error) = App::delete_account(&app, &name) {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("couldn't delete account: {error}")));
+                    toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "couldn't delete account: {error}"
+                    )));
                 }
                 populate_accounts(&group, &account_rows, &app, &toast_overlay, &dialog_parent);
             }
         }
     });
     confirm.present();
+}
+
+/// Role manager: same shape as `open_account_manager_dialog`. Built-in
+/// roles (`role::builtin_roles`) are listed read-only — no edit/delete
+/// button, same reasoning as the `default` account row; custom roles get an
+/// edit (pencil) and a destructive delete (trash) button. The header's
+/// "add" button opens `open_role_editor_dialog` with no existing role to
+/// fill in.
+fn open_role_manager_dialog(
+    app: &Rc<RefCell<App>>,
+    parent: &adw::ApplicationWindow,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(420)
+        .title("Agent roles")
+        .build();
+
+    let header = adw::HeaderBar::new();
+    let new_role_button = gtk4::Button::from_icon_name("list-add-symbolic");
+    header.pack_end(&new_role_button);
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+
+    let roles_group = adw::PreferencesGroup::new();
+    roles_group.set_title("Roles");
+    roles_group.set_description(Some(
+        "A role's instructions become the agent's first prompt when a \
+         session using it launches fresh. Assign one from the new-session \
+         dialog.",
+    ));
+
+    let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+    page_box.set_margin_top(16);
+    page_box.set_margin_bottom(16);
+    page_box.set_margin_start(16);
+    page_box.set_margin_end(16);
+    page_box.append(&roles_group);
+    toolbar_view.set_content(Some(&page_box));
+    dialog.set_content(Some(&toolbar_view));
+
+    let role_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    populate_roles(&roles_group, &role_rows, app, toast_overlay, &dialog);
+
+    new_role_button.connect_clicked({
+        let app = app.clone();
+        let roles_group = roles_group.clone();
+        let role_rows = role_rows.clone();
+        let toast_overlay = toast_overlay.clone();
+        let dialog = dialog.clone();
+        move |_| {
+            open_role_editor_dialog(&app, &dialog, &toast_overlay, None, {
+                let app = app.clone();
+                let roles_group = roles_group.clone();
+                let role_rows = role_rows.clone();
+                let toast_overlay = toast_overlay.clone();
+                let dialog = dialog.clone();
+                move || populate_roles(&roles_group, &role_rows, &app, &toast_overlay, &dialog)
+            });
+        }
+    });
+
+    dialog.present();
+}
+
+/// Clears and repopulates the role rows tracked in `role_rows`, from
+/// `App::roles()` (built-ins then customs). `dialog_parent` is the role
+/// manager window itself, used as the `transient_for` anchor for the editor
+/// and delete-confirmation dialogs opened from a row's buttons.
+fn populate_roles(
+    group: &adw::PreferencesGroup,
+    role_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    app: &Rc<RefCell<App>>,
+    toast_overlay: &adw::ToastOverlay,
+    dialog_parent: &adw::Window,
+) {
+    for row in role_rows.borrow_mut().drain(..) {
+        group.remove(&row);
+    }
+
+    for role in app.borrow().roles() {
+        let row = adw::ActionRow::new();
+        row.set_title(&role.name);
+        if role::is_builtin(role.id) {
+            row.set_subtitle(&format!("Built-in — {}", role.instructions));
+        } else {
+            row.set_subtitle(&role.instructions);
+            let edit_button = gtk4::Button::from_icon_name("document-edit-symbolic");
+            edit_button.add_css_class("flat");
+            edit_button.set_valign(gtk4::Align::Center);
+            edit_button.connect_clicked({
+                let app = app.clone();
+                let dialog_parent = dialog_parent.clone();
+                let toast_overlay = toast_overlay.clone();
+                let group = group.clone();
+                let role_rows = role_rows.clone();
+                let role = role.clone();
+                move |_| {
+                    open_role_editor_dialog(
+                        &app,
+                        &dialog_parent,
+                        &toast_overlay,
+                        Some(role.clone()),
+                        {
+                            let app = app.clone();
+                            let group = group.clone();
+                            let role_rows = role_rows.clone();
+                            let toast_overlay = toast_overlay.clone();
+                            let dialog_parent = dialog_parent.clone();
+                            move || {
+                                populate_roles(
+                                    &group,
+                                    &role_rows,
+                                    &app,
+                                    &toast_overlay,
+                                    &dialog_parent,
+                                )
+                            }
+                        },
+                    );
+                }
+            });
+            let delete_button = gtk4::Button::from_icon_name("user-trash-symbolic");
+            delete_button.add_css_class("flat");
+            delete_button.add_css_class("destructive-action");
+            delete_button.set_valign(gtk4::Align::Center);
+            delete_button.connect_clicked({
+                let app = app.clone();
+                let group = group.clone();
+                let role_rows = role_rows.clone();
+                let toast_overlay = toast_overlay.clone();
+                let dialog_parent = dialog_parent.clone();
+                let id = role.id;
+                let name = role.name.clone();
+                move |_| {
+                    confirm_delete_role(
+                        &app,
+                        id,
+                        &name,
+                        &group,
+                        &role_rows,
+                        &toast_overlay,
+                        &dialog_parent,
+                    )
+                }
+            });
+            row.add_suffix(&edit_button);
+            row.add_suffix(&delete_button);
+        }
+        group.add(&row);
+        role_rows.borrow_mut().push(row);
+    }
+}
+
+/// Asks "Delete role '{name}'? N session(s) will be unassigned." before
+/// actually calling `App::delete_role` — same confirm-before-destructive
+/// pattern as `confirm_delete_account`, though deleting a role only
+/// unassigns sessions rather than closing them.
+fn confirm_delete_role(
+    app: &Rc<RefCell<App>>,
+    id: Uuid,
+    name: &str,
+    group: &adw::PreferencesGroup,
+    role_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    toast_overlay: &adw::ToastOverlay,
+    dialog_parent: &adw::Window,
+) {
+    let session_count = app
+        .borrow()
+        .sessions
+        .values()
+        .filter(|entry| entry.record.role_id == Some(id))
+        .count();
+    let body = match session_count {
+        0 => "No sessions use this role.".to_string(),
+        1 => "1 session will be unassigned from this role.".to_string(),
+        n => format!("{n} sessions will be unassigned from this role."),
+    };
+
+    let confirm = adw::MessageDialog::new(
+        Some(dialog_parent),
+        Some(&format!("Delete role \"{name}\"?")),
+        Some(&body),
+    );
+    confirm.add_response("cancel", "Cancel");
+    confirm.add_response("delete", "Delete");
+    confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("cancel"));
+    confirm.set_close_response("cancel");
+    confirm.connect_response(None, {
+        let app = app.clone();
+        let group = group.clone();
+        let role_rows = role_rows.clone();
+        let toast_overlay = toast_overlay.clone();
+        let dialog_parent = dialog_parent.clone();
+        move |_dialog, response| {
+            if response == "delete" {
+                if let Err(error) = App::delete_role(&app, id) {
+                    toast_overlay
+                        .add_toast(adw::Toast::new(&format!("couldn't delete role: {error}")));
+                }
+                populate_roles(&group, &role_rows, &app, &toast_overlay, &dialog_parent);
+            }
+        }
+    });
+    confirm.present();
+}
+
+/// "New role" / "Edit role": a small titled window with a name entry, an
+/// instructions text view, an optional icon-name entry, and an accent
+/// dropdown. Saves via `App::create_role`/`App::update_role` depending on
+/// whether `existing` is `Some`, then calls `on_saved` (which repopulates
+/// the role manager's list) and closes.
+fn open_role_editor_dialog(
+    app: &Rc<RefCell<App>>,
+    parent: &adw::Window,
+    toast_overlay: &adw::ToastOverlay,
+    existing: Option<role::Role>,
+    on_saved: impl Fn() + 'static,
+) {
+    let editing_id = existing.as_ref().map(|role| role.id);
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(380)
+        .title(if existing.is_some() {
+            "Edit role"
+        } else {
+            "New role"
+        })
+        .build();
+
+    let name_entry = gtk4::Entry::builder()
+        .placeholder_text("Role name")
+        .text(existing.as_ref().map(|r| r.name.as_str()).unwrap_or(""))
+        .build();
+
+    let instructions_view = gtk4::TextView::new();
+    instructions_view.set_wrap_mode(gtk4::WrapMode::Word);
+    instructions_view.buffer().set_text(
+        existing
+            .as_ref()
+            .map(|r| r.instructions.as_str())
+            .unwrap_or(""),
+    );
+    let instructions_scroller = gtk4::ScrolledWindow::new();
+    instructions_scroller.set_child(Some(&instructions_view));
+    instructions_scroller.set_size_request(-1, 100);
+
+    let icon_entry = gtk4::Entry::builder()
+        .placeholder_text("Icon name (optional, e.g. face-smile-symbolic)")
+        .text(
+            existing
+                .as_ref()
+                .and_then(|r| r.icon.clone())
+                .unwrap_or_default(),
+        )
+        .build();
+
+    let accent_names: Vec<String> = std::iter::once("No accent".to_string())
+        .chain(role::ACCENTS.iter().map(|accent| accent.to_string()))
+        .collect();
+    let accent_dropdown =
+        gtk4::DropDown::from_strings(&accent_names.iter().map(String::as_str).collect::<Vec<_>>());
+    let existing_accent_index = existing
+        .as_ref()
+        .and_then(|role| role.accent.as_deref())
+        .and_then(|accent| role::ACCENTS.iter().position(|a| *a == accent))
+        .map(|index| index as u32 + 1)
+        .unwrap_or(0);
+    accent_dropdown.set_selected(existing_accent_index);
+
+    let save_button = gtk4::Button::with_label(if editing_id.is_some() {
+        "Save"
+    } else {
+        "Create"
+    });
+    save_button.add_css_class("suggested-action");
+
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    body.append(&name_entry);
+    body.append(&gtk4::Label::new(Some("Instructions")));
+    body.append(&instructions_scroller);
+    body.append(&icon_entry);
+    body.append(&accent_dropdown);
+    body.append(&save_button);
+    dialog.set_content(Some(&body));
+
+    save_button.connect_clicked({
+        let app = app.clone();
+        let dialog = dialog.clone();
+        let toast_overlay = toast_overlay.clone();
+        let name_entry = name_entry.clone();
+        let instructions_view = instructions_view.clone();
+        let icon_entry = icon_entry.clone();
+        let accent_dropdown = accent_dropdown.clone();
+        move |_| {
+            let name = name_entry.text().to_string();
+            let buffer = instructions_view.buffer();
+            let instructions = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string();
+            let icon_text = icon_entry.text().trim().to_string();
+            let icon = (!icon_text.is_empty()).then_some(icon_text);
+            let accent = accent_dropdown
+                .selected()
+                .checked_sub(1)
+                .and_then(|index| role::ACCENTS.get(index as usize))
+                .map(|accent| accent.to_string());
+            let result = match editing_id {
+                Some(id) => App::update_role(&app, id, name, instructions, icon, accent),
+                None => App::create_role(&app, name, instructions, icon, accent),
+            };
+            match result {
+                Ok(()) => {
+                    on_saved();
+                    dialog.close();
+                }
+                Err(error) => toast_overlay.add_toast(adw::Toast::new(&error.to_string())),
+            }
+        }
+    });
+
+    dialog.present();
 }
 
 /// Reflects the active workspace's name on the header-bar switcher button.
