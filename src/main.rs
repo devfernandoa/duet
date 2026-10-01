@@ -69,7 +69,18 @@ fn build_ui(application: &adw::Application) {
     css.load_from_data(
         ".note-yellow { background-color: #fff3a0; } \
          .note-blue { background-color: #cfe8ff; } \
-         .note-green { background-color: #d7f5d0; }",
+         .note-green { background-color: #d7f5d0; } \
+         .note-title-bar { background-color: rgba(0, 0, 0, 0.08); min-height: 20px; } \
+         .node-title-bar { padding: 2px 4px; } \
+         /* GtkTextView paints its own theme background by default, which \
+            otherwise hides the pastel `.note-*` tint entirely and, in dark \
+            mode, renders light text on a dark box regardless of the note's \
+            color. Forcing both layers transparent/dark here is what makes \
+            notes legible and actually show their tint. */ \
+         textview.note-text, textview.note-text text { background-color: transparent; } \
+         textview.note-text text { color: #262626; caret-color: #262626; } \
+         .resize-handle { background-color: rgba(0, 0, 0, 0.18); border-radius: 3px; margin: 2px; } \
+         .resize-handle:hover { background-color: rgba(0, 0, 0, 0.32); }",
     );
     gtk4::style_context_add_provider_for_display(
         &gtk4::prelude::WidgetExt::display(&window),
@@ -179,13 +190,49 @@ fn open_new_session_dialog(
         .build();
     let agent_dropdown = gtk4::DropDown::from_strings(&["Claude", "Codex"]);
 
+    // Claude-account picker: previously this dialog always passed `None` to
+    // `App::create_session`, silently ignoring every account but the default
+    // one — there was no way to actually pick an account from the UI even
+    // though the account manager let you create more than one. `accounts`
+    // always lists at least `default` because `ensure` is idempotent and
+    // `App::new`/restore never delete it on their own; it's listed here only
+    // if it already has a directory, so fall back to showing just `default`
+    // when none exist yet.
+    let mut account_names = app.borrow().accounts.list().unwrap_or_default();
+    if !account_names.iter().any(|a| a == account::DEFAULT_ACCOUNT) {
+        account_names.insert(0, account::DEFAULT_ACCOUNT.to_string());
+    }
+    let account_dropdown =
+        gtk4::DropDown::from_strings(&account_names.iter().map(String::as_str).collect::<Vec<_>>());
+    let account_label = gtk4::Label::new(Some("Claude account"));
+    account_label.set_xalign(0.0);
+
     let create_button = gtk4::Button::with_label("Create");
+    create_button.add_css_class("suggested-action");
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     body.append(&name_entry);
     body.append(&cwd_entry);
     body.append(&agent_dropdown);
+    body.append(&account_label);
+    body.append(&account_dropdown);
     body.append(&create_button);
     dialog.set_content(Some(&body));
+
+    // The account picker only matters for Claude; keep it visible but
+    // dimmed/disabled when Codex is selected rather than hiding it, so the
+    // dialog's layout doesn't jump around as the user switches agents.
+    let sync_account_sensitivity = {
+        let agent_dropdown = agent_dropdown.clone();
+        let account_label = account_label.clone();
+        let account_dropdown = account_dropdown.clone();
+        move || {
+            let is_claude = agent_dropdown.selected() == 0;
+            account_label.set_sensitive(is_claude);
+            account_dropdown.set_sensitive(is_claude);
+        }
+    };
+    sync_account_sensitivity();
+    agent_dropdown.connect_selected_notify(move |_| sync_account_sensitivity());
 
     create_button.connect_clicked({
         let app = app.clone();
@@ -194,6 +241,7 @@ fn open_new_session_dialog(
         let name_entry = name_entry.clone();
         let cwd_entry = cwd_entry.clone();
         let agent_dropdown = agent_dropdown.clone();
+        let account_dropdown = account_dropdown.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| {
             let agent = if agent_dropdown.selected() == 0 {
@@ -201,6 +249,9 @@ fn open_new_session_dialog(
             } else {
                 agent::Agent::Codex
             };
+            // Ignored entirely by `create_session`'s Codex path; only read
+            // when `agent == Claude`.
+            let claude_account = account_names.get(account_dropdown.selected() as usize).cloned();
             let viewport_center = {
                 let (width, height) = (parent.width(), parent.height());
                 let screen_center = if width > 0 && height > 0 {
@@ -220,7 +271,7 @@ fn open_new_session_dialog(
                 name_entry.text().to_string(),
                 PathBuf::from(cwd_entry.text().to_string()),
                 agent,
-                None,
+                claude_account,
                 viewport_center,
                 &toast_overlay,
             );
@@ -234,6 +285,15 @@ fn open_new_session_dialog(
     dialog.present();
 }
 
+/// Account manager: a titled window (matching `open_new_session_dialog`'s
+/// shape) built from real Adwaita list widgets — an `adw::PreferencesGroup`
+/// of `adw::ActionRow`s (one per account, each with a destructive-styled
+/// trash button) plus an `adw::EntryRow` to create a new one — instead of
+/// the original plain `ListBox` of hand-built `gtk4::Box` rows. Every
+/// mutating action (create, delete) reports failures as a toast and the
+/// account named `default` can't be deleted from here, since every Claude
+/// session silently falls back to it and removing it out from under a
+/// restored session would otherwise fail confusingly later.
 fn open_account_manager_dialog(
     app: &Rc<RefCell<App>>,
     parent: &adw::ApplicationWindow,
@@ -242,61 +302,102 @@ fn open_account_manager_dialog(
     let dialog = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .default_width(360)
+        .default_width(420)
         .title("Accounts")
         .build();
 
-    let list_box = gtk4::ListBox::new();
-    let new_name_entry = gtk4::Entry::builder()
-        .placeholder_text("New account name")
-        .build();
-    let add_button = gtk4::Button::with_label("Add");
+    let header = adw::HeaderBar::new();
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
 
-    let add_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    add_row.append(&new_name_entry);
-    add_row.append(&add_button);
+    let accounts_group = adw::PreferencesGroup::new();
+    accounts_group.set_title("Claude accounts");
+    accounts_group.set_description(Some(
+        "Each account keeps its own isolated Claude login/config directory. \
+         Pick one when creating a Claude session.",
+    ));
 
-    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    body.append(&list_box);
-    body.append(&add_row);
-    dialog.set_content(Some(&body));
+    let new_name_row = adw::EntryRow::new();
+    new_name_row.set_title("New account name");
+    let add_button = gtk4::Button::from_icon_name("list-add-symbolic");
+    add_button.add_css_class("flat");
+    add_button.set_valign(gtk4::Align::Center);
+    new_name_row.add_suffix(&add_button);
+    accounts_group.add(&new_name_row);
 
-    populate_accounts(&list_box, app, toast_overlay);
+    let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+    page_box.set_margin_top(16);
+    page_box.set_margin_bottom(16);
+    page_box.set_margin_start(16);
+    page_box.set_margin_end(16);
+    page_box.append(&accounts_group);
+    toolbar_view.set_content(Some(&page_box));
+    dialog.set_content(Some(&toolbar_view));
 
-    add_button.connect_clicked({
+    // `AdwPreferencesGroup` manages its rows in its own internal list box —
+    // its *public* widget-tree children (`first_child`/`next_sibling`) don't
+    // correspond 1:1 to the rows added via `add()`, so there's no reliable
+    // way to enumerate "the rows I added" by walking the group's children
+    // back. Tracking them explicitly here (separately from `new_name_row`,
+    // which is permanent and never removed) is what lets `populate_accounts`
+    // clear and rebuild just the account rows on every change.
+    let account_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    populate_accounts(&accounts_group, &account_rows, app, toast_overlay);
+
+    let create_from_entry = {
         let app = app.clone();
-        let list_box = list_box.clone();
+        let accounts_group = accounts_group.clone();
+        let account_rows = account_rows.clone();
+        let new_name_row = new_name_row.clone();
         let toast_overlay = toast_overlay.clone();
-        let new_name_entry = new_name_entry.clone();
-        move |_| {
-            let name = new_name_entry.text().to_string();
+        move || {
+            let name = new_name_row.text().to_string();
             let name = name.trim();
             if name.is_empty() {
                 return;
             }
             match app.borrow().accounts.ensure(name) {
                 Ok(_) => {
-                    new_name_entry.set_text("");
-                    populate_accounts(&list_box, &app, &toast_overlay);
+                    new_name_row.set_text("");
+                    populate_accounts(&accounts_group, &account_rows, &app, &toast_overlay);
                 }
                 Err(error) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("couldn't create account: {error}")));
                 }
             }
         }
+    };
+    add_button.connect_clicked({
+        let create_from_entry = create_from_entry.clone();
+        move |_| create_from_entry()
     });
+    // EntryRow's own activate signal (pressing Enter in the entry) — lets
+    // the user create an account without reaching for the mouse.
+    new_name_row.connect_entry_activated(move |_| create_from_entry());
 
     dialog.present();
 }
 
-/// Clears and repopulates `list_box` from `app.accounts.list()`, wiring a
-/// delete button per row to `App::delete_account`. A plain function (not a
-/// closure) so the per-row delete handler can call it again by name after a
-/// deletion, without needing to capture itself.
-fn populate_accounts(list_box: &gtk4::ListBox, app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) {
-    while let Some(row) = list_box.row_at_index(0) {
-        list_box.remove(&row);
+/// Clears and repopulates the account rows tracked in `account_rows` (see
+/// its doc comment in `open_account_manager_dialog` for why they must be
+/// tracked explicitly rather than enumerated from `group`'s own widget
+/// tree), from `app.accounts.list()`, wiring a destructive trash button per
+/// row to `App::delete_account`. The `default` account has no delete button
+/// — it's the implicit fallback every Claude session uses when no other
+/// account is picked, so removing it from here would just be confusing. A
+/// plain function (not a closure) so the per-row delete handler can call it
+/// again by name after a deletion, without needing to capture itself.
+fn populate_accounts(
+    group: &adw::PreferencesGroup,
+    account_rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    app: &Rc<RefCell<App>>,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    for row in account_rows.borrow_mut().drain(..) {
+        group.remove(&row);
     }
+
     let accounts = match app.borrow().accounts.list() {
         Ok(accounts) => accounts,
         Err(error) => {
@@ -305,26 +406,31 @@ fn populate_accounts(list_box: &gtk4::ListBox, app: &Rc<RefCell<App>>, toast_ove
         }
     };
     for name in accounts {
-        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let label = gtk4::Label::new(Some(&name));
-        label.set_hexpand(true);
-        label.set_xalign(0.0);
-        let delete_button = gtk4::Button::from_icon_name("user-trash-symbolic");
-        row.append(&label);
-        row.append(&delete_button);
-        list_box.append(&row);
-
-        delete_button.connect_clicked({
-            let app = app.clone();
-            let list_box = list_box.clone();
-            let toast_overlay = toast_overlay.clone();
-            let name = name.clone();
-            move |_| {
-                if let Err(error) = App::delete_account(&app, &name) {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("couldn't delete account: {error}")));
+        let row = adw::ActionRow::new();
+        row.set_title(&name);
+        if name == crate::account::DEFAULT_ACCOUNT {
+            row.set_subtitle("Used automatically when no other account is picked");
+        } else {
+            let delete_button = gtk4::Button::from_icon_name("user-trash-symbolic");
+            delete_button.add_css_class("flat");
+            delete_button.add_css_class("destructive-action");
+            delete_button.set_valign(gtk4::Align::Center);
+            delete_button.connect_clicked({
+                let app = app.clone();
+                let group = group.clone();
+                let account_rows = account_rows.clone();
+                let toast_overlay = toast_overlay.clone();
+                let name = name.clone();
+                move |_| {
+                    if let Err(error) = App::delete_account(&app, &name) {
+                        toast_overlay.add_toast(adw::Toast::new(&format!("couldn't delete account: {error}")));
+                    }
+                    populate_accounts(&group, &account_rows, &app, &toast_overlay);
                 }
-                populate_accounts(&list_box, &app, &toast_overlay);
-            }
-        });
+            });
+            row.add_suffix(&delete_button);
+        }
+        group.add(&row);
+        account_rows.borrow_mut().push(row);
     }
 }

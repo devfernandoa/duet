@@ -136,6 +136,7 @@ impl App {
             match Session::spawn(record.cwd.clone(), launch) {
                 Ok(session) => {
                     let node = SessionNode::new(&record.name);
+                    node.terminal.set_size_request(record.size.0 as i32, record.size.1 as i32);
                     let id = record.id;
                     {
                         let app_ref = app.borrow();
@@ -150,6 +151,7 @@ impl App {
                         }
                     });
                     wire_link_controls(app, &node, id, toast_overlay);
+                    wire_session_chrome(app, &node, id);
                     app.borrow_mut().sessions.insert(
                         id,
                         SessionEntry {
@@ -168,6 +170,8 @@ impl App {
 
         for note_record in saved.notes {
             let node = NoteNode::new(&note_record.text, &note_record.color);
+            node.text_view
+                .set_size_request(note_record.size.0 as i32, note_record.size.1 as i32);
             {
                 let app_ref = app.borrow();
                 app_ref.canvas.add_node(&node.container, note_record.position);
@@ -182,6 +186,7 @@ impl App {
                     App::schedule_persist(&app);
                 }
             });
+            wire_note_chrome(app, &node, id);
             app.borrow_mut()
                 .notes
                 .insert(id, NoteEntry { record: note_record, node });
@@ -304,6 +309,7 @@ impl App {
             }
         });
         wire_link_controls(app, &node, id, toast_overlay);
+        wire_session_chrome(app, &node, id);
         app.borrow_mut().sessions.insert(
             id,
             SessionEntry {
@@ -337,6 +343,7 @@ impl App {
                 App::schedule_persist(&app);
             }
         });
+        wire_note_chrome(app, &node, id);
         let record = StickyNoteRecord {
             id,
             text: String::new(),
@@ -483,6 +490,189 @@ impl App {
         app.borrow().persist()?;
         Ok(())
     }
+
+    /// Removes a single session from the canvas (its per-card close button):
+    /// kills the process, drops the node via `canvas.remove_node`, and drops
+    /// any link to/from it so `pump_output` never looks it up again.
+    pub fn close_session(app: &Rc<RefCell<App>>, id: Uuid) {
+        {
+            let mut app_mut = app.borrow_mut();
+            if let Some(mut entry) = app_mut.sessions.remove(&id) {
+                entry.session.kill();
+                app_mut.canvas.remove_node(&entry.node.container);
+            }
+            app_mut.links.retain(|l| l.source != id && l.target != id);
+        }
+        let _ = app.borrow().persist();
+    }
+
+    /// Removes a single sticky note from the canvas (its per-note close
+    /// button).
+    pub fn close_note(app: &Rc<RefCell<App>>, id: Uuid) {
+        {
+            let mut app_mut = app.borrow_mut();
+            if let Some(entry) = app_mut.notes.remove(&id) {
+                app_mut.canvas.remove_node(&entry.node.container);
+            }
+        }
+        let _ = app.borrow().persist();
+    }
+}
+
+/// Converts a screen-space drag offset (as reported by a `GestureDrag`'s
+/// `drag-update`, relative to the drag's start point) into an absolute
+/// world-space value, given the value's world-space value at drag start and
+/// the canvas's current zoom. Shared by the move and resize handlers below —
+/// moving is "world position at drag start, plus a zoom-scaled offset" and
+/// resizing is "world size at drag start, plus a zoom-scaled offset"; both
+/// are the same formula `Canvas`'s own pan handler already uses (screen
+/// deltas must be divided by zoom to stay in world units).
+fn drag_delta_to_world(start: (f64, f64), offset_screen: (f64, f64), zoom: f64) -> (f64, f64) {
+    (start.0 + offset_screen.0 / zoom, start.1 + offset_screen.1 / zoom)
+}
+
+/// Wires a session card's drag-to-move (`node.drag_handle`), drag-to-resize
+/// (`node.resize_handle`), and close button (`node.close_button`). Shared by
+/// `restore` and `create_session`, same as `wire_link_controls`.
+///
+/// Both gestures call `gesture.set_state(Claimed)` in their `drag-begin`
+/// handler. Without this, the same press would also bubble up to `Canvas`'s
+/// own pan `GestureDrag` (attached to `fixed`, an ancestor of every node),
+/// since GTK delivers an event to every interested controller along a
+/// widget's ancestor chain during the bubble phase unless one of them claims
+/// the event sequence — so without claiming, moving/resizing a card would
+/// simultaneously pan the whole canvas underneath it.
+fn wire_session_chrome(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid) {
+    node.close_button.connect_clicked({
+        let app = Rc::clone(app);
+        move |_| App::close_session(&app, id)
+    });
+
+    let move_start = Rc::new(RefCell::new((0.0, 0.0)));
+    let drag = gtk4::GestureDrag::new();
+    drag.connect_drag_begin({
+        let app = Rc::clone(app);
+        let move_start = Rc::clone(&move_start);
+        move |gesture, _x, _y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(entry) = app.borrow().sessions.get(&id) {
+                *move_start.borrow_mut() = entry.record.position;
+            }
+        }
+    });
+    drag.connect_drag_update({
+        let app = Rc::clone(app);
+        let container = node.container.clone();
+        move |_gesture, offset_x, offset_y| {
+            let zoom = app.borrow().canvas.state.borrow().zoom;
+            let new_position = drag_delta_to_world(*move_start.borrow(), (offset_x, offset_y), zoom);
+            {
+                let mut app_mut = app.borrow_mut();
+                app_mut.canvas.reposition_node(&container, new_position);
+                if let Some(entry) = app_mut.sessions.get_mut(&id) {
+                    entry.record.position = new_position;
+                }
+            }
+            App::schedule_persist(&app);
+        }
+    });
+    node.drag_handle.add_controller(drag);
+
+    let resize_start = Rc::new(RefCell::new((0.0, 0.0)));
+    let resize = gtk4::GestureDrag::new();
+    resize.connect_drag_begin({
+        let app = Rc::clone(app);
+        let resize_start = Rc::clone(&resize_start);
+        move |gesture, _x, _y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(entry) = app.borrow().sessions.get(&id) {
+                *resize_start.borrow_mut() = entry.record.size;
+            }
+        }
+    });
+    resize.connect_drag_update({
+        let app = Rc::clone(app);
+        let terminal = node.terminal.clone();
+        move |_gesture, offset_x, offset_y| {
+            let zoom = app.borrow().canvas.state.borrow().zoom;
+            let (w, h) = drag_delta_to_world(*resize_start.borrow(), (offset_x, offset_y), zoom);
+            let new_size = (w.max(crate::node::MIN_NODE_WIDTH), h.max(crate::node::MIN_NODE_HEIGHT));
+            terminal.set_size_request(new_size.0 as i32, new_size.1 as i32);
+            if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
+                entry.record.size = new_size;
+            }
+            App::schedule_persist(&app);
+        }
+    });
+    node.resize_handle.add_controller(resize);
+}
+
+/// Note equivalent of `wire_session_chrome` — same drag-to-move/resize/close
+/// wiring, against `app.notes` and `node.text_view` instead of
+/// `app.sessions`/`node.terminal`.
+fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
+    node.close_button.connect_clicked({
+        let app = Rc::clone(app);
+        move |_| App::close_note(&app, id)
+    });
+
+    let move_start = Rc::new(RefCell::new((0.0, 0.0)));
+    let drag = gtk4::GestureDrag::new();
+    drag.connect_drag_begin({
+        let app = Rc::clone(app);
+        let move_start = Rc::clone(&move_start);
+        move |gesture, _x, _y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(entry) = app.borrow().notes.get(&id) {
+                *move_start.borrow_mut() = entry.record.position;
+            }
+        }
+    });
+    drag.connect_drag_update({
+        let app = Rc::clone(app);
+        let container = node.container.clone();
+        move |_gesture, offset_x, offset_y| {
+            let zoom = app.borrow().canvas.state.borrow().zoom;
+            let new_position = drag_delta_to_world(*move_start.borrow(), (offset_x, offset_y), zoom);
+            {
+                let mut app_mut = app.borrow_mut();
+                app_mut.canvas.reposition_node(&container, new_position);
+                if let Some(entry) = app_mut.notes.get_mut(&id) {
+                    entry.record.position = new_position;
+                }
+            }
+            App::schedule_persist(&app);
+        }
+    });
+    node.drag_handle.add_controller(drag);
+
+    let resize_start = Rc::new(RefCell::new((0.0, 0.0)));
+    let resize = gtk4::GestureDrag::new();
+    resize.connect_drag_begin({
+        let app = Rc::clone(app);
+        let resize_start = Rc::clone(&resize_start);
+        move |gesture, _x, _y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(entry) = app.borrow().notes.get(&id) {
+                *resize_start.borrow_mut() = entry.record.size;
+            }
+        }
+    });
+    resize.connect_drag_update({
+        let app = Rc::clone(app);
+        let text_view = node.text_view.clone();
+        move |_gesture, offset_x, offset_y| {
+            let zoom = app.borrow().canvas.state.borrow().zoom;
+            let (w, h) = drag_delta_to_world(*resize_start.borrow(), (offset_x, offset_y), zoom);
+            let new_size = (w.max(crate::node::MIN_NODE_WIDTH), h.max(crate::node::MIN_NODE_HEIGHT));
+            text_view.set_size_request(new_size.0 as i32, new_size.1 as i32);
+            if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
+                entry.record.size = new_size;
+            }
+            App::schedule_persist(&app);
+        }
+    });
+    node.resize_handle.add_controller(resize);
 }
 
 /// Wires a session node's link button (click to enter link mode, sourced
@@ -573,5 +763,17 @@ fn build_launch_and_record(
             };
             Ok((launch, record))
         }
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn drag_delta_to_world_scales_screen_offset_by_zoom() {
+        assert_eq!(drag_delta_to_world((10.0, 20.0), (30.0, 60.0), 1.0), (40.0, 80.0));
+        assert_eq!(drag_delta_to_world((10.0, 20.0), (30.0, 60.0), 2.0), (25.0, 50.0));
+        assert_eq!(drag_delta_to_world((0.0, 0.0), (0.0, 0.0), 0.5), (0.0, 0.0));
     }
 }
