@@ -1,5 +1,5 @@
 use crate::account::AccountStore;
-use crate::agent::{Agent, Launch, claude_launch, codex_launch};
+use crate::agent::{Agent, Launch, LaunchRequest};
 use crate::canvas::Canvas;
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::node::{NoteNode, SessionNode};
@@ -812,56 +812,78 @@ impl App {
     /// rather than failing the whole handoff.
     pub fn switch_agent(app: &Rc<RefCell<App>>, id: Uuid) -> anyhow::Result<()> {
         let record = {
-            let mut app_mut = app.borrow_mut();
-            let entry = app_mut.sessions.get_mut(&id).context("session not found")?;
-            entry.session.kill();
-            entry.record.clone()
+            let app_ref = app.borrow();
+            app_ref
+                .sessions
+                .get(&id)
+                .context("session not found")?
+                .record
+                .clone()
         };
+        // Checked before anything is torn down: a session whose agent has no
+        // handoff support (every provider besides Claude/Codex) should be
+        // left running untouched, not killed for a switch that can't
+        // meaningfully complete.
+        if !record.agent.supports_handoff() {
+            anyhow::bail!(
+                "{} sessions don't support handing off to another agent",
+                record.agent.display_name()
+            );
+        }
+        if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
+            entry.session.kill();
+        }
 
-        let summary_result = match record.agent {
-            Agent::Claude => {
-                let session_id = record
-                    .claude_session_id
-                    .context("session has no Claude session to summarize")?;
-                let config_dir = record
-                    .claude_account
-                    .as_ref()
-                    .map(|a| app.borrow().accounts.config_dir(a));
-                summarize_claude(session_id, config_dir.as_deref(), &record.cwd)
-            }
-            Agent::Codex => summarize_codex(&record.cwd),
+        let is_claude = matches!(record.agent, Agent::Claude);
+        let summary_result = if is_claude {
+            let session_id = record
+                .claude_session_id
+                .context("session has no Claude session to summarize")?;
+            let config_dir = record
+                .claude_account
+                .as_ref()
+                .map(|a| app.borrow().accounts.config_dir(a));
+            summarize_claude(session_id, config_dir.as_deref(), &record.cwd)
+        } else {
+            summarize_codex(&record.cwd)
         };
         let summary = match summary_result {
             Ok(summary) => summary,
             Err(_) => "The previous agent session could not be recovered. Start by inspecting the working directory and continue from there.".to_string(),
         };
 
-        let to = match record.agent {
-            Agent::Claude => Agent::Codex,
-            Agent::Codex => Agent::Claude,
+        let to = if is_claude {
+            Agent::Codex
+        } else {
+            Agent::Claude
         };
         let (launch, updated_record) = {
             let app_ref = app.borrow();
-            match to {
-                Agent::Claude => {
-                    let account = crate::account::DEFAULT_ACCOUNT.to_string();
-                    let config_dir = app_ref.accounts.ensure(&account)?;
-                    let session_id = Uuid::new_v4();
-                    let launch = claude_launch(session_id, false, Some(&summary), Some(&config_dir));
-                    let mut updated = record.clone();
-                    updated.agent = Agent::Claude;
-                    updated.claude_session_id = Some(session_id);
-                    updated.claude_account = Some(account);
-                    (launch, updated)
-                }
-                Agent::Codex => {
-                    let launch = codex_launch(false, Some(&summary));
-                    let mut updated = record.clone();
-                    updated.agent = Agent::Codex;
-                    updated.claude_session_id = None;
-                    updated.claude_account = None;
-                    (launch, updated)
-                }
+            if matches!(to, Agent::Claude) {
+                let account = crate::account::DEFAULT_ACCOUNT.to_string();
+                let config_dir = app_ref.accounts.ensure(&account)?;
+                let session_id = Uuid::new_v4();
+                let launch = to.launch(LaunchRequest {
+                    initial_prompt: Some(&summary),
+                    claude_session_id: Some(session_id),
+                    claude_config_dir: Some(&config_dir),
+                    ..Default::default()
+                });
+                let mut updated = record.clone();
+                updated.agent = Agent::Claude;
+                updated.claude_session_id = Some(session_id);
+                updated.claude_account = Some(account);
+                (launch, updated)
+            } else {
+                let launch = to.launch(LaunchRequest {
+                    initial_prompt: Some(&summary),
+                    ..Default::default()
+                });
+                let mut updated = record.clone();
+                updated.agent = Agent::Codex;
+                updated.claude_session_id = None;
+                updated.claude_account = None;
+                (launch, updated)
             }
         };
         let new_session = Session::spawn(updated_record.cwd.clone(), launch)?;
@@ -1398,11 +1420,13 @@ fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid, toas
         }
     });
 
-    // `switch_agent` kills the old process as its first, unconditional step,
-    // before any of the fallible work (summarize, account setup, spawning
-    // the new process) runs — so a failure here can leave the card's process
-    // dead with no other signal. Surface it as a toast rather than swallowing
-    // it, matching `App::restore`/the new-session dialog's error handling.
+    // `switch_agent` refuses up front (before killing anything) for a
+    // provider with no handoff support, but once past that check it still
+    // kills the old process before the rest of the fallible work (summarize,
+    // account setup, spawning the new process) — so a failure after that
+    // point can leave the card's process dead with no other signal. Surface
+    // it as a toast rather than swallowing it, matching `App::restore`/the
+    // new-session dialog's error handling.
     node.handoff_button.connect_clicked({
         let app = Rc::clone(app);
         let toast_overlay = toast_overlay.clone();
@@ -1445,25 +1469,32 @@ fn spawn_workspace_contents(
     for record in sessions {
         let launch = {
             let app_ref = app.borrow();
-            match record.agent {
-                Agent::Claude => {
-                    let account = record
-                        .claude_account
-                        .clone()
-                        .unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
-                    match app_ref.accounts.ensure(&account) {
-                        Ok(dir) => {
-                            let id = record.claude_session_id.unwrap_or_else(Uuid::new_v4);
-                            claude_launch(id, record.claude_session_id.is_some(), None, Some(&dir))
-                        }
-                        Err(error) => {
-                            errors.push(format!("couldn't restore {}: {error}", record.name));
-                            continue;
-                        }
-                    }
+            let claude = match resolve_claude_account(
+                &app_ref,
+                &record.agent,
+                record.claude_account.clone(),
+            ) {
+                Ok(claude) => claude,
+                Err(error) => {
+                    errors.push(format!("couldn't restore {}: {error}", record.name));
+                    continue;
                 }
-                Agent::Codex => codex_launch(true, None),
-            }
+            };
+            // Claude only resumes a prior conversation when this record
+            // already pinned a session id; every other provider is simply
+            // relaunched fresh (Codex's own `--last` happens to pick up its
+            // most recent conversation regardless of this flag, consistent
+            // with the pre-workspace behavior).
+            let resume = match &record.agent {
+                Agent::Claude => record.claude_session_id.is_some(),
+                _ => true,
+            };
+            record.agent.launch(LaunchRequest {
+                resume,
+                claude_session_id: record.claude_session_id,
+                claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+                ..Default::default()
+            })
         };
         match Session::spawn(record.cwd.clone(), launch) {
             Ok(session) => {
@@ -1531,6 +1562,24 @@ fn spawn_workspace_contents(
     errors
 }
 
+/// Resolves a Claude account's isolated config directory for a Claude-kind
+/// agent, falling back to the default account when none was picked; `None`
+/// for every other agent, since `account.rs`'s isolation is Claude-only.
+/// Returns the account name alongside the directory so the caller can
+/// persist which account was actually used onto the session's record.
+fn resolve_claude_account(
+    app: &App,
+    agent: &Agent,
+    claude_account: Option<String>,
+) -> anyhow::Result<Option<(String, PathBuf)>> {
+    if !agent.supports_accounts() {
+        return Ok(None);
+    }
+    let account = claude_account.unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
+    let dir = app.accounts.ensure(&account)?;
+    Ok(Some((account, dir)))
+}
+
 fn build_launch_and_record(
     app: &App,
     name: &str,
@@ -1539,37 +1588,27 @@ fn build_launch_and_record(
     claude_account: Option<String>,
     position: (f64, f64),
 ) -> anyhow::Result<(Launch, SessionRecord)> {
-    match agent {
-        Agent::Claude => {
-            let account = claude_account.unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
-            let config_dir = app.accounts.ensure(&account)?;
-            let session_id = Uuid::new_v4();
-            let launch = claude_launch(session_id, false, None, Some(&config_dir));
-            let record = SessionRecord {
-                id: Uuid::new_v4(),
-                name: name.to_string(),
-                cwd: cwd.to_path_buf(),
-                agent,
-                claude_session_id: Some(session_id),
-                claude_account: Some(account),
-                position,
-                size: (720.0, 504.0),
-            };
-            Ok((launch, record))
-        }
-        Agent::Codex => {
-            let launch = codex_launch(false, None);
-            let record = SessionRecord {
-                id: Uuid::new_v4(),
-                name: name.to_string(),
-                cwd: cwd.to_path_buf(),
-                agent,
-                claude_session_id: None,
-                claude_account: None,
-                position,
-                size: (720.0, 504.0),
-            };
-            Ok((launch, record))
+    if let Agent::Custom { program, .. } = &agent {
+        if program.trim().is_empty() {
+            anyhow::bail!("give the custom command a program to run");
         }
     }
+    let claude = resolve_claude_account(app, &agent, claude_account)?;
+    let claude_session_id = claude.is_some().then(Uuid::new_v4);
+    let launch = agent.launch(LaunchRequest {
+        claude_session_id,
+        claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+        ..Default::default()
+    });
+    let record = SessionRecord {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        cwd: cwd.to_path_buf(),
+        claude_account: claude.map(|(account, _)| account),
+        claude_session_id,
+        agent,
+        position,
+        size: (720.0, 504.0),
+    };
+    Ok((launch, record))
 }

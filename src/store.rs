@@ -415,4 +415,61 @@ mod tests {
         assert!(Store::load(&path).workspaces.is_empty());
         assert!(path.with_extension("corrupt.json").exists());
     }
+
+    /// Milestone 3 added three `Agent` variants alongside the original
+    /// `Claude`/`Codex` unit variants. A workspace saved by an older duet
+    /// binary has `"agent": "Claude"`/`"agent": "Codex"` as bare JSON
+    /// strings (serde's default unit-variant representation) — confirms
+    /// that literal shape still deserializes under the expanded enum with
+    /// zero migration code, i.e. existing saved sessions are preserved.
+    #[test]
+    fn old_bare_string_agent_values_still_deserialize() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000000",
+                    "name": "web",
+                    "root_dir": "/home/fernando",
+                    "sessions": [
+                        {"id": "00000000-0000-0000-0000-000000000001", "name": "a", "cwd": "/tmp", "agent": "Claude", "claude_session_id": null, "claude_account": null, "position": [0.0, 0.0], "size": [480.0, 320.0]},
+                        {"id": "00000000-0000-0000-0000-000000000002", "name": "b", "cwd": "/tmp", "agent": "Codex", "claude_session_id": null, "claude_account": null, "position": [0.0, 0.0], "size": [480.0, 320.0]}
+                    ],
+                    "notes": [],
+                    "links": [],
+                    "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
+                }],
+                "active_workspace": "00000000-0000-0000-0000-000000000000"
+            }"#,
+        )
+        .unwrap();
+        let store = Store::load(&path);
+        assert_eq!(store.workspaces[0].sessions[0].agent, Agent::Claude);
+        assert_eq!(store.workspaces[0].sessions[1].agent, Agent::Codex);
+    }
+
+    /// A custom-provider session's `Agent::Custom { program, args }` carries
+    /// its own metadata inside the enum variant, serializing as a JSON
+    /// object rather than a bare string — confirms it round-trips through a
+    /// real save+load, not just `agent.rs`'s own unit tests.
+    #[test]
+    fn custom_agent_round_trips_through_save_and_load() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        let mut record = sample_record();
+        record.agent = Agent::Custom {
+            program: "mytool".to_string(),
+            args: vec!["--flag".to_string()],
+        };
+        let workspace = sample_workspace(vec![record.clone()]);
+        let store = Store {
+            workspaces: vec![workspace.clone()],
+            active_workspace: Some(workspace.id),
+        };
+        store.save(&path).unwrap();
+        let loaded = Store::load(&path);
+        assert_eq!(loaded.workspaces[0].sessions[0].agent, record.agent);
+    }
 }

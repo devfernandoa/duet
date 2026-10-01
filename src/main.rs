@@ -280,7 +280,16 @@ fn open_new_session_dialog(
     let cwd_entry = gtk4::Entry::builder()
         .text(app.borrow().workspace_root.display().to_string())
         .build();
-    let agent_dropdown = gtk4::DropDown::from_strings(&["Claude", "Codex"]);
+    // This order (index 0-4) is matched by index in two places below:
+    // `sync_field_visibility`'s `selected() == 0`/`== 4` checks, and the
+    // `create_button` click handler's `match agent_dropdown.selected()`.
+    // Reordering these strings means updating both.
+    let agent_dropdown =
+        gtk4::DropDown::from_strings(&["Claude", "Codex", "OpenCode", "Shell", "Custom command"]);
+    let custom_command_entry = gtk4::Entry::builder()
+        .placeholder_text("Command to run (e.g. mytool --flag value)")
+        .build();
+    custom_command_entry.set_visible(false);
 
     // Claude-account picker: previously this dialog always passed `None` to
     // `App::create_session`, silently ignoring every account but the default
@@ -307,24 +316,28 @@ fn open_new_session_dialog(
     body.append(&agent_dropdown);
     body.append(&account_label);
     body.append(&account_dropdown);
+    body.append(&custom_command_entry);
     body.append(&create_button);
     dialog.set_content(Some(&body));
 
-    // The account picker only matters for Claude; keep it visible but
-    // dimmed/disabled when Codex is selected rather than hiding it, so the
-    // dialog's layout doesn't jump around as the user switches agents.
-    let sync_account_sensitivity = {
+    // The account picker only matters for Claude; the command field only for
+    // a custom provider. Both stay in the layout (dimmed/hidden, not
+    // removed) rather than being added/removed, so the dialog doesn't jump
+    // around as the user changes the agent dropdown.
+    let sync_field_visibility = {
         let agent_dropdown = agent_dropdown.clone();
         let account_label = account_label.clone();
         let account_dropdown = account_dropdown.clone();
+        let custom_command_entry = custom_command_entry.clone();
         move || {
             let is_claude = agent_dropdown.selected() == 0;
             account_label.set_sensitive(is_claude);
             account_dropdown.set_sensitive(is_claude);
+            custom_command_entry.set_visible(agent_dropdown.selected() == 4);
         }
     };
-    sync_account_sensitivity();
-    agent_dropdown.connect_selected_notify(move |_| sync_account_sensitivity());
+    sync_field_visibility();
+    agent_dropdown.connect_selected_notify(move |_| sync_field_visibility());
 
     create_button.connect_clicked({
         let app = app.clone();
@@ -334,15 +347,27 @@ fn open_new_session_dialog(
         let cwd_entry = cwd_entry.clone();
         let agent_dropdown = agent_dropdown.clone();
         let account_dropdown = account_dropdown.clone();
+        let custom_command_entry = custom_command_entry.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| {
-            let agent = if agent_dropdown.selected() == 0 {
-                agent::Agent::Claude
-            } else {
-                agent::Agent::Codex
+            let agent = match agent_dropdown.selected() {
+                0 => agent::Agent::Claude,
+                1 => agent::Agent::Codex,
+                2 => agent::Agent::OpenCode,
+                3 => agent::Agent::Shell,
+                _ => {
+                    // Naive whitespace splitting, not a shell-quoting parser —
+                    // "simple command configurations," per this milestone's
+                    // own scope, not a full command-line grammar.
+                    let command_text = custom_command_entry.text();
+                    let mut parts = command_text.split_whitespace().map(str::to_string);
+                    let program = parts.next().unwrap_or_default();
+                    let args = parts.collect();
+                    agent::Agent::Custom { program, args }
+                }
             };
-            // Ignored entirely by `create_session`'s Codex path; only read
-            // when `agent == Claude`.
+            // Ignored entirely by every non-Claude path; only read when
+            // `agent` is `Agent::Claude`.
             let claude_account = account_names.get(account_dropdown.selected() as usize).cloned();
             let viewport_center = {
                 let (width, height) = (parent.width(), parent.height());

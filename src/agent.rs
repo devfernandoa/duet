@@ -1,12 +1,89 @@
-//! Agent enumeration and launch configuration for claude and codex CLI tools.
+//! Agent provider enumeration and launch configuration. Each `Agent` variant
+//! owns exactly its own command construction, resume behavior, and metadata
+//! (a provider concern); nothing here knows about PTYs, GTK, or the canvas —
+//! that split is `session.rs`/`node.rs`'s job, unchanged by what kind of
+//! agent is running inside.
 
 use std::path::Path;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Agent {
     Claude,
     Codex,
+    OpenCode,
+    Shell,
+    /// A user-configured command: `program` plus any fixed `args`, always
+    /// launched fresh — no resume/session-id concept, no handoff/summarize
+    /// support. The "simple command configuration" this milestone scopes a
+    /// custom provider to, not a plugin system.
+    Custom {
+        program: String,
+        args: Vec<String>,
+    },
+}
+
+impl Agent {
+    /// What to show the user — the provider's own name for the built-in
+    /// kinds, or the configured program for a custom one (there's no other
+    /// name to show).
+    pub fn display_name(&self) -> String {
+        match self {
+            Agent::Claude => "Claude".to_string(),
+            Agent::Codex => "Codex".to_string(),
+            Agent::OpenCode => "OpenCode".to_string(),
+            Agent::Shell => "Shell".to_string(),
+            Agent::Custom { program, .. } => program.clone(),
+        }
+    }
+
+    /// Whether duet can meaningfully hand a session of this agent off to
+    /// "the other" agent (summarize the conversation, then relaunch the
+    /// other one with that summary) — only Claude and Codex have the
+    /// resumable-session-plus-non-interactive-summarize support
+    /// `handoff.rs` needs. The other providers are plain interactive
+    /// processes with no equivalent hook, so handoff is refused for them
+    /// rather than silently doing something meaningless.
+    pub fn supports_handoff(&self) -> bool {
+        matches!(self, Agent::Claude | Agent::Codex)
+    }
+
+    /// Whether this agent uses duet's per-account Claude config-dir
+    /// isolation (`account.rs`) — Claude-only; every other provider ignores
+    /// accounts entirely.
+    pub fn supports_accounts(&self) -> bool {
+        matches!(self, Agent::Claude)
+    }
+
+    /// Builds the `Launch` for this agent. `request`'s Claude-only fields are
+    /// simply ignored by every other provider — one call site per launch
+    /// instead of callers re-matching `Agent` themselves to pick which free
+    /// function to call.
+    pub fn launch(&self, request: LaunchRequest) -> Launch {
+        match self {
+            Agent::Claude => claude_launch(
+                request.claude_session_id.unwrap_or_else(Uuid::new_v4),
+                request.resume,
+                request.initial_prompt,
+                request.claude_config_dir,
+            ),
+            Agent::Codex => codex_launch(request.resume, request.initial_prompt),
+            Agent::OpenCode => opencode_launch(),
+            Agent::Shell => shell_launch(),
+            Agent::Custom { program, args } => custom_launch(program, args),
+        }
+    }
+}
+
+/// What's needed to build a `Launch` for any `Agent`. Fields only some
+/// providers consult (Claude's session id/config dir) are simply ignored by
+/// the providers that don't use them.
+#[derive(Debug, Default)]
+pub struct LaunchRequest<'a> {
+    pub resume: bool,
+    pub initial_prompt: Option<&'a str>,
+    pub claude_session_id: Option<Uuid>,
+    pub claude_config_dir: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +151,40 @@ pub fn codex_launch(resume: bool, initial_prompt: Option<&str>) -> Launch {
     Launch {
         program: "codex".to_string(),
         args,
+        envs: Vec::new(),
+    }
+}
+
+/// OpenCode has no duet-tracked resumable session concept yet (unlike
+/// Claude's pinned session id or even Codex's directory-scoped `--last`), so
+/// every launch is simply a fresh interactive start.
+pub fn opencode_launch() -> Launch {
+    Launch {
+        program: "opencode".to_string(),
+        args: Vec::new(),
+        envs: Vec::new(),
+    }
+}
+
+/// Launches the user's own shell (`$SHELL`, falling back to `sh` if unset —
+/// the standard Unix convention) with no arguments, for a plain terminal
+/// with none of the other providers' agent-specific behavior.
+pub fn shell_launch() -> Launch {
+    let program = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    Launch {
+        program,
+        args: Vec::new(),
+        envs: Vec::new(),
+    }
+}
+
+/// Launches exactly the user-configured `program`/`args`, unmodified — no
+/// resume flag, no initial-prompt injection, since a custom command's own
+/// argv is the one thing duet is told to run verbatim.
+pub fn custom_launch(program: &str, args: &[String]) -> Launch {
+    Launch {
+        program: program.to_string(),
+        args: args.to_vec(),
         envs: Vec::new(),
     }
 }
@@ -210,5 +321,106 @@ mod tests {
                 Some(std::ffi::OsStr::new("bar"))
             )]
         );
+    }
+
+    #[test]
+    fn opencode_launch_is_a_plain_fresh_start() {
+        let launch = opencode_launch();
+        assert_eq!(launch.program, "opencode");
+        assert!(launch.args.is_empty());
+        assert!(launch.envs.is_empty());
+    }
+
+    #[test]
+    fn shell_launch_has_no_args_and_a_nonempty_program() {
+        let launch = shell_launch();
+        assert!(!launch.program.is_empty());
+        assert!(launch.args.is_empty());
+    }
+
+    #[test]
+    fn custom_launch_runs_program_and_args_verbatim() {
+        let launch = custom_launch("mytool", &["--flag".to_string(), "value".to_string()]);
+        assert_eq!(launch.program, "mytool");
+        assert_eq!(launch.args, vec!["--flag", "value"]);
+        assert!(launch.envs.is_empty());
+    }
+
+    #[test]
+    fn display_name_uses_the_provider_name_or_the_custom_program() {
+        assert_eq!(Agent::Claude.display_name(), "Claude");
+        assert_eq!(Agent::Codex.display_name(), "Codex");
+        assert_eq!(Agent::OpenCode.display_name(), "OpenCode");
+        assert_eq!(Agent::Shell.display_name(), "Shell");
+        assert_eq!(
+            Agent::Custom {
+                program: "mytool".to_string(),
+                args: vec![],
+            }
+            .display_name(),
+            "mytool"
+        );
+    }
+
+    #[test]
+    fn only_claude_and_codex_support_handoff() {
+        assert!(Agent::Claude.supports_handoff());
+        assert!(Agent::Codex.supports_handoff());
+        assert!(!Agent::OpenCode.supports_handoff());
+        assert!(!Agent::Shell.supports_handoff());
+        assert!(
+            !Agent::Custom {
+                program: "mytool".to_string(),
+                args: vec![],
+            }
+            .supports_handoff()
+        );
+    }
+
+    #[test]
+    fn only_claude_supports_accounts() {
+        assert!(Agent::Claude.supports_accounts());
+        assert!(!Agent::Codex.supports_accounts());
+        assert!(!Agent::OpenCode.supports_accounts());
+        assert!(!Agent::Shell.supports_accounts());
+    }
+
+    #[test]
+    fn launch_dispatches_to_the_right_provider_builder() {
+        let id = Uuid::nil();
+        let request = LaunchRequest {
+            resume: true,
+            claude_session_id: Some(id),
+            ..Default::default()
+        };
+        assert_eq!(Agent::Claude.launch(request).program, "claude");
+
+        let request = LaunchRequest {
+            resume: true,
+            ..Default::default()
+        };
+        assert_eq!(Agent::Codex.launch(request).args, vec!["resume", "--last"]);
+
+        assert_eq!(
+            Agent::OpenCode.launch(LaunchRequest::default()).program,
+            "opencode"
+        );
+
+        let custom = Agent::Custom {
+            program: "mytool".to_string(),
+            args: vec!["--flag".to_string()],
+        };
+        let launch = custom.launch(LaunchRequest::default());
+        assert_eq!(launch.program, "mytool");
+        assert_eq!(launch.args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn claude_launch_via_request_generates_a_session_id_when_none_given() {
+        let launch = Agent::Claude.launch(LaunchRequest::default());
+        // No session id was supplied, so one was generated — the launch must
+        // still pin *some* id, not fall back to resuming nothing.
+        assert_eq!(launch.args[0], "--session-id");
+        assert!(Uuid::parse_str(&launch.args[1]).is_ok());
     }
 }
