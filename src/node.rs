@@ -169,12 +169,11 @@ impl SessionNode {
         title_bar.append(&handoff_button);
         title_bar.append(&close_button);
 
-        // Deliberately no `set_size_request` here: a VTE terminal's size is
-        // its character grid, and `set_size_request` only raises the widget's
-        // *minimum*. VTE's natural size (80x24 grid = 722x506px at a 9x21
-        // cell) stayed larger than any request under ~722x506, so `GtkFixed`
-        // kept allocating the natural size and the request had no effect at
-        // all. Callers size the terminal through `request_grid` instead.
+        // No size request here, but only because callers immediately set one
+        // via `request_grid` (restore/create from the record, resize drags
+        // from the pointer). Without one a card is allocated VTE's *minimum*
+        // — one row tall — because `GtkFixed` allocates minimums, not natural
+        // sizes; see `request_grid`.
         let terminal = vte4::Terminal::new();
 
         // Focus-follows-mouse ("sloppy focus"): hovering a card's terminal is
@@ -239,35 +238,41 @@ impl SessionNode {
             .set_tooltip_text(Some(&format!("{name}\nClick to rename")));
     }
 
-    /// Asks the terminal for the largest character grid that fits
-    /// `width` x `height` pixels. A no-op when the grid is already that size,
-    /// so a resize drag doesn't queue a relayout on every motion event, and
-    /// when VTE reports a non-positive cell size (the pixel -> grid
+    /// Sizes the terminal to `width` x `height` pixels, rounded down to a
+    /// whole character grid of at least `MIN_GRID_COLS` x `MIN_GRID_ROWS`.
+    /// A no-op when VTE reports a non-positive cell size (the pixel -> grid
     /// conversion would be meaningless).
     ///
-    /// This is only a *request*. `vte_terminal_set_size` sets the widget's
-    /// size request, but VTE recomputes its real grid from whatever
-    /// allocation its parent then hands it — and the card's title bar sets a
-    /// minimum width of its own (~300px of buttons), so a narrower request is
-    /// simply overruled and the terminal silently gains columns. Nothing here
-    /// touches the PTY for that reason: `App::pump_output` syncs the PTY from
-    /// `column_count()`/`row_count()`, the only grid numbers that are
-    /// actually true. Telling the PTY what was *requested* instead is what
-    /// re-introduced the garbled-text mismatch at small card sizes.
+    /// It has to be `set_size_request`, i.e. the widget's *minimum*, and not
+    /// `vte_terminal_set_size`, i.e. its character grid. `GtkFixed` allocates
+    /// every child at its **minimum** size, never its natural size — measured
+    /// on a real card: `container: min=(155x49) nat=(722x532) alloc=(155x49)`.
+    /// VTE's grid only feeds its *natural* size, so `set_size` moved a number
+    /// nothing downstream ever read: every resize tick set the grid, the next
+    /// allocation recomputed it straight back from the unchanged 153x21
+    /// minimum allocation, and a full drag ended with the card the exact size
+    /// it started. That is why resize appeared completely dead rather than
+    /// merely wrong. A note's text view was always sized this way
+    /// (`set_size_request` in `app.rs`), which is why notes resized and cards
+    /// did not.
+    ///
+    /// Nothing here touches the PTY: the request is a floor, so the title
+    /// bar's own minimum width can still overrule a narrower one and leave
+    /// the terminal wider than asked. `App::pump_output` syncs the PTY from
+    /// `column_count()`/`row_count()` after allocation, the only grid numbers
+    /// that are actually true; telling the PTY what was *requested* instead
+    /// is what garbled the text of a card narrower than its title bar.
     pub fn request_grid(&self, width: f64, height: f64) {
-        let Some((cols, rows)) = grid_size(
-            width,
-            height,
-            self.terminal.char_width(),
-            self.terminal.char_height(),
-        ) else {
+        let (char_width, char_height) = (self.terminal.char_width(), self.terminal.char_height());
+        let Some((cols, rows)) = grid_size(width, height, char_width, char_height) else {
             return;
         };
-        if (i64::from(cols), i64::from(rows))
-            != (self.terminal.column_count(), self.terminal.row_count())
-        {
-            self.terminal.set_size(i64::from(cols), i64::from(rows));
-        }
+        // `grid_size` floors the grid, so when that floor bites (a drag below
+        // MIN_GRID_*) the grid's pixel size is the larger of the two.
+        self.terminal.set_size_request(
+            width.max(f64::from(cols) * char_width as f64) as i32,
+            height.max(f64::from(rows) * char_height as f64) as i32,
+        );
     }
 
     /// The terminal's real character grid as `(cols, rows)` — what VTE is
@@ -402,6 +407,48 @@ mod tests {
     fn grid_size_rejects_unusable_cell_metrics() {
         assert_eq!(grid_size(722.0, 506.0, 0, 21), None);
         assert_eq!(grid_size(f64::NAN, 506.0, 9, 21), None);
+    }
+
+    /// The regression that made resize look *completely* dead rather than
+    /// merely wrong: `GtkFixed` allocates children at their MINIMUM size, so
+    /// sizing a card through VTE's character grid — which only feeds its
+    /// *natural* size — moved a number nothing downstream ever read. No pure
+    /// function can catch that; it takes a real allocation. Needs a display,
+    /// so: `cargo test -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "needs a display"]
+    fn request_grid_drives_the_cards_real_allocation() {
+        use gtk4::prelude::*;
+        if gtk4::init().is_err() {
+            return;
+        }
+        let node = super::SessionNode::new("probe");
+        let fixed = gtk4::Fixed::new();
+        fixed.put(&node.container, 0.0, 0.0);
+        let window = gtk4::Window::new();
+        window.set_default_size(1600, 1200);
+        window.set_child(Some(&fixed));
+        node.request_grid(600.0, 400.0);
+        window.present();
+
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..400 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if node.terminal.width() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (width, height) = (node.terminal.width(), node.terminal.height());
+        window.destroy();
+        // Within one character cell of what was asked for: the request is
+        // floored to whole cells, and VTE's own padding costs a pixel or two.
+        assert!(
+            (width - 600).abs() <= 12 && (height - 400).abs() <= 24,
+            "terminal allocated {width}x{height}, wanted ~600x400"
+        );
     }
 }
 
