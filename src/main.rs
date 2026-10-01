@@ -3,6 +3,7 @@ mod agent;
 mod app;
 mod canvas;
 mod handoff;
+mod node;
 mod session;
 mod store;
 
