@@ -82,11 +82,23 @@ pub fn builtin_roles() -> Vec<Role> {
     ]
 }
 
+/// The fixed ids `builtin_roles()` uses, kept in sync with it by hand (there
+/// are only five, and they never change). Lets `is_builtin` check membership
+/// without reallocating all five `Role`s — called once per role on every
+/// role-manager repopulate.
+const BUILTIN_IDS: [Uuid; 5] = [
+    Uuid::from_u128(1),
+    Uuid::from_u128(2),
+    Uuid::from_u128(3),
+    Uuid::from_u128(4),
+    Uuid::from_u128(5),
+];
+
 /// `true` for any id a built-in role uses — keeps the role manager from
 /// offering to edit/delete them, the same way `account::DEFAULT_ACCOUNT`
 /// can't be deleted from the account manager.
 pub fn is_builtin(id: Uuid) -> bool {
-    builtin_roles().iter().any(|role| role.id == id)
+    BUILTIN_IDS.contains(&id)
 }
 
 #[cfg(test)]

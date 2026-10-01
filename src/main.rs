@@ -729,18 +729,14 @@ fn open_role_manager_dialog(
         let toast_overlay = toast_overlay.clone();
         let dialog = dialog.clone();
         move |_| {
-            let app = app.clone();
-            let roles_group = roles_group.clone();
-            let role_rows = role_rows.clone();
-            let toast_overlay = toast_overlay.clone();
-            let dialog = dialog.clone();
-            open_role_editor_dialog(
-                &app.clone(),
-                &dialog.clone(),
-                &toast_overlay.clone(),
-                None,
-                move || populate_roles(&roles_group, &role_rows, &app, &toast_overlay, &dialog),
-            );
+            open_role_editor_dialog(&app, &dialog, &toast_overlay, None, {
+                let app = app.clone();
+                let roles_group = roles_group.clone();
+                let role_rows = role_rows.clone();
+                let toast_overlay = toast_overlay.clone();
+                let dialog = dialog.clone();
+                move || populate_roles(&roles_group, &role_rows, &app, &toast_overlay, &dialog)
+            });
         }
     });
 
@@ -780,18 +776,26 @@ fn populate_roles(
                 let role_rows = role_rows.clone();
                 let role = role.clone();
                 move |_| {
-                    let app = app.clone();
-                    let group = group.clone();
-                    let role_rows = role_rows.clone();
-                    let toast_overlay = toast_overlay.clone();
-                    let dialog_parent = dialog_parent.clone();
                     open_role_editor_dialog(
-                        &app.clone(),
-                        &dialog_parent.clone(),
-                        &toast_overlay.clone(),
+                        &app,
+                        &dialog_parent,
+                        &toast_overlay,
                         Some(role.clone()),
-                        move || {
-                            populate_roles(&group, &role_rows, &app, &toast_overlay, &dialog_parent)
+                        {
+                            let app = app.clone();
+                            let group = group.clone();
+                            let role_rows = role_rows.clone();
+                            let toast_overlay = toast_overlay.clone();
+                            let dialog_parent = dialog_parent.clone();
+                            move || {
+                                populate_roles(
+                                    &group,
+                                    &role_rows,
+                                    &app,
+                                    &toast_overlay,
+                                    &dialog_parent,
+                                )
+                            }
                         },
                     );
                 }
@@ -980,7 +984,8 @@ fn open_role_editor_dialog(
             let instructions = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
                 .to_string();
-            let icon = Some(icon_entry.text().to_string()).filter(|text| !text.trim().is_empty());
+            let icon_text = icon_entry.text().trim().to_string();
+            let icon = (!icon_text.is_empty()).then_some(icon_text);
             let accent = accent_dropdown
                 .selected()
                 .checked_sub(1)
