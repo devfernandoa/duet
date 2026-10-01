@@ -4,12 +4,20 @@ use crate::canvas::Canvas;
 use crate::node::{NoteNode, SessionNode};
 use crate::session::Session;
 use crate::store::{SessionRecord, StickyNoteRecord, Store};
+use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// How long to wait after the last edit before writing the store to disk.
+/// Keeps rapid-fire events (e.g. every keystroke in a sticky note) from each
+/// triggering their own synchronous `File::create` + `write_all` +
+/// `sync_all` + `rename`.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub struct SessionEntry {
     pub record: SessionRecord,
@@ -28,6 +36,9 @@ pub struct App {
     pub canvas: Canvas,
     pub sessions: HashMap<Uuid, SessionEntry>,
     pub notes: HashMap<Uuid, NoteEntry>,
+    /// The debounce timer for `schedule_persist`, if a save is currently
+    /// pending. `None` when no save is scheduled.
+    pending_save: Option<glib::SourceId>,
 }
 
 impl App {
@@ -38,7 +49,26 @@ impl App {
             canvas: Canvas::new(),
             sessions: HashMap::new(),
             notes: HashMap::new(),
+            pending_save: None,
         }))
+    }
+
+    /// Debounces `persist()` so a burst of rapid-fire events (e.g. every
+    /// keystroke in a sticky note's text buffer) collapses into a single
+    /// disk write `PERSIST_DEBOUNCE` after the last one, instead of each
+    /// event doing its own synchronous fsync+rename. Callers must still
+    /// update any in-memory state (e.g. `entry.record.text`) synchronously
+    /// before calling this — only the disk write is delayed.
+    pub fn schedule_persist(app: &Rc<RefCell<App>>) {
+        if let Some(source_id) = app.borrow_mut().pending_save.take() {
+            source_id.remove();
+        }
+        let app_for_timeout = Rc::clone(app);
+        let source_id = glib::timeout_add_local_once(PERSIST_DEBOUNCE, move || {
+            let _ = app_for_timeout.borrow().persist();
+            app_for_timeout.borrow_mut().pending_save = None;
+        });
+        app.borrow_mut().pending_save = Some(source_id);
     }
 
     /// Loads the store and spawns one Session + SessionNode per saved
@@ -130,7 +160,7 @@ impl App {
                     if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
                         entry.record.text = entry.node.text();
                     }
-                    let _ = app.borrow().persist();
+                    App::schedule_persist(&app);
                 }
             });
             app.borrow_mut()
@@ -249,7 +279,7 @@ impl App {
                 if let Some(entry) = app.borrow_mut().notes.get_mut(&id) {
                     entry.record.text = entry.node.text();
                 }
-                let _ = app.borrow().persist();
+                App::schedule_persist(&app);
             }
         });
         let record = StickyNoteRecord {
