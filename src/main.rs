@@ -103,6 +103,7 @@ fn open_new_session_dialog(app: &Rc<RefCell<App>>, parent: &adw::ApplicationWind
     create_button.connect_clicked({
         let app = app.clone();
         let dialog = dialog.clone();
+        let parent = parent.clone();
         let name_entry = name_entry.clone();
         let cwd_entry = cwd_entry.clone();
         let agent_dropdown = agent_dropdown.clone();
@@ -113,9 +114,18 @@ fn open_new_session_dialog(app: &Rc<RefCell<App>>, parent: &adw::ApplicationWind
                 agent::Agent::Codex
             };
             let viewport_center = {
+                let (width, height) = (parent.width(), parent.height());
+                let screen_center = if width > 0 && height > 0 {
+                    (width as f64 / 2.0, height as f64 / 2.0)
+                } else {
+                    // Defensive fallback: only reachable if the window hasn't
+                    // been allocated a size yet, which shouldn't happen since
+                    // window.present() runs before this dialog can be opened.
+                    (600.0, 400.0)
+                };
                 let app_ref = app.borrow();
                 let state = app_ref.canvas.state.borrow();
-                canvas::screen_to_world((600.0, 400.0), state.pan, state.zoom)
+                canvas::screen_to_world(screen_center, state.pan, state.zoom)
             };
             let result = App::create_session(
                 &app,
