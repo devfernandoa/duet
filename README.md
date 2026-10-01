@@ -48,7 +48,9 @@ cargo install --path . --root "$HOME/.local"
 duet
 ```
 
-Requires `claude` and `codex` on `PATH` to actually run agent sessions.
+Requires `claude`/`codex`/`opencode` on `PATH` for those providers; "Shell"
+runs `$SHELL`, and "Custom command" runs whatever program you configure when
+creating the session.
 
 ## Workflow
 
@@ -57,6 +59,13 @@ per-project workspace switch. Sessions and notes persist across restarts at
 their saved canvas position and size. Drag a card's title bar to move just
 that card, drag its bottom-right corner to resize it, drag empty canvas space
 to pan everything at once, and `Ctrl+scroll` to zoom.
+
+The new-session dialog's agent dropdown picks the provider: Claude, Codex,
+OpenCode, a plain Shell, or a Custom command (type the program and any
+arguments). Only Claude and Codex support handing a session off to "the
+other" agent — the other providers are plain interactive processes with no
+equivalent resumable-session/summarize hook, so their handoff button reports
+that it's unsupported rather than doing something meaningless.
 
 Accounts (used to keep separate Claude logins/config isolated per session)
 are managed through the account-manager dialog rather than ad hoc per-session
