@@ -17,6 +17,7 @@ impl AccountStore {
     }
 
     pub fn ensure(&self, name: &str) -> io::Result<PathBuf> {
+        validate_name(name)?;
         let dir = self.config_dir(name);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
@@ -34,6 +35,29 @@ impl AccountStore {
         names.sort();
         Ok(names)
     }
+
+    pub fn remove(&self, name: &str) -> io::Result<()> {
+        validate_name(name)?;
+        let dir = self.config_dir(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "account names may only contain letters, numbers, '-' and '_'",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -76,5 +100,24 @@ mod tests {
         store.ensure("work").unwrap();
         store.ensure("work").unwrap();
         assert_eq!(store.list().unwrap(), vec!["work".to_string()]);
+    }
+
+    #[test]
+    fn remove_deletes_only_the_named_account() {
+        let tmp = tempdir().unwrap();
+        let store = AccountStore::new(tmp.path().join("accounts"));
+        store.ensure("personal").unwrap();
+        store.ensure("work").unwrap();
+        store.remove("personal").unwrap();
+        assert_eq!(store.list().unwrap(), vec!["work".to_string()]);
+    }
+
+    #[test]
+    fn unsafe_account_names_are_rejected() {
+        let tmp = tempdir().unwrap();
+        let store = AccountStore::new(tmp.path().join("accounts"));
+        assert!(store.ensure("../escape").is_err());
+        assert!(store.ensure("spaces are ambiguous").is_err());
+        assert!(store.ensure("work-2_personal").is_ok());
     }
 }
