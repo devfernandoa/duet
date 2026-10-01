@@ -3,6 +3,7 @@ use crate::agent::{Agent, Launch, LaunchRequest};
 use crate::canvas::Canvas;
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::node::{NoteNode, SessionNode};
+use crate::role::Role;
 use crate::session::Session;
 use crate::store::{
     CanvasRecord, LinkRecord, SessionRecord, StickyNoteRecord, Store, WorkspaceRecord,
@@ -61,6 +62,10 @@ pub struct App {
     /// `delete_workspace` are the only places that move a workspace between
     /// "this" (live) and an entry here (dormant).
     pub inactive_workspaces: Vec<WorkspaceRecord>,
+    /// User-created roles, global across every workspace (unlike
+    /// `sessions`/`notes`/`links` below). Built-in roles come from
+    /// `role::builtin_roles` and are never stored here.
+    pub custom_roles: Vec<Role>,
     pub sessions: HashMap<Uuid, SessionEntry>,
     pub notes: HashMap<Uuid, NoteEntry>,
     pub links: Vec<LinkRecord>,
@@ -89,6 +94,7 @@ impl App {
             workspace_name: "Default".to_string(),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             inactive_workspaces: Vec::new(),
+            custom_roles: Vec::new(),
             sessions: HashMap::new(),
             notes: HashMap::new(),
             links: Vec::new(),
@@ -133,6 +139,7 @@ impl App {
             Store::load_with_warning(&app_ref.store_path)
         };
         let mut errors: Vec<String> = load_warning.into_iter().collect();
+        app.borrow_mut().custom_roles = saved.custom_roles;
 
         if saved.workspaces.is_empty() {
             return errors;
@@ -164,8 +171,112 @@ impl App {
         let store = Store {
             workspaces,
             active_workspace: Some(self.workspace_id),
+            custom_roles: self.custom_roles.clone(),
         };
         store.save(&self.store_path)
+    }
+
+    /// Every role available to assign to a session: built-ins first, then
+    /// user-created ones.
+    pub fn roles(&self) -> Vec<Role> {
+        let mut roles = crate::role::builtin_roles();
+        roles.extend(self.custom_roles.iter().cloned());
+        roles
+    }
+
+    pub fn find_role(&self, id: Uuid) -> Option<Role> {
+        self.roles().into_iter().find(|role| role.id == id)
+    }
+
+    /// The instructions text for a session's assigned role, if it has one —
+    /// what a fresh (or handed-off) launch prefixes onto its prompt. `None`
+    /// both when no role is assigned and when the assigned role no longer
+    /// exists (a custom role deleted out from under an old record, say).
+    pub fn role_instructions(&self, role_id: Option<Uuid>) -> Option<String> {
+        role_id
+            .and_then(|id| self.find_role(id))
+            .map(|role| role.instructions)
+    }
+
+    /// Creates a user-defined role and persists it.
+    pub fn create_role(
+        app: &Rc<RefCell<App>>,
+        name: String,
+        instructions: String,
+        icon: Option<String>,
+        accent: Option<String>,
+    ) -> anyhow::Result<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("give this role a name");
+        }
+        app.borrow_mut().custom_roles.push(Role {
+            id: Uuid::new_v4(),
+            name,
+            instructions,
+            icon,
+            accent,
+        });
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// Updates a user-defined role in place, then refreshes the role badge
+    /// on every live session currently assigned to it (name/icon/accent may
+    /// have changed). Built-in roles have no id in `custom_roles`, so this
+    /// can never touch one.
+    pub fn update_role(
+        app: &Rc<RefCell<App>>,
+        id: Uuid,
+        name: String,
+        instructions: String,
+        icon: Option<String>,
+        accent: Option<String>,
+    ) -> anyhow::Result<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("give this role a name");
+        }
+        {
+            let mut app_mut = app.borrow_mut();
+            let role = app_mut
+                .custom_roles
+                .iter_mut()
+                .find(|role| role.id == id)
+                .context("role not found")?;
+            role.name = name.clone();
+            role.instructions = instructions;
+            role.icon = icon.clone();
+            role.accent = accent.clone();
+            for entry in app_mut.sessions.values_mut() {
+                if entry.record.role_id == Some(id) {
+                    entry
+                        .node
+                        .set_role(Some(&name), icon.as_deref(), accent.as_deref());
+                }
+            }
+        }
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// Deletes a custom role, unassigning it (rather than killing anything)
+    /// from every session that referenced it — losing a role is cosmetic/
+    /// instructional, not a login identity a running process depends on the
+    /// way an account's config directory is.
+    pub fn delete_role(app: &Rc<RefCell<App>>, id: Uuid) -> anyhow::Result<()> {
+        {
+            let mut app_mut = app.borrow_mut();
+            app_mut.custom_roles.retain(|role| role.id != id);
+            for entry in app_mut.sessions.values_mut() {
+                if entry.record.role_id == Some(id) {
+                    entry.record.role_id = None;
+                    entry.node.set_role(None, None, None);
+                }
+            }
+        }
+        app.borrow().persist()?;
+        Ok(())
     }
 
     /// The active workspace's current live state, as a `WorkspaceRecord` —
@@ -496,6 +607,7 @@ impl App {
         cwd: PathBuf,
         agent: Agent,
         claude_account: Option<String>,
+        role_id: Option<Uuid>,
         viewport_center_world: (f64, f64),
         toast_overlay: &adw::ToastOverlay,
     ) -> anyhow::Result<()> {
@@ -508,7 +620,11 @@ impl App {
         }
         {
             let app_ref = app.borrow();
-            if app_ref.sessions.values().any(|entry| entry.record.name == name) {
+            if app_ref
+                .sessions
+                .values()
+                .any(|entry| entry.record.name == name)
+            {
                 anyhow::bail!("a session named '{name}' already exists");
             }
         }
@@ -521,16 +637,20 @@ impl App {
                 &cwd,
                 agent,
                 claude_account,
+                role_id,
                 viewport_center_world,
             )?
         };
         let session = Session::spawn(cwd, launch)?;
         let node = SessionNode::new(&name);
         node.request_grid(record.size.0, record.size.1);
+        apply_role_badge(&app.borrow(), &node, role_id);
         let id = record.id;
         {
             let app_ref = app.borrow();
-            app_ref.canvas.add_node(&node.container, viewport_center_world);
+            app_ref
+                .canvas
+                .add_node(&node.container, viewport_center_world);
         }
         node.connect_commit({
             let app = Rc::clone(app);
@@ -585,7 +705,9 @@ impl App {
             size: (220.0, 160.0),
             color: "yellow".to_string(),
         };
-        app.borrow_mut().notes.insert(id, NoteEntry { record, node });
+        app.borrow_mut()
+            .notes
+            .insert(id, NoteEntry { record, node });
         let _ = app.borrow().persist();
     }
 
@@ -606,7 +728,10 @@ impl App {
         if source != target
             && app.sessions.contains_key(&source)
             && app.sessions.contains_key(&target)
-            && !app.links.iter().any(|l| l.source == source && l.target == target)
+            && !app
+                .links
+                .iter()
+                .any(|l| l.source == source && l.target == target)
         {
             app.links.push(LinkRecord { source, target });
             let _ = app.persist();
@@ -736,7 +861,8 @@ impl App {
 
     pub fn remove_link(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) {
         let mut app = app.borrow_mut();
-        app.links.retain(|l| !(l.source == source && l.target == target));
+        app.links
+            .retain(|l| !(l.source == source && l.target == target));
         let _ = app.persist();
     }
 
@@ -859,12 +985,14 @@ impl App {
         };
         let (launch, updated_record) = {
             let app_ref = app.borrow();
+            let initial_prompt =
+                with_role_instructions(app_ref.role_instructions(record.role_id), Some(&summary));
             if matches!(to, Agent::Claude) {
                 let account = crate::account::DEFAULT_ACCOUNT.to_string();
                 let config_dir = app_ref.accounts.ensure(&account)?;
                 let session_id = Uuid::new_v4();
                 let launch = to.launch(LaunchRequest {
-                    initial_prompt: Some(&summary),
+                    initial_prompt: initial_prompt.as_deref(),
                     claude_session_id: Some(session_id),
                     claude_config_dir: Some(&config_dir),
                     ..Default::default()
@@ -876,7 +1004,7 @@ impl App {
                 (launch, updated)
             } else {
                 let launch = to.launch(LaunchRequest {
-                    initial_prompt: Some(&summary),
+                    initial_prompt: initial_prompt.as_deref(),
                     ..Default::default()
                 });
                 let mut updated = record.clone();
@@ -1408,7 +1536,12 @@ fn wire_note_chrome(app: &Rc<RefCell<App>>, node: &NoteNode, id: Uuid) {
 /// (a different subtree under `container`) is never seen by this gesture at
 /// all, since GTK's bubble phase only walks up a widget's own ancestor
 /// chain, not into sibling subtrees.
-fn wire_link_controls(app: &Rc<RefCell<App>>, node: &SessionNode, id: Uuid, toast_overlay: &adw::ToastOverlay) {
+fn wire_link_controls(
+    app: &Rc<RefCell<App>>,
+    node: &SessionNode,
+    id: Uuid,
+    toast_overlay: &adw::ToastOverlay,
+) {
     node.link_button.connect_clicked({
         let app = Rc::clone(app);
         let toast_overlay = toast_overlay.clone();
@@ -1502,6 +1635,7 @@ fn spawn_workspace_contents(
                 // Ask for the saved size; `pump_output` syncs the PTY to
                 // whatever grid VTE actually ends up rendering.
                 node.request_grid(record.size.0, record.size.1);
+                apply_role_badge(&app.borrow(), &node, record.role_id);
                 let id = record.id;
                 {
                     let app_ref = app.borrow();
@@ -1541,7 +1675,9 @@ fn spawn_workspace_contents(
             .set_size_request(note_record.size.0 as i32, note_record.size.1 as i32);
         {
             let app_ref = app.borrow();
-            app_ref.canvas.add_node(&node.container, note_record.position);
+            app_ref
+                .canvas
+                .add_node(&node.container, note_record.position);
         }
         let id = note_record.id;
         node.text_view.buffer().connect_changed({
@@ -1554,9 +1690,13 @@ fn spawn_workspace_contents(
             }
         });
         wire_note_chrome(app, &node, id);
-        app.borrow_mut()
-            .notes
-            .insert(id, NoteEntry { record: note_record, node });
+        app.borrow_mut().notes.insert(
+            id,
+            NoteEntry {
+                record: note_record,
+                node,
+            },
+        );
     }
 
     errors
@@ -1580,12 +1720,41 @@ fn resolve_claude_account(
     Ok(Some((account, dir)))
 }
 
+/// Combines a role's instructions with whatever prompt text a launch already
+/// has (a handoff summary, or nothing for a brand-new session) into one
+/// `initial_prompt` — the single place role injection happens, reused by
+/// every launch site instead of each one re-deciding how to fold a role in.
+/// Goes through the same provider-agnostic `LaunchRequest::initial_prompt`
+/// field `handoff.rs` already uses, so it needs no Claude-specific code.
+fn with_role_instructions(role_instructions: Option<String>, base: Option<&str>) -> Option<String> {
+    match (role_instructions, base) {
+        (None, None) => None,
+        (Some(role), None) => Some(role),
+        (None, Some(base)) => Some(base.to_string()),
+        (Some(role), Some(base)) => Some(format!("{role}\n\n{base}")),
+    }
+}
+
+/// Looks up `role_id` and updates `node`'s title-bar badge to match —
+/// shared by `create_session` and `spawn_workspace_contents` so a session's
+/// assigned role is shown the same way whether it was just created or
+/// restored.
+fn apply_role_badge(app: &App, node: &SessionNode, role_id: Option<Uuid>) {
+    let role = role_id.and_then(|id| app.find_role(id));
+    node.set_role(
+        role.as_ref().map(|role| role.name.as_str()),
+        role.as_ref().and_then(|role| role.icon.as_deref()),
+        role.as_ref().and_then(|role| role.accent.as_deref()),
+    );
+}
+
 fn build_launch_and_record(
     app: &App,
     name: &str,
     cwd: &Path,
     agent: Agent,
     claude_account: Option<String>,
+    role_id: Option<Uuid>,
     position: (f64, f64),
 ) -> anyhow::Result<(Launch, SessionRecord)> {
     if let Agent::Custom { program, .. } = &agent {
@@ -1595,9 +1764,11 @@ fn build_launch_and_record(
     }
     let claude = resolve_claude_account(app, &agent, claude_account)?;
     let claude_session_id = claude.is_some().then(Uuid::new_v4);
+    let initial_prompt = with_role_instructions(app.role_instructions(role_id), None);
     let launch = agent.launch(LaunchRequest {
         claude_session_id,
         claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+        initial_prompt: initial_prompt.as_deref(),
         ..Default::default()
     });
     let record = SessionRecord {
@@ -1607,6 +1778,7 @@ fn build_launch_and_record(
         claude_account: claude.map(|(account, _)| account),
         claude_session_id,
         agent,
+        role_id,
         position,
         size: (720.0, 504.0),
     };

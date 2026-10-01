@@ -166,11 +166,14 @@ pub fn opencode_launch() -> Launch {
     }
 }
 
-/// Launches the user's own shell (`$SHELL`, falling back to `sh` if unset —
-/// the standard Unix convention) with no arguments, for a plain terminal
-/// with none of the other providers' agent-specific behavior.
+/// Launches the user's own shell (`$SHELL`, falling back to `sh` if unset or
+/// empty — the standard Unix convention) with no arguments, for a plain
+/// terminal with none of the other providers' agent-specific behavior.
 pub fn shell_launch() -> Launch {
-    let program = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let program = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "sh".to_string());
     Launch {
         program,
         args: Vec::new(),

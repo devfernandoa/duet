@@ -1,4 +1,5 @@
 use crate::agent::Agent;
+use crate::role::Role;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,12 @@ pub struct SessionRecord {
     pub agent: Agent,
     pub claude_session_id: Option<Uuid>,
     pub claude_account: Option<String>,
+    /// The role (if any) this session was assigned — an id into
+    /// `role::builtin_roles()` or `Store::custom_roles`. `#[serde(default)]`
+    /// so a store saved before milestone 4 still loads with every existing
+    /// session simply unassigned.
+    #[serde(default)]
+    pub role_id: Option<Uuid>,
     pub position: (f64, f64),
     pub size: (f64, f64),
 }
@@ -72,6 +79,11 @@ pub struct Store {
     pub workspaces: Vec<WorkspaceRecord>,
     #[serde(default)]
     pub active_workspace: Option<Uuid>,
+    /// User-created roles, global across every workspace (unlike sessions/
+    /// notes/links). Built-in roles are never persisted — see
+    /// `role::builtin_roles`.
+    #[serde(default)]
+    pub custom_roles: Vec<Role>,
 }
 
 /// The pre-canvas on-disk shape. Kept only to migrate old `tabs.json` files
@@ -135,6 +147,7 @@ fn wrap_single_workspace(
             canvas,
         }],
         active_workspace: Some(id),
+        custom_roles: Vec::new(),
     }
 }
 
@@ -153,6 +166,7 @@ fn migrate_legacy(legacy: LegacyStore) -> Store {
                 agent: tab.agent,
                 claude_session_id: tab.claude_session_id,
                 claude_account: tab.claude_account,
+                role_id: None,
                 position: (column * GRID_CELL_WIDTH, row * GRID_CELL_HEIGHT),
                 size: DEFAULT_NODE_SIZE,
             }
@@ -285,6 +299,7 @@ mod tests {
             agent: Agent::Claude,
             claude_session_id: Some(Uuid::nil()),
             claude_account: Some("work".to_string()),
+            role_id: None,
             position: (10.0, 20.0),
             size: (480.0, 320.0),
         }
@@ -319,14 +334,53 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("store.json");
         let workspace = sample_workspace(vec![sample_record()]);
+        let role = Role {
+            id: Uuid::nil(),
+            name: "Custom".to_string(),
+            instructions: "Be custom.".to_string(),
+            icon: Some("face-smile-symbolic".to_string()),
+            accent: Some("blue".to_string()),
+        };
         let store = Store {
             workspaces: vec![workspace.clone()],
             active_workspace: Some(workspace.id),
+            custom_roles: vec![role.clone()],
         };
         store.save(&path).unwrap();
         let loaded = Store::load(&path);
         assert_eq!(loaded.workspaces, vec![workspace.clone()]);
         assert_eq!(loaded.active_workspace, Some(workspace.id));
+        assert_eq!(loaded.custom_roles, vec![role]);
+    }
+
+    /// A store saved before milestone 4 has no `"custom_roles"` key and no
+    /// session record has a `"role_id"` key at all — confirms both default
+    /// to empty/`None` rather than failing to load.
+    #[test]
+    fn store_without_roles_still_loads_with_sessions_unassigned() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000000",
+                    "name": "web",
+                    "root_dir": "/home/fernando",
+                    "sessions": [
+                        {"id": "00000000-0000-0000-0000-000000000001", "name": "a", "cwd": "/tmp", "agent": "Claude", "claude_session_id": null, "claude_account": null, "position": [0.0, 0.0], "size": [480.0, 320.0]}
+                    ],
+                    "notes": [],
+                    "links": [],
+                    "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
+                }],
+                "active_workspace": "00000000-0000-0000-0000-000000000000"
+            }"#,
+        )
+        .unwrap();
+        let store = Store::load(&path);
+        assert_eq!(store.workspaces[0].sessions[0].role_id, None);
+        assert!(store.custom_roles.is_empty());
     }
 
     #[test]
@@ -336,6 +390,7 @@ mod tests {
         let store = Store {
             workspaces: vec![sample_workspace(vec![sample_record()])],
             active_workspace: None,
+            custom_roles: Vec::new(),
         };
         store.save(&path).unwrap();
         assert!(path.exists());
@@ -467,6 +522,7 @@ mod tests {
         let store = Store {
             workspaces: vec![workspace.clone()],
             active_workspace: Some(workspace.id),
+            custom_roles: Vec::new(),
         };
         store.save(&path).unwrap();
         let loaded = Store::load(&path);
