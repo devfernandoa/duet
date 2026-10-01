@@ -46,8 +46,16 @@ impl Default for CanvasRecord {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Store {
+/// An independently persisted canvas/project context: its own sessions,
+/// notes, links, and pan/zoom, plus a `root_dir` used only as the default
+/// working directory suggested when creating a new session inside it (a
+/// session's own `cwd` can still be anything — this is a convenience, not a
+/// constraint).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub root_dir: PathBuf,
     #[serde(default)]
     pub sessions: Vec<SessionRecord>,
     #[serde(default)]
@@ -56,6 +64,14 @@ pub struct Store {
     pub links: Vec<LinkRecord>,
     #[serde(default)]
     pub canvas: CanvasRecord,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Store {
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceRecord>,
+    #[serde(default)]
+    pub active_workspace: Option<Uuid>,
 }
 
 /// The pre-canvas on-disk shape. Kept only to migrate old `tabs.json` files
@@ -74,10 +90,53 @@ struct LegacyStore {
     tabs: Vec<LegacyTabRecord>,
 }
 
+/// The pre-workspace on-disk shape: a single flat canvas, no `workspaces`
+/// key. Kept only to migrate files written before workspaces existed.
+#[derive(Debug, Deserialize)]
+struct PreWorkspaceStore {
+    #[serde(default)]
+    sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    notes: Vec<StickyNoteRecord>,
+    #[serde(default)]
+    links: Vec<LinkRecord>,
+    #[serde(default)]
+    canvas: CanvasRecord,
+}
+
 const GRID_COLUMNS: f64 = 3.0;
 const GRID_CELL_WIDTH: f64 = 520.0;
 const GRID_CELL_HEIGHT: f64 = 360.0;
 const DEFAULT_NODE_SIZE: (f64, f64) = (480.0, 320.0);
+
+/// Name and root directory given to a workspace created by migrating an
+/// older single-canvas store, so existing users don't lose their canvas.
+fn default_workspace_root() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Wraps one flat canvas's worth of records into a `Store` containing a
+/// single "Default" workspace, used by both migration paths below.
+fn wrap_single_workspace(
+    sessions: Vec<SessionRecord>,
+    notes: Vec<StickyNoteRecord>,
+    links: Vec<LinkRecord>,
+    canvas: CanvasRecord,
+) -> Store {
+    let id = Uuid::new_v4();
+    Store {
+        workspaces: vec![WorkspaceRecord {
+            id,
+            name: "Default".to_string(),
+            root_dir: default_workspace_root(),
+            sessions,
+            notes,
+            links,
+            canvas,
+        }],
+        active_workspace: Some(id),
+    }
+}
 
 fn migrate_legacy(legacy: LegacyStore) -> Store {
     let sessions = legacy
@@ -99,12 +158,7 @@ fn migrate_legacy(legacy: LegacyStore) -> Store {
             }
         })
         .collect();
-    Store {
-        sessions,
-        notes: Vec::new(),
-        links: Vec::new(),
-        canvas: CanvasRecord::default(),
-    }
+    wrap_single_workspace(sessions, Vec::new(), Vec::new(), CanvasRecord::default())
 }
 
 fn backup_corrupt_file(path: &Path, reason: &str) -> (Store, Option<String>) {
@@ -146,15 +200,27 @@ impl Store {
 
                     // Check if it's a JSON object with at least one recognized key
                     if let Some(obj) = value.as_object() {
-                        let has_recognized_key = obj.contains_key("sessions")
-                            || obj.contains_key("notes")
-                            || obj.contains_key("links")
-                            || obj.contains_key("canvas");
-
-                        if has_recognized_key {
-                            // It looks like a new format Store; try to deserialize
+                        if obj.contains_key("workspaces") {
+                            // Current format; try to deserialize directly.
                             if let Ok(store) = serde_json::from_value::<Store>(value) {
                                 return (store, None);
+                            }
+                        } else if obj.contains_key("sessions")
+                            || obj.contains_key("notes")
+                            || obj.contains_key("links")
+                            || obj.contains_key("canvas")
+                        {
+                            // Pre-workspace single-canvas format.
+                            if let Ok(pre) = serde_json::from_value::<PreWorkspaceStore>(value) {
+                                return (
+                                    wrap_single_workspace(
+                                        pre.sessions,
+                                        pre.notes,
+                                        pre.links,
+                                        pre.canvas,
+                                    ),
+                                    None,
+                                );
                             }
                         } else {
                             // Valid JSON object but has no recognized keys and no "tabs"
@@ -224,12 +290,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn save_then_load_round_trips() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        let store = Store {
-            sessions: vec![sample_record()],
+    fn sample_workspace(sessions: Vec<SessionRecord>) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: Uuid::nil(),
+            name: "web".to_string(),
+            root_dir: PathBuf::from("/home/fernando"),
+            sessions,
             notes: vec![StickyNoteRecord {
                 id: Uuid::nil(),
                 text: "hello".to_string(),
@@ -245,11 +311,22 @@ mod tests {
                 zoom: 1.5,
                 pan: (3.0, 4.0),
             },
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        let workspace = sample_workspace(vec![sample_record()]);
+        let store = Store {
+            workspaces: vec![workspace.clone()],
+            active_workspace: Some(workspace.id),
         };
         store.save(&path).unwrap();
         let loaded = Store::load(&path);
-        assert_eq!(loaded.sessions, vec![sample_record()]);
-        assert_eq!(loaded.canvas.zoom, 1.5);
+        assert_eq!(loaded.workspaces, vec![workspace.clone()]);
+        assert_eq!(loaded.active_workspace, Some(workspace.id));
     }
 
     #[test]
@@ -257,10 +334,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nested").join("dir").join("store.json");
         let store = Store {
-            sessions: vec![sample_record()],
-            notes: vec![],
-            links: vec![],
-            canvas: CanvasRecord::default(),
+            workspaces: vec![sample_workspace(vec![sample_record()])],
+            active_workspace: None,
         };
         store.save(&path).unwrap();
         assert!(path.exists());
@@ -271,7 +346,7 @@ mod tests {
     fn load_missing_file_returns_empty_store() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("does-not-exist.json");
-        assert!(Store::load(&path).sessions.is_empty());
+        assert!(Store::load(&path).workspaces.is_empty());
     }
 
     #[test]
@@ -279,12 +354,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("store.json");
         std::fs::write(&path, "{not valid json").unwrap();
-        assert!(Store::load(&path).sessions.is_empty());
+        assert!(Store::load(&path).workspaces.is_empty());
         assert!(path.with_extension("corrupt.json").exists());
     }
 
     #[test]
-    fn loading_old_tabs_shape_migrates_with_grid_positions_and_fresh_ids() {
+    fn loading_old_tabs_shape_migrates_into_one_default_workspace() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("store.json");
         std::fs::write(
@@ -296,11 +371,40 @@ mod tests {
         )
         .unwrap();
         let store = Store::load(&path);
-        assert_eq!(store.sessions.len(), 2);
-        assert_ne!(store.sessions[0].id, store.sessions[1].id);
-        assert_eq!(store.sessions[0].position, (0.0, 0.0));
-        assert_eq!(store.sessions[1].position, (520.0, 0.0));
-        assert_eq!(store.canvas.zoom, 1.0);
+        assert_eq!(store.workspaces.len(), 1);
+        let workspace = &store.workspaces[0];
+        assert_eq!(store.active_workspace, Some(workspace.id));
+        assert_eq!(workspace.sessions.len(), 2);
+        assert_ne!(workspace.sessions[0].id, workspace.sessions[1].id);
+        assert_eq!(workspace.sessions[0].position, (0.0, 0.0));
+        assert_eq!(workspace.sessions[1].position, (520.0, 0.0));
+        assert_eq!(workspace.canvas.zoom, 1.0);
+    }
+
+    /// The exact scenario the migration exists for: a user upgrading from the
+    /// single-canvas (pre-workspace) version must not lose their canvas — it
+    /// becomes one workspace, not an empty store.
+    #[test]
+    fn loading_pre_workspace_single_canvas_shape_migrates_into_one_default_workspace() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "sessions": [{"id": "00000000-0000-0000-0000-000000000000", "name": "web", "cwd": "/tmp", "agent": "Codex", "claude_session_id": null, "claude_account": null, "position": [10.0, 20.0], "size": [480.0, 320.0]}],
+                "notes": [],
+                "links": [],
+                "canvas": {"zoom": 2.0, "pan": [5.0, 6.0]}
+            }"#,
+        )
+        .unwrap();
+        let store = Store::load(&path);
+        assert_eq!(store.workspaces.len(), 1);
+        let workspace = &store.workspaces[0];
+        assert_eq!(store.active_workspace, Some(workspace.id));
+        assert_eq!(workspace.sessions.len(), 1);
+        assert_eq!(workspace.sessions[0].name, "web");
+        assert_eq!(workspace.canvas.zoom, 2.0);
     }
 
     #[test]
@@ -308,7 +412,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("store.json");
         std::fs::write(&path, "{}").unwrap();
-        assert!(Store::load(&path).sessions.is_empty());
+        assert!(Store::load(&path).workspaces.is_empty());
         assert!(path.with_extension("corrupt.json").exists());
     }
 }
