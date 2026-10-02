@@ -13,6 +13,7 @@
 //! owning features are built.
 
 use crate::agent::Agent;
+use crate::environment::EnvironmentKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -40,6 +41,12 @@ pub struct TerminalPayload {
     pub claude_account: Option<String>,
     #[serde(default)]
     pub role_id: Option<Uuid>,
+    /// Which runtime this terminal's process runs under. `#[serde(default)]`
+    /// so an older-schema terminal (every one saved before Milestone 2)
+    /// loads as `LocalPty` — the only backend that existed then, and still
+    /// the default for a newly created terminal.
+    #[serde(default)]
+    pub environment: EnvironmentKind,
 }
 
 /// A note's content: Markdown source (plain text is valid Markdown, so a
@@ -264,6 +271,7 @@ mod tests {
                 claude_session_id: None,
                 claude_account: None,
                 role_id: None,
+                environment: EnvironmentKind::LocalPty,
             })
             .label(),
             "Terminal"
