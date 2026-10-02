@@ -167,20 +167,13 @@ impl App {
             Store::load_with_warning(&app_ref.store_path)
         };
         let mut errors: Vec<String> = load_warning.into_iter().collect();
-        app.borrow_mut().custom_roles = saved.custom_roles;
+        app.borrow_mut().custom_roles = saved.custom_roles.clone();
 
-        if saved.workspaces.is_empty() {
+        let Some((active, inactive)) = saved.resolve_active_workspace() else {
             return errors;
-        }
+        };
 
-        let mut workspaces = saved.workspaces;
-        let active_index = saved
-            .active_workspace
-            .and_then(|id| workspaces.iter().position(|w| w.id == id))
-            .unwrap_or(0);
-        let active = workspaces.remove(active_index);
-
-        app.borrow_mut().inactive_workspaces = workspaces;
+        app.borrow_mut().inactive_workspaces = inactive;
         App::activate_workspace(app, &active);
 
         errors.extend(spawn_workspace_contents(

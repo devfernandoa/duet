@@ -137,6 +137,29 @@ impl Store {
         }
     }
 
+    /// Splits a loaded store's workspaces into the one that should become
+    /// live and everything else that stays dormant — pure data logic (no
+    /// GTK/runtime involved), so `App::restore` only has to decide what to
+    /// *do* with the split, not how to compute it. The active workspace is
+    /// whichever `active_workspace` id names; if that id is missing or
+    /// doesn't match any saved workspace (deleted since the last save, or an
+    /// older file that never recorded one), it falls back to the first
+    /// workspace in storage order. `None` when there are no saved workspaces
+    /// at all — a fresh install, which the caller treats as "nothing to
+    /// restore" rather than conjuring a placeholder.
+    pub fn resolve_active_workspace(self) -> Option<(WorkspaceRecord, Vec<WorkspaceRecord>)> {
+        if self.workspaces.is_empty() {
+            return None;
+        }
+        let mut workspaces = self.workspaces;
+        let active_index = self
+            .active_workspace
+            .and_then(|id| workspaces.iter().position(|w| w.id == id))
+            .unwrap_or(0);
+        let active = workspaces.remove(active_index);
+        Some((active, workspaces))
+    }
+
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -270,6 +293,51 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("does-not-exist.json");
         assert!(Store::load(&path).workspaces.is_empty());
+    }
+
+    fn named_workspace(name: &str) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            root_dir: PathBuf::from("/home/fernando"),
+            sessions: Vec::new(),
+            notes: Vec::new(),
+            links: Vec::new(),
+            canvas: CanvasRecord::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_active_workspace_is_none_when_nothing_was_saved() {
+        assert!(Store::default().resolve_active_workspace().is_none());
+    }
+
+    #[test]
+    fn resolve_active_workspace_picks_the_workspace_named_by_active_workspace() {
+        let (a, b) = (named_workspace("a"), named_workspace("b"));
+        let store = Store::new(vec![a.clone(), b.clone()], Some(b.id), Vec::new());
+        let (active, inactive) = store.resolve_active_workspace().unwrap();
+        assert_eq!(active.id, b.id);
+        assert_eq!(inactive, vec![a]);
+    }
+
+    /// A stale or absent `active_workspace` (an id that no longer names any
+    /// saved workspace, or `None` at all — an older file, or one hand-edited
+    /// after the referenced workspace was deleted) must not be treated as
+    /// "nothing to restore"; it falls back to the first workspace rather than
+    /// losing every workspace's data.
+    #[test]
+    fn resolve_active_workspace_falls_back_to_the_first_workspace_when_the_id_is_stale() {
+        let (a, b) = (named_workspace("a"), named_workspace("b"));
+        let store = Store::new(vec![a.clone(), b.clone()], Some(Uuid::new_v4()), Vec::new());
+        let (active, inactive) = store.resolve_active_workspace().unwrap();
+        assert_eq!(active.id, a.id);
+        assert_eq!(inactive, vec![b.clone()]);
+
+        let store = Store::new(vec![a.clone(), b.clone()], None, Vec::new());
+        let (active, inactive) = store.resolve_active_workspace().unwrap();
+        assert_eq!(active.id, a.id);
+        assert_eq!(inactive, vec![b]);
     }
 
     /// A custom-provider session's `Agent::Custom { program, args }` carries
