@@ -18,6 +18,14 @@ pub struct Role {
     pub icon: Option<String>,
     #[serde(default)]
     pub accent: Option<String>,
+    /// Whether an agent assigned this role may exercise `duetctl`'s
+    /// manager-only orchestration actions (create/remove an agent, assign a
+    /// role) — see Milestone 3's "manager role" requirement: do not give
+    /// recruitment permissions to every agent. `#[serde(default)]` so every
+    /// custom role saved before this field existed loads as a non-manager,
+    /// never silently gaining recruitment rights it was never granted.
+    #[serde(default)]
+    pub manager: bool,
 }
 
 /// The fixed accent palette a role (built-in or custom) can pick from;
@@ -40,6 +48,7 @@ pub fn builtin_roles() -> Vec<Role> {
                 .to_string(),
             icon: Some("utilities-terminal-symbolic".to_string()),
             accent: Some("blue".to_string()),
+            manager: false,
         },
         Role {
             id: Uuid::from_u128(2),
@@ -50,6 +59,7 @@ pub fn builtin_roles() -> Vec<Role> {
                 .to_string(),
             icon: Some("edit-find-symbolic".to_string()),
             accent: Some("purple".to_string()),
+            manager: false,
         },
         Role {
             id: Uuid::from_u128(3),
@@ -59,6 +69,7 @@ pub fn builtin_roles() -> Vec<Role> {
                 .to_string(),
             icon: Some("emblem-ok-symbolic".to_string()),
             accent: Some("green".to_string()),
+            manager: false,
         },
         Role {
             id: Uuid::from_u128(4),
@@ -69,6 +80,9 @@ pub fn builtin_roles() -> Vec<Role> {
                 .to_string(),
             icon: Some("starred-symbolic".to_string()),
             accent: Some("orange".to_string()),
+            // The one built-in role with recruiting/coordination permissions
+            // — see Milestone 3's manager-role requirement.
+            manager: true,
         },
         Role {
             id: Uuid::from_u128(5),
@@ -78,6 +92,7 @@ pub fn builtin_roles() -> Vec<Role> {
                 .to_string(),
             icon: Some("text-x-generic-symbolic".to_string()),
             accent: Some("gray".to_string()),
+            manager: false,
         },
     ]
 }
