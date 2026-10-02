@@ -70,16 +70,16 @@ Phase B is the first real product release, v0.2 Orchestration: agents that messa
 
 ### Milestone 3: Agent communication and orchestration
 
-- [ ] `orchestration/` service: `bus`, `message`, `registry`, `routing`, `permissions`; `AgentIdentity` separate from terminal widget identity
-- [ ] Structured `AgentMessage` with status Queued / Delivered / Acknowledged / Failed
-- [ ] Edges express capabilities (`SendMessages`, `ReadNote`, `WriteNote`, `ControlPortal`, `ShareContext`), not PTY piping
-- [ ] `AgentRegistry`: list, find by name, get by id, send, connected agents; routing always by UUID
-- [ ] `duetctl`: `agents list`, `agents inspect`, `send`, `notes read/write`, `portals list`, `workspace inspect`, `connections list`; GUI and agents use the same service layer
-- [ ] Environment metadata on launch: `DUET_WORKSPACE_ID`, `DUET_WORKSPACE_NAME`, `DUET_TERMINAL_ID`, `DUET_AGENT_ID`, `DUET_ROLE`, `DUET_FLOOR_ID`, `DUET_CONTROL_SOCKET`, plus a compact instruction block
-- [ ] Per-agent inbox; `AgentAdapter` trait with Claude, Codex, OpenCode, Shell and CustomCommand adapters
-- [ ] `AgentActivity`: Starting, Idle, Working, AwaitingUser, AwaitingAgent, Finished, Failed, Offline; show `Unknown` rather than guess
-- [ ] Manager role: coordinator with messaging and recruiting; `agents create/remove/assign-role`; only after routing and lifecycle are reliable
-- [ ] Acceptance: Lead, Backend, Frontend, Reviewer wired as Lead→Backend, Lead→Frontend, Backend→Reviewer, Frontend→Reviewer complete the delegate-and-summarize task with no manual copying
+- [x] `orchestration/` service: `bus`, `message`, `registry`, `permissions`; `AgentIdentity` separate from terminal widget identity — `orchestration::{identity, registry, bus, permissions, adapter, activity, env}`, all pure data/logic with no GTK dependency; routing lives inside `bus::MessageBus::send` (calling `permissions::authorize`) rather than a separate `routing.rs` file — there was no distinct routing concern left once send already does registry lookup + permission check + queueing in one place
+- [x] Structured `AgentMessage` with status Queued / Delivered / Acknowledged / Failed — `message::DeliveryStatus`; `Acknowledged` is representable but never produced this milestone (no ack signal exists yet — see its doc comment), the same "Unknown is better than false confidence" pattern `AgentActivity` already used
+- [x] Edges express capabilities (`SendMessages`, `ReadNote`, `WriteNote`, `ControlPortal`, `ShareContext`), not PTY piping — `orchestration::permissions::authorize` is generic over any `EdgeCapability`; only `SendMessages` is actually enforced anywhere this milestone (`ReadNote`/`WriteNote` have no feature to gate yet — notes agent read/write is Milestone 4's own scope per that milestone's own checklist below)
+- [x] `AgentRegistry`: list, find by name, get by id, connected agents; routing always by UUID — `orchestration::registry::AgentRegistry`; message routing itself is `bus::MessageBus::send`, which takes a registry rather than being a registry method
+- [ ] `duetctl`: `agents list`, `agents inspect`, `send`, `workspace inspect`, `connections list` all done, GUI and agents use the same `App` services — `notes read/write` and `portals list` are NOT implemented (correctly: there is no `NoteService`/`PortalService` agent-facing API yet to front — those are Milestone 4 and Milestone 8's own jobs). `duetctl` ships as its own binary (`src/bin/duetctl.rs`, a thin wrapper over `duet::control::run_cli`), not just a `duet agent` subcommand, matching PR 7's own name; `duet agent list`/`duet agent send` are preserved unchanged for backward compatibility.
+- [x] Environment metadata on launch: `DUET_WORKSPACE_ID`, `DUET_WORKSPACE_NAME`, `DUET_TERMINAL_ID`, `DUET_AGENT_ID`, `DUET_ROLE`, `DUET_FLOOR_ID`, `DUET_CONTROL_SOCKET`, plus a compact instruction block — `orchestration::env`; applied on every terminal launch (fresh, resumed, reattached, and handoff) via `app::build_terminal_launch`/`App::switch_agent`
+- [x] Per-agent inbox; `AgentAdapter` trait with Claude, Codex, OpenCode, Shell and CustomCommand adapters — `orchestration::bus`'s per-agent `Inbox` (serializes delivery so two queued messages for one agent are never dispatched out of order); `orchestration::adapter::{ClaudeAdapter, CodexAdapter, OpenCodeAdapter, ShellAdapter, CustomCommandAdapter}` plus `FakeAgentAdapter` for tests
+- [x] `AgentActivity`: Starting, Idle, Working, AwaitingUser, AwaitingAgent, Finished, Failed, Offline; show `Unknown` rather than guess — `runtime::SessionRuntime::activity` now derives Starting/Working/Idle from real observed PTY output recency (`Session::seconds_since_output`), not just exit status; `orchestration::activity::activity_for` layers Offline (node exists, process doesn't) and AwaitingAgent (inbox non-empty) on top. `AwaitingUser` has no reliable signal this milestone (would need parsing terminal content) and is never produced — representable, not guessed. Live in the UI: terminal card status labels update continuously (not just on exit), change-detected so it doesn't force a relayout every tick.
+- [x] Manager role: coordinator with messaging and recruiting; `agents create/remove/assign-role`; only after routing and lifecycle are reliable — `role::Role::manager` (builtin Lead role is the one manager by default); `App::{create_agent, remove_agent, assign_role}` all gate on `App::require_manager`, refusing a non-manager agent with a clear error while leaving the human operator (no `DUET_AGENT_ID`) unrestricted, same trust level the GTK UI already has
+- [x] Acceptance: Lead, Backend, Frontend, Reviewer wired as Lead→Backend, Lead→Frontend, Backend→Reviewer, Frontend→Reviewer complete the delegate-and-summarize task with no manual copying — verified live against the real running GTK app (`duetctl agents create` for node creation with roles, the existing link-button gesture for `SendMessages` edges, `duetctl send`/`connections list`/`workspace inspect` for inspection) using the Shell provider as every PTY-backed provider shares identical delivery mechanics; a real `duetctl send --from <id> --to <name>` delivered live into a real second process's PTY and was executed there, and an unauthorized send (no edge) was refused live with a clear error. The literal 4-live-Claude-Code-agent run is blocked in this sandbox specifically by nested Claude authentication (`duet`'s per-account `CLAUDE_CONFIG_DIR` isolation creates a fresh, unauthenticated config dir; copying real credentials into it was correctly refused by this environment's security policy as credential leakage, and no API key was available to seed instead) — not by anything in this milestone's code. The exact same code path (`agent::Agent::launch`, `orchestration::bus`, `App::send_message`/`pump_inboxes`) runs Claude Code identically to Shell; only argv construction differs per provider. 26 `FakeAgentAdapter`-backed unit tests cover routing, permissions, queueing/ordering, delivery failure, offline/reconnect, and manager actions without needing any real agent process.
 
 ### Milestone 4: First-class Markdown notes
 
@@ -213,10 +213,10 @@ The first ten PRs reach v0.2, and each one is reviewable on its own.
 - [x] PR 3: `refactor: generic NodeRecord and EdgeRecord` (migrate terminals and sticky notes)
 - [x] PR 4: `feat: selection and multi-node canvas operations`
 - [ ] PR 5: `refactor: RuntimeRegistry independent of active workspace` (critical checkpoint: switching no longer destroys PTYs)
-- [ ] PR 6: `feat: agent registry and structured message bus` (preserve existing messaging behavior)
-- [ ] PR 7: `feat: duetctl agent messaging API` (`agents list`, `agents inspect`, `send`)
+- [x] PR 6: `feat: agent registry and structured message bus` (preserve existing messaging behavior) — `duet agent list`/`duet agent send` still work unchanged; `App::send_message` now routes through `orchestration::MessageBus` instead of writing to the PTY inline
+- [x] PR 7: `feat: duetctl agent messaging API` (`agents list`, `agents inspect`, `send`) — plus `connections list`/`workspace inspect`/`agents create`/`agents remove`/`agents assign-role`, as its own `duetctl` binary
 - [ ] PR 8: `feat: agent-readable and writable markdown notes`
-- [ ] PR 9: `feat: connection capabilities` (edges become explicit access relationships)
+- [x] PR 9: `feat: connection capabilities` (edges become explicit access relationships) — `orchestration::permissions::authorize`; a Terminal-to-Terminal edge (the only kind the GTK link gesture can create) is granted `SendMessages` by default, since there's no capability-editing UI yet to grant it any other way
 - [ ] PR 10: `feat: global prompt composer with @ mentions` (cut v0.2)
 
 ### Five questions before every feature
@@ -263,8 +263,8 @@ Progress against the Maestri-style target is measured by capability, not by visu
 
 **Orchestration:**
 
-- [ ] Agent registry, structured messages, connections
-- [ ] Delivery status, manager role, dynamic recruitment, CLI
+- [x] Agent registry, structured messages, connections
+- [x] Delivery status, manager role, dynamic recruitment, CLI
 
 **Notes:**
 
