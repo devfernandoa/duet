@@ -6,6 +6,23 @@ pub fn screen_to_world(screen: (f64, f64), pan: (f64, f64), zoom: f64) -> (f64, 
     (screen.0 / zoom - pan.0, screen.1 / zoom - pan.1)
 }
 
+/// The new `pan` that keeps `anchor` (a screen-space point, fixed for the
+/// duration of one zoom change) over the same world-space point once `zoom`
+/// becomes `new_zoom` — i.e. `world_to_screen(screen_to_world(anchor, pan,
+/// zoom), result, new_zoom) == anchor`. Shared by scroll-to-zoom (`anchor` =
+/// the pointer) and `Canvas::zoom_by_steps` (`anchor` = the viewport
+/// center) — the only difference between "zoom follows the cursor" and
+/// "zoom follows the view" is which point this is called with.
+fn pan_keeping_anchor_fixed(
+    anchor: (f64, f64),
+    pan: (f64, f64),
+    zoom: f64,
+    new_zoom: f64,
+) -> (f64, f64) {
+    let world = screen_to_world(anchor, pan, zoom);
+    (anchor.0 / new_zoom - world.0, anchor.1 / new_zoom - world.1)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasState {
     pub pan: (f64, f64),
@@ -187,6 +204,45 @@ impl Canvas {
         }
         fixed.add_controller(drag);
 
+        // `EventControllerScroll`'s own `scroll` signal carries only a delta
+        // (`dx`, `dy`), never a position, and `GdkEvent::position()` on its
+        // current event is unreliable for a scroll (observed returning
+        // `None` outright for some scroll sources) — falling back to a fixed
+        // `(0.0, 0.0)` whenever that happened is what made zooming read as
+        // "always drifts toward a corner" instead of staying under the
+        // cursor. An `EventControllerMotion` on the same widget, by
+        // contrast, reports the pointer's position directly in `fixed`'s own
+        // local coordinates on every real motion event — tracking the most
+        // recent one here and reading it from the scroll handler is the
+        // standard GTK4 way to give a controller that has no position of its
+        // own a reliable one.
+        let pointer_position: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((0.0, 0.0)));
+        let motion = gtk4::EventControllerMotion::new();
+        // Capture (not the default Bubble) so this reliably sees pointer
+        // motion over every card too, not just empty canvas — a child
+        // widget's own controllers never get a chance to stop a Capture-
+        // phase observer from seeing the event first.
+        motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        {
+            let pointer_position = Rc::clone(&pointer_position);
+            motion.connect_motion(move |_controller, x, y| {
+                *pointer_position.borrow_mut() = (x, y);
+            });
+        }
+        {
+            // GTK guarantees a crossing (`enter`) event when the pointer
+            // starts over a widget, but not a `motion` event just because a
+            // window became mapped under an already-stationary pointer — so
+            // `connect_motion` alone could leave `pointer_position` at its
+            // stale default for a scroll that happens before the pointer
+            // ever actually moves. Seeding it on `enter` too closes that gap.
+            let pointer_position = Rc::clone(&pointer_position);
+            motion.connect_enter(move |_controller, x, y| {
+                *pointer_position.borrow_mut() = (x, y);
+            });
+        }
+        fixed.add_controller(motion);
+
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         // A terminal consumes its own scrolls for scrollback before this
         // bubble-phase canvas handler sees them. On empty canvas, the wheel
@@ -197,22 +253,17 @@ impl Canvas {
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
-            scroll.connect_scroll(move |controller, _dx, dy| {
+            let pointer_position = Rc::clone(&pointer_position);
+            scroll.connect_scroll(move |_controller, _dx, dy| {
                 let mut state = state.borrow_mut();
                 // Preserve the world-space point under the pointer, rather
                 // than scaling from the canvas origin. This makes the card or
                 // empty region the user is looking at stay under the cursor.
-                let cursor = controller
-                    .current_event()
-                    .and_then(|event| event.position())
-                    .unwrap_or((0.0, 0.0));
-                let world = screen_to_world(cursor, state.pan, state.zoom);
+                let cursor = *pointer_position.borrow();
+                let old_zoom = state.zoom;
                 state.zoom *= if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
                 state.clamp_zoom();
-                state.pan = (
-                    cursor.0 / state.zoom - world.0,
-                    cursor.1 / state.zoom - world.1,
-                );
+                state.pan = pan_keeping_anchor_fixed(cursor, state.pan, old_zoom, state.zoom);
                 apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
                 glib::Propagation::Stop
             });
@@ -247,13 +298,26 @@ impl Canvas {
 
     /// Multiplies the zoom by `ZOOM_STEP` (`steps` positive zooms in,
     /// negative out), the keyboard equivalent of Ctrl+scroll. Wired to
-    /// Ctrl+Plus/Ctrl+Minus in `main.rs`, because a modifier+scroll gesture
-    /// is not discoverable — the user asked to be able to zoom without ever
-    /// finding the one that already existed.
+    /// Ctrl+Plus/Ctrl+Minus and the zoom in/out buttons in `main.rs`, because
+    /// a modifier+scroll gesture is not discoverable — the user asked to be
+    /// able to zoom without ever finding the one that already existed.
+    /// Neither a keyboard shortcut nor a toolbar button has a pointer
+    /// position to anchor on the way scroll-to-zoom does, so this anchors on
+    /// the viewport's own center instead of leaving `pan` untouched — the
+    /// previous behavior effectively anchored on the world origin, which
+    /// (whenever the current `pan` has scrolled that point away from the
+    /// viewport's center) reads as "zooming drifts everything toward a
+    /// corner" rather than zooming on what's actually in view.
     pub fn zoom_by_steps(&self, steps: i32) {
         let mut state = self.state.borrow_mut();
+        let center = (
+            self.fixed.width() as f64 / 2.0,
+            self.fixed.height() as f64 / 2.0,
+        );
+        let old_zoom = state.zoom;
         state.zoom *= ZOOM_STEP.powi(steps);
         state.clamp_zoom();
+        state.pan = pan_keeping_anchor_fixed(center, state.pan, old_zoom, state.zoom);
         apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
     }
 
@@ -848,6 +912,39 @@ mod tests {
         let state = CanvasState::new();
         assert_eq!(state.pan, (0.0, 0.0));
         assert_eq!(state.zoom, 1.0);
+    }
+
+    /// The core contract both scroll-to-zoom and `zoom_by_steps` rely on:
+    /// whatever world point sits under `anchor` before the zoom change must
+    /// still be there, at the same screen position, after it.
+    #[test]
+    fn pan_keeping_anchor_fixed_keeps_the_anchors_world_point_under_the_anchor() {
+        let anchor = (300.0, 150.0);
+        let pan = (12.0, -8.0);
+        let old_zoom = 1.0;
+        let world_before = screen_to_world(anchor, pan, old_zoom);
+
+        let new_zoom = 2.0;
+        let new_pan = pan_keeping_anchor_fixed(anchor, pan, old_zoom, new_zoom);
+
+        let world_after = screen_to_world(anchor, new_pan, new_zoom);
+        assert!((world_after.0 - world_before.0).abs() < 1e-9);
+        assert!((world_after.1 - world_before.1).abs() < 1e-9);
+        // Equivalently: mapping that same world point back to screen space
+        // under the new pan/zoom lands exactly on the anchor again.
+        let screen_after = world_to_screen(world_before, new_pan, new_zoom);
+        assert!((screen_after.0 - anchor.0).abs() < 1e-9);
+        assert!((screen_after.1 - anchor.1).abs() < 1e-9);
+    }
+
+    /// `zoom_by_steps` calls this with `anchor` derived from the (possibly
+    /// unrealized, 0x0) `fixed` widget's own size — must not divide by zero
+    /// or produce NaN/infinity when `anchor` is the origin.
+    #[test]
+    fn pan_keeping_anchor_fixed_is_well_defined_at_the_origin() {
+        let new_pan = pan_keeping_anchor_fixed((0.0, 0.0), (0.0, 0.0), 1.0, 2.0);
+        assert_eq!(new_pan, (0.0, 0.0));
+        assert!(new_pan.0.is_finite() && new_pan.1.is_finite());
     }
 
     /// The whole point of hit-testing a link is that a click near the curve
