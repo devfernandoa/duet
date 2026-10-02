@@ -17,9 +17,10 @@ Every card's title bar has a close button (removes that card — killing its
 process, for a session) and a drag handle (the blank space in the title bar;
 dragging it moves the card without panning the canvas underneath it). A small
 grip in the card's bottom-right corner resizes it. Session cards additionally
-have a link button (drag a link to another session to forward its output into
-that session's input — handy for one agent watching another) and a handoff
-button (switching the agent asks the outgoing agent to summarize the
+have a link button (drag a link to another session to mark them as connected
+— a logical connection shown on the canvas and in `duet agent list`, not a
+live feed; use `duet agent send` to actually get a message from one into the
+other) and a handoff button (switching the agent asks the outgoing agent to summarize the
 conversation, then opens the incoming agent with that summary as its first
 prompt — a real handoff, not shared context, since Claude and Codex don't
 share a session store) and show an "exited" badge once their underlying
@@ -74,6 +75,13 @@ fresh — carried through a handoff to the other agent too — and the role's
 name (with its accent color, if it has one) shows as a badge on the session
 card's title bar. Manage custom roles — create, edit, delete — through the
 roles button or `Ctrl+Shift+R`; built-in roles can't be edited or deleted.
+
+An agent can address another live session from its terminal with
+`duet agent send <session-name-or-id> "message"`. Duet writes the message into
+the target session as a labeled prompt and keeps a short in-memory delivery
+log. `duet agent list` prints the available sessions, their ids, and their
+canvas connections. These commands use the running desktop application's
+local control socket, so they require Duet to be open.
 
 Accounts (used to keep separate Claude logins/config isolated per session)
 are managed through the account-manager dialog rather than ad hoc per-session

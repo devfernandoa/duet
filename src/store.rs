@@ -286,6 +286,21 @@ pub fn default_accounts_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where `control.rs`'s Unix-domain control socket listens — one per user,
+/// the same single-instance assumption `default_store_path` already makes.
+/// Prefers `XDG_RUNTIME_DIR` (short, tmpfs-backed, exactly what a runtime
+/// socket is for) over the data dir, both because it's the textbook-correct
+/// spot and because a `sockaddr_un` path is capped at ~108 bytes on Linux —
+/// a long `$HOME`-derived data dir can overflow that, where a runtime dir
+/// (typically `/run/user/<uid>`) essentially never does.
+pub fn default_control_socket_path() -> anyhow::Result<PathBuf> {
+    let dir = dirs::runtime_dir()
+        .or_else(dirs::data_dir)
+        .ok_or_else(|| anyhow::anyhow!("no runtime or data directory available on this platform"))?
+        .join("duet");
+    Ok(dir.join("control.sock"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

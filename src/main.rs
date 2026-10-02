@@ -2,8 +2,9 @@ mod account;
 mod agent;
 mod app;
 mod canvas;
+mod control;
 mod handoff;
-mod link;
+mod message;
 mod node;
 mod role;
 mod session;
@@ -23,6 +24,19 @@ use uuid::Uuid;
 const APP_ID: &str = "dev.fernandoa.duet";
 
 fn main() -> glib::ExitCode {
+    // `duet agent list`/`duet agent send ...`: a plain CLI client talking to
+    // the already-running duet instance's control socket, dispatched before
+    // GTK/GApplication ever sees argv — it needs no display and must work
+    // from inside a headless agent shell.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("agent") {
+        return if control::run_agent_cli(&args[2..]) {
+            glib::ExitCode::SUCCESS
+        } else {
+            glib::ExitCode::FAILURE
+        };
+    }
+
     let application = adw::Application::builder().application_id(APP_ID).build();
     application.connect_activate(build_ui);
     application.run()
@@ -45,6 +59,7 @@ fn build_ui(application: &adw::Application) {
                     from,
                     to,
                     selected: selected == Some(link),
+                    overlap: app_ref.link_overlap(link),
                 })
                 .collect()
         }
@@ -84,6 +99,12 @@ fn build_ui(application: &adw::Application) {
     let roles_button = gtk4::Button::from_icon_name("preferences-system-symbolic");
     roles_button.set_tooltip_text(Some("Manage agent roles"));
     header.pack_start(&roles_button);
+    let zoom_out_button = gtk4::Button::from_icon_name("zoom-out-symbolic");
+    zoom_out_button.set_tooltip_text(Some("Zoom out (Ctrl+-)"));
+    header.pack_end(&zoom_out_button);
+    let zoom_in_button = gtk4::Button::from_icon_name("zoom-in-symbolic");
+    zoom_in_button.set_tooltip_text(Some("Zoom in (Ctrl++)"));
+    header.pack_end(&zoom_in_button);
     let workspace_icon = gtk4::Image::from_icon_name("view-paged-symbolic");
     let workspace_label = gtk4::Label::new(None);
     let workspace_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -101,6 +122,21 @@ fn build_ui(application: &adw::Application) {
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&toolbar_view));
     window.set_content(Some(&toast_overlay));
+
+    zoom_out_button.connect_clicked({
+        let app = app.clone();
+        move |_| {
+            app.borrow().canvas.zoom_by_steps(-1);
+            App::schedule_persist(&app);
+        }
+    });
+    zoom_in_button.connect_clicked({
+        let app = app.clone();
+        move |_| {
+            app.borrow().canvas.zoom_by_steps(1);
+            App::schedule_persist(&app);
+        }
+    });
 
     // Link lines are drawn, not widgets, so deleting one needs a hit test
     // against the curve rather than a click on a control: one click selects
@@ -120,13 +156,33 @@ fn build_ui(application: &adw::Application) {
     // Restore after the toast overlay exists: restored sessions' handoff
     // buttons are wired (via `wire_link_controls`) to show a toast on
     // failure, and `restore`'s own load/spawn errors are also toasted below.
-    let errors = App::restore(&app, &toast_overlay);
+    let mut errors = App::restore(&app, &toast_overlay);
     sync_workspace_button(&workspace_label, &app);
     // Writes back immediately rather than waiting for the first edit, so a
     // migration from an older single-canvas store.json (see `store::Store`'s
     // pre-workspace migration) is durable on disk right away instead of only
     // in memory until something happens to trigger a save.
     let _ = app.borrow().persist();
+
+    // The agent-messaging control socket (`duet agent list`/`duet agent
+    // send`): accepted on a background thread, but answered here on the
+    // main thread via the same timer-poll shape `pump_output` already uses
+    // above — `App`'s session map and GTK widgets aren't `Send`, so a
+    // request from another thread can only be handled by polling for it.
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<control::ControlEvent>();
+    if let Err(error) = control::spawn_server(control_tx) {
+        errors.push(format!("agent messaging is unavailable: {error}"));
+    }
+    glib::timeout_add_local(Duration::from_millis(150), {
+        let app = app.clone();
+        move || {
+            while let Ok(event) = control_rx.try_recv() {
+                let response = control::handle_request(&app, event.request);
+                let _ = event.respond.send(response);
+            }
+            glib::ControlFlow::Continue
+        }
+    });
 
     new_session_button.connect_clicked({
         let app = app.clone();
@@ -289,28 +345,66 @@ fn open_new_session_dialog(
     let dialog = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .default_width(400)
+        .default_width(440)
         .title("New session")
         .build();
 
-    let name_entry = gtk4::Entry::builder()
-        .placeholder_text("Session name")
-        .build();
+    let header = adw::HeaderBar::new();
+    header.set_show_end_title_buttons(false);
+    header.set_show_start_title_buttons(false);
+    let cancel_button = gtk4::Button::with_label("Cancel");
+    header.pack_start(&cancel_button);
+    let create_button = gtk4::Button::with_label("Create");
+    create_button.add_css_class("suggested-action");
+    // Starts disabled: the name field starts empty, which `update_validity`
+    // (below) already treats as invalid — there is no moment where the
+    // button is clickable before the form has been looked at once.
+    create_button.set_sensitive(false);
+    header.pack_end(&create_button);
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+
+    let name_row = adw::EntryRow::new();
+    name_row.set_title("Session name");
+    name_row.set_activates_default(true);
+    let name_warning = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+    name_warning.add_css_class("warning");
+    name_warning.set_visible(false);
+    name_row.add_suffix(&name_warning);
+
     // The active workspace's root directory, not just the process's cwd —
     // that's the whole point of a per-workspace default.
-    let cwd_entry = gtk4::Entry::builder()
-        .text(app.borrow().workspace_root.display().to_string())
-        .build();
+    let cwd_row = adw::EntryRow::new();
+    cwd_row.set_title("Working directory");
+    cwd_row.set_text(app.borrow().workspace_root.display().to_string().as_str());
+    let cwd_warning = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+    cwd_warning.add_css_class("warning");
+    cwd_warning.set_visible(false);
+    cwd_row.add_suffix(&cwd_warning);
+    let browse_button = gtk4::Button::from_icon_name("folder-open-symbolic");
+    browse_button.add_css_class("flat");
+    browse_button.set_valign(gtk4::Align::Center);
+    browse_button.set_tooltip_text(Some("Choose a working directory"));
+    cwd_row.add_suffix(&browse_button);
+
+    let session_group = adw::PreferencesGroup::new();
+    session_group.set_title("Session");
+    session_group.add(&name_row);
+    session_group.add(&cwd_row);
+
     // This order (index 0-4) is matched by index in two places below:
     // `sync_field_visibility`'s `selected() == 0`/`== 4` checks, and the
-    // `create_button` click handler's `match agent_dropdown.selected()`.
+    // `try_create` closure's `match agent_row.selected()`.
     // Reordering these strings means updating both.
-    let agent_dropdown =
-        gtk4::DropDown::from_strings(&["Claude", "Codex", "OpenCode", "Shell", "Custom command"]);
-    let custom_command_entry = gtk4::Entry::builder()
-        .placeholder_text("Command to run (e.g. mytool --flag value)")
-        .build();
-    custom_command_entry.set_visible(false);
+    let agent_row = adw::ComboRow::new();
+    agent_row.set_title("Agent");
+    agent_row.set_model(Some(&gtk4::StringList::new(&[
+        "Claude",
+        "Codex",
+        "OpenCode",
+        "Shell",
+        "Custom command",
+    ])));
 
     // Claude-account picker: previously this dialog always passed `None` to
     // `App::create_session`, silently ignoring every account but the default
@@ -324,10 +418,15 @@ fn open_new_session_dialog(
     if !account_names.iter().any(|a| a == account::DEFAULT_ACCOUNT) {
         account_names.insert(0, account::DEFAULT_ACCOUNT.to_string());
     }
-    let account_dropdown =
-        gtk4::DropDown::from_strings(&account_names.iter().map(String::as_str).collect::<Vec<_>>());
-    let account_label = gtk4::Label::new(Some("Claude account"));
-    account_label.set_xalign(0.0);
+    let account_row = adw::ComboRow::new();
+    account_row.set_title("Claude account");
+    account_row.set_model(Some(&gtk4::StringList::new(
+        &account_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    )));
+
+    let custom_command_row = adw::EntryRow::new();
+    custom_command_row.set_title("Command (e.g. mytool --flag value)");
+    custom_command_row.set_visible(false);
 
     // Role picker: index 0 is always "No role" (`role_ids[0] == None`), then
     // every built-in role followed by every custom one, in `App::roles`'
@@ -338,58 +437,127 @@ fn open_new_session_dialog(
     let role_ids: Vec<Option<Uuid>> = std::iter::once(None)
         .chain(roles.iter().map(|role| Some(role.id)))
         .collect();
-    let role_dropdown =
-        gtk4::DropDown::from_strings(&role_names.iter().map(String::as_str).collect::<Vec<_>>());
-    let role_label = gtk4::Label::new(Some("Role"));
-    role_label.set_xalign(0.0);
+    let role_row = adw::ComboRow::new();
+    role_row.set_title("Role");
+    role_row.set_model(Some(&gtk4::StringList::new(
+        &role_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    )));
 
-    let create_button = gtk4::Button::with_label("Create");
-    create_button.add_css_class("suggested-action");
-    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    body.append(&name_entry);
-    body.append(&cwd_entry);
-    body.append(&agent_dropdown);
-    body.append(&account_label);
-    body.append(&account_dropdown);
-    body.append(&custom_command_entry);
-    body.append(&role_label);
-    body.append(&role_dropdown);
-    body.append(&create_button);
-    dialog.set_content(Some(&body));
+    let agent_group = adw::PreferencesGroup::new();
+    agent_group.set_title("Agent");
+    agent_group.add(&agent_row);
+    agent_group.add(&account_row);
+    agent_group.add(&custom_command_row);
+    agent_group.add(&role_row);
+
+    let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+    page_box.set_margin_top(16);
+    page_box.set_margin_bottom(16);
+    page_box.set_margin_start(16);
+    page_box.set_margin_end(16);
+    page_box.append(&session_group);
+    page_box.append(&agent_group);
+    toolbar_view.set_content(Some(&page_box));
+    dialog.set_content(Some(&toolbar_view));
 
     // The account picker only matters for Claude; the command field only for
-    // a custom provider. Both stay in the layout (dimmed/hidden, not
+    // a custom provider. Both stay in the layout (hidden/insensitive, not
     // removed) rather than being added/removed, so the dialog doesn't jump
-    // around as the user changes the agent dropdown.
+    // around as the user changes the agent picker.
     let sync_field_visibility = {
-        let agent_dropdown = agent_dropdown.clone();
-        let account_label = account_label.clone();
-        let account_dropdown = account_dropdown.clone();
-        let custom_command_entry = custom_command_entry.clone();
+        let agent_row = agent_row.clone();
+        let account_row = account_row.clone();
+        let custom_command_row = custom_command_row.clone();
         move || {
-            let is_claude = agent_dropdown.selected() == 0;
-            account_label.set_sensitive(is_claude);
-            account_dropdown.set_sensitive(is_claude);
-            custom_command_entry.set_visible(agent_dropdown.selected() == 4);
+            let is_claude = agent_row.selected() == 0;
+            account_row.set_sensitive(is_claude);
+            custom_command_row.set_visible(agent_row.selected() == 4);
         }
     };
     sync_field_visibility();
-    agent_dropdown.connect_selected_notify(move |_| sync_field_visibility());
+    agent_row.connect_selected_notify(move |_| sync_field_visibility());
 
-    create_button.connect_clicked({
+    // Live feedback instead of a failed click: a taken name or a directory
+    // that doesn't exist is flagged on the field itself (red outline plus a
+    // warning icon with the reason in its tooltip) and the Create button is
+    // simply not clickable until both clear, rather than letting the user
+    // submit and then telling them it didn't work.
+    let update_validity = {
+        let app = app.clone();
+        let name_row = name_row.clone();
+        let name_warning = name_warning.clone();
+        let cwd_row = cwd_row.clone();
+        let cwd_warning = cwd_warning.clone();
+        let create_button = create_button.clone();
+        move || {
+            let name = name_row.text().trim().to_string();
+            let name_taken = !name.is_empty()
+                && app
+                    .borrow()
+                    .sessions
+                    .values()
+                    .any(|entry| entry.record.name == name);
+            name_row.set_css_classes(if name_taken { &["error"] } else { &[] });
+            name_warning.set_visible(name_taken);
+            name_warning
+                .set_tooltip_text(name_taken.then_some("A session with this name already exists"));
+
+            let cwd_text = cwd_row.text().to_string();
+            let cwd_valid = PathBuf::from(&cwd_text).is_dir();
+            cwd_row.set_css_classes(if cwd_valid { &[] } else { &["error"] });
+            cwd_warning.set_visible(!cwd_valid);
+            cwd_warning.set_tooltip_text((!cwd_valid).then_some("This directory does not exist"));
+
+            create_button.set_sensitive(!name.is_empty() && !name_taken && cwd_valid);
+        }
+    };
+    update_validity();
+    name_row.connect_changed({
+        let update_validity = update_validity.clone();
+        move |_| update_validity()
+    });
+    cwd_row.connect_changed(move |_| update_validity());
+
+    browse_button.connect_clicked({
+        let dialog = dialog.clone();
+        let cwd_row = cwd_row.clone();
+        move |_| {
+            let file_dialog = gtk4::FileDialog::builder()
+                .title("Choose working directory")
+                .build();
+            let current = PathBuf::from(cwd_row.text().to_string());
+            if current.is_dir() {
+                file_dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(&current)));
+            }
+            let cwd_row = cwd_row.clone();
+            file_dialog.select_folder(Some(&dialog), gtk4::gio::Cancellable::NONE, move |result| {
+                if let Ok(folder) = result
+                    && let Some(path) = folder.path()
+                {
+                    cwd_row.set_text(&path.display().to_string());
+                }
+            });
+        }
+    });
+
+    cancel_button.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| dialog.close()
+    });
+
+    let try_create = {
         let app = app.clone();
         let dialog = dialog.clone();
         let parent = parent.clone();
-        let name_entry = name_entry.clone();
-        let cwd_entry = cwd_entry.clone();
-        let agent_dropdown = agent_dropdown.clone();
-        let account_dropdown = account_dropdown.clone();
-        let custom_command_entry = custom_command_entry.clone();
-        let role_dropdown = role_dropdown.clone();
-        let role_ids = role_ids.clone();
+        let name_row = name_row.clone();
+        let cwd_row = cwd_row.clone();
+        let agent_row = agent_row.clone();
+        let account_row = account_row.clone();
+        let custom_command_row = custom_command_row.clone();
+        let role_row = role_row.clone();
         let toast_overlay = toast_overlay.clone();
-        move |_| {
-            let agent = match agent_dropdown.selected() {
+        move || {
+            let agent = match agent_row.selected() {
                 0 => agent::Agent::Claude,
                 1 => agent::Agent::Codex,
                 2 => agent::Agent::OpenCode,
@@ -398,7 +566,7 @@ fn open_new_session_dialog(
                     // Naive whitespace splitting, not a shell-quoting parser —
                     // "simple command configurations," per this milestone's
                     // own scope, not a full command-line grammar.
-                    let command_text = custom_command_entry.text();
+                    let command_text = custom_command_row.text();
                     let mut parts = command_text.split_whitespace().map(str::to_string);
                     let program = parts.next().unwrap_or_default();
                     let args = parts.collect();
@@ -407,11 +575,9 @@ fn open_new_session_dialog(
             };
             // Ignored entirely by every non-Claude path; only read when
             // `agent` is `Agent::Claude`.
-            let claude_account = account_names
-                .get(account_dropdown.selected() as usize)
-                .cloned();
+            let claude_account = account_names.get(account_row.selected() as usize).cloned();
             let role_id = role_ids
-                .get(role_dropdown.selected() as usize)
+                .get(role_row.selected() as usize)
                 .copied()
                 .flatten();
             let viewport_center = {
@@ -430,8 +596,8 @@ fn open_new_session_dialog(
             };
             let result = App::create_session(
                 &app,
-                name_entry.text().to_string(),
-                PathBuf::from(cwd_entry.text().to_string()),
+                name_row.text().to_string(),
+                PathBuf::from(cwd_row.text().to_string()),
                 agent,
                 claude_account,
                 role_id,
@@ -443,9 +609,32 @@ fn open_new_session_dialog(
                 Err(error) => toast_overlay.add_toast(adw::Toast::new(&error.to_string())),
             }
         }
+    };
+    create_button.connect_clicked({
+        let try_create = try_create.clone();
+        move |_| try_create()
+    });
+    // The fields themselves still fall back to validation state rather than
+    // actually submitting when invalid — `activates_default` fires this on
+    // Enter, but the button's own sensitivity already guards `try_create`'s
+    // precondition, so a disabled Create just does nothing here too.
+    name_row.connect_entry_activated({
+        let create_button = create_button.clone();
+        let try_create = try_create.clone();
+        move |_| {
+            if create_button.is_sensitive() {
+                try_create();
+            }
+        }
+    });
+    cwd_row.connect_entry_activated(move |_| {
+        if create_button.is_sensitive() {
+            try_create();
+        }
     });
 
     dialog.present();
+    name_row.grab_focus();
 }
 
 /// Account manager: a titled window (matching `open_new_session_dialog`'s
