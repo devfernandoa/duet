@@ -74,41 +74,76 @@ pub fn set_renaming(label: &gtk4::Label, entry: &gtk4::Entry, renaming: bool) {
     }
 }
 
-/// Collapse/expand a node to just its title bar. Deliberately self-contained
-/// here rather than wired from `app.rs`: it is pure widget visibility with no
+fn sync_minimize_icon(button: &gtk4::Button, expanded: bool) {
+    button.set_icon_name(if expanded {
+        "go-up-symbolic"
+    } else {
+        "go-down-symbolic"
+    });
+    button.set_tooltip_text(Some(if expanded {
+        "Collapse to title bar"
+    } else {
+        "Expand"
+    }));
+}
+
+/// A handle onto one node's collapse/expand widget state, returned by
+/// `wire_minimize` and stored on every node struct so `app.rs`'s "Collapse
+/// Selected"/"Expand Selected" menu commands — and undo/redo of a collapse
+/// toggle — can drive the same visibility the minimize button itself
+/// controls. Before this existed, only clicking the button (through
+/// `wire_minimize`'s own closure) could ever change `body`'s visibility, so
+/// `NodeRecord::collapsed` and what was actually on screen could silently
+/// disagree.
+#[derive(Clone)]
+pub struct CollapseHandle {
+    button: gtk4::Button,
+    body: gtk4::Overlay,
+}
+
+impl CollapseHandle {
+    /// Applies `collapsed` to the widget if it isn't already in that state.
+    /// Idempotent and cheap to call unconditionally (e.g. from undo/redo
+    /// replaying a `SetProperties` command that didn't actually touch
+    /// `collapsed`), since it no-ops when nothing needs to change.
+    pub fn set_collapsed(&self, collapsed: bool) {
+        let expanded = !collapsed;
+        if self.body.is_visible() != expanded {
+            self.body.set_visible(expanded);
+            sync_minimize_icon(&self.button, expanded);
+        }
+    }
+}
+
+/// Collapse/expand a node to just its title bar, via its minimize button.
+/// Also returns a `CollapseHandle` for driving the same state
+/// programmatically (see its doc comment). Deliberately self-contained here
+/// rather than wired from `app.rs`: it is pure widget visibility with no
 /// bearing on the node's record, its runtime, or the store caller side —
 /// `app.rs` separately persists `NodeRecord::collapsed` so the state survives
-/// a restart; this function only ever flips what's already on screen.
+/// a restart; `on_toggle` is how a direct button click reports that back.
 fn wire_minimize(
     button: &gtk4::Button,
     body: &gtk4::Overlay,
     initially_collapsed: bool,
     on_toggle: impl Fn(bool) + 'static,
-) {
-    let sync = |button: &gtk4::Button, expanded: bool| {
-        button.set_icon_name(if expanded {
-            "go-up-symbolic"
-        } else {
-            "go-down-symbolic"
-        });
-        button.set_tooltip_text(Some(if expanded {
-            "Collapse to title bar"
-        } else {
-            "Expand"
-        }));
-    };
+) -> CollapseHandle {
     let expanded = !initially_collapsed;
     body.set_visible(expanded);
-    sync(button, expanded);
+    sync_minimize_icon(button, expanded);
     button.connect_clicked({
         let body = body.clone();
         move |button| {
             let expanded = !body.is_visible();
             body.set_visible(expanded);
-            sync(button, expanded);
+            sync_minimize_icon(button, expanded);
             on_toggle(!expanded);
         }
     });
+    CollapseHandle {
+        button: button.clone(),
+        body: body.clone(),
+    }
 }
 
 /// Builds the role badge shown in a session card's title bar: an icon plus
@@ -167,6 +202,9 @@ pub struct SessionNode {
     pub close_button: gtk4::Button,
     /// Drag this to resize the terminal (wired in `app.rs`).
     pub resize_handle: gtk4::Box,
+    /// Lets `app.rs` collapse/expand this card from outside a button click —
+    /// see `CollapseHandle`'s doc comment.
+    pub collapse: CollapseHandle,
 }
 
 impl SessionNode {
@@ -261,7 +299,7 @@ impl SessionNode {
         container.append(&body);
         container.add_css_class("card");
 
-        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
 
         let node = SessionNode {
             container,
@@ -277,6 +315,7 @@ impl SessionNode {
             drag_handle,
             close_button,
             resize_handle,
+            collapse,
         };
         node.set_name(name);
         node
@@ -400,6 +439,7 @@ pub struct NoteNode {
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
+    pub collapse: CollapseHandle,
 }
 
 fn mode_label(mode: crate::model::NoteViewMode) -> &'static str {
@@ -507,7 +547,7 @@ impl NoteNode {
         container.append(&body);
         container.set_css_classes(&["card", &format!("note-{color}")]);
 
-        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
 
         let node = NoteNode {
             container,
@@ -518,6 +558,7 @@ impl NoteNode {
             drag_handle,
             close_button,
             resize_handle,
+            collapse,
         };
         node.set_view_mode(initial_mode);
         node
@@ -545,6 +586,7 @@ pub struct TextNode {
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
+    pub collapse: CollapseHandle,
 }
 
 impl TextNode {
@@ -587,9 +629,17 @@ impl TextNode {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.append(&title_bar);
         container.append(&body);
-        container.set_css_classes(&["card", "text-node"]);
+        // Reuses the Note pastel-card palette (`.note-blue`/`.note-title-bar`
+        // in style.css) rather than a separate, never-styled `.text-node`
+        // class: a Text node used to render as near-black text on whatever
+        // the system theme's default (often near-black) GtkTextView
+        // background is — illegible, and nothing like the readable postit
+        // look every other card on the canvas has. Blue (rather than Note's
+        // default yellow) keeps a Text node visually distinguishable from a
+        // Note at a glance.
+        container.set_css_classes(&["card", "note-blue"]);
 
-        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
 
         TextNode {
             container,
@@ -597,6 +647,7 @@ impl TextNode {
             drag_handle,
             close_button,
             resize_handle,
+            collapse,
         }
     }
 }
@@ -611,6 +662,7 @@ pub struct PlaceholderNode {
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
+    pub collapse: CollapseHandle,
 }
 
 impl PlaceholderNode {
@@ -664,13 +716,14 @@ impl PlaceholderNode {
         container.append(&body);
         container.set_css_classes(&["card", "placeholder-node"]);
 
-        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
 
         PlaceholderNode {
             container,
             drag_handle,
             close_button,
             resize_handle,
+            collapse,
         }
     }
 }

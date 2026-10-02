@@ -93,3 +93,18 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
    which is why clicking the chain icon looked like a no-op. `outline` rather
    than `border` so the highlight doesn't reflow the card's contents. */
 .card.link-source { outline: 2px solid #3584e4; outline-offset: -2px; }
+
+/* `App::set_selection` adds/removes the `selected` class on every node, but
+   until this rule existed nothing styled it at all — single/multi/marquee
+   selection had no on-screen effect whatsoever, so there was no way to tell
+   what (if anything) was selected before running a selection-dependent
+   command (align, duplicate, collapse, ...). A glow rather than
+   `link-source`'s inset outline, both so the two states (mid-link-click vs.
+   selected) read as visually distinct and so a multi-selection's glows don't
+   visually compete with one another at shared edges the way two inset
+   outlines touching would. */
+.card.selected {
+    outline: 2px solid #3584e4;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 5px rgba(53, 132, 228, 0.25);
+}

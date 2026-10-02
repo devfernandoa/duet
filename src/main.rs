@@ -166,12 +166,16 @@ fn build_ui(application: &adw::Application) {
         move |world| {
             if let Some(message) = App::click_link_at(&app, world) {
                 toast_overlay.add_toast(adw::Toast::new(&message));
-            } else {
-                // A plain click that hit neither a node nor a link: the usual
-                // "click empty space to clear the selection" canvas
-                // convention. Only reached when `click_link_at` found nothing
-                // to toast about, so this doesn't fire mid-marquee (that's a
-                // drag, not a click) or when a link was just selected/deleted.
+            } else if !app.borrow().covers_point(world) {
+                // A plain click that hit truly empty canvas (not a link, and
+                // not a card either — `click_link_at` returns `None` for
+                // both, since it skips link hit-testing entirely when a card
+                // covers the click point): the usual "click empty space to
+                // clear the selection" canvas convention. The `covers_point`
+                // check is what keeps this from also firing — and wiping the
+                // selection — on every click into a card itself: a title-bar
+                // button, a drag-to-move press, or a click into a note's own
+                // text view to start editing it.
                 App::deselect_all(&app);
             }
         }
