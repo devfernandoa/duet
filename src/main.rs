@@ -1432,6 +1432,10 @@ fn populate_workspaces(
 /// A small titled window (matching `open_new_session_dialog`'s shape) with a
 /// single pre-filled entry, for renaming one workspace. On success,
 /// re-syncs the header button and repopulates the switcher dialog's rows.
+// Each parameter is a distinct widget/state handle this one dialog-wiring
+// function needs to re-sync on success; a params struct built once per call
+// site wouldn't clarify anything here.
+#[allow(clippy::too_many_arguments)]
 fn prompt_rename_workspace(
     app: &Rc<RefCell<App>>,
     id: Uuid,
@@ -1502,6 +1506,10 @@ fn prompt_rename_workspace(
 /// sessions map when deleting the active workspace, or from the dormant
 /// record's saved session list otherwise, since an inactive workspace's
 /// sessions aren't running processes to begin with.
+// Each parameter is a distinct widget/state handle this one dialog-wiring
+// function needs to re-sync on success; a params struct built once per call
+// site wouldn't clarify anything here.
+#[allow(clippy::too_many_arguments)]
 fn confirm_delete_workspace(
     app: &Rc<RefCell<App>>,
     id: Uuid,
