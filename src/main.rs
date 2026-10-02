@@ -1,20 +1,4 @@
-mod account;
-mod agent;
-mod app;
-mod canvas;
-mod control;
-mod environment;
-mod handoff;
-mod layout;
-mod markdown;
-mod message;
-mod migration;
-mod model;
-mod node;
-mod role;
-mod runtime;
-mod session;
-mod store;
+use duet::*;
 
 use account::AccountStore;
 use adw::prelude::*;
@@ -30,13 +14,18 @@ use uuid::Uuid;
 const APP_ID: &str = "dev.fernandoa.duet";
 
 fn main() -> glib::ExitCode {
-    // `duet agent list`/`duet agent send ...`: a plain CLI client talking to
-    // the already-running duet instance's control socket, dispatched before
-    // GTK/GApplication ever sees argv — it needs no display and must work
-    // from inside a headless agent shell.
+    // `duet agent list`/`duet agents list`/`duet send ...`/etc: the same
+    // control CLI `duetctl` exposes as its own binary (see
+    // `src/bin/duetctl.rs`), also reachable through `duet` itself so a
+    // script that only knows the GUI binary's name still works. Dispatched
+    // before GTK/GApplication ever sees argv — it needs no display and must
+    // work from inside a headless agent shell.
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("agent") {
-        return if control::run_agent_cli(&args[2..]) {
+    if args
+        .get(1)
+        .is_some_and(|arg| control::is_cli_verb(arg.as_str()))
+    {
+        return if control::run_cli(&args[1..]) {
             glib::ExitCode::SUCCESS
         } else {
             glib::ExitCode::FAILURE
@@ -82,6 +71,7 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         move || {
             app.borrow_mut().pump_output();
+            App::pump_inboxes(&app);
             app.borrow().canvas.links_area.queue_draw();
             glib::ControlFlow::Continue
         }
@@ -954,7 +944,7 @@ fn open_new_session_dialog(
                 &toast_overlay,
             );
             match result {
-                Ok(()) => dialog.close(),
+                Ok(_id) => dialog.close(),
                 Err(error) => toast_overlay.add_toast(adw::Toast::new(&error.to_string())),
             }
         }

@@ -26,15 +26,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// What's knowable right now about a session's agent, without inspecting
-/// terminal output — that kind of detection (idle vs. working vs. awaiting
-/// input) is explicitly deferred to Milestone 3. `Unknown` is the honest
-/// default for anything still running; `Finished`/`Failed` are the only
-/// other values this milestone ever actually produces, derived from a real
-/// exit status. The remaining variants exist now so Milestone 3's real
-/// detection work doesn't need another enum migration.
+/// How recently a session must have produced output to count as `Working`
+/// rather than merely `Idle`. A few seconds, not milliseconds: agent CLIs
+/// routinely pause between a tool call and its result, and treating that
+/// pause as "idle" would make the badge flicker on every turn.
+const WORKING_WINDOW_SECS: f64 = 5.0;
+
+/// What's knowable right now about a session's agent. `Starting`/`Working`/
+/// `Idle` come from real, directly-observed PTY activity (see
+/// `SessionRuntime::seconds_since_output`); `Finished`/`Failed` come from a
+/// real exit status; `Offline` and `AwaitingAgent` are computed one layer up
+/// in `orchestration::activity`, which also knows about node existence and
+/// inbox state that this module doesn't. `AwaitingUser` has no reliable
+/// signal yet (it would need parsing terminal content, which this milestone
+/// explicitly doesn't do) and so is never actually produced — kept
+/// representable rather than removed, the same "Unknown is better than false
+/// confidence" reasoning this enum has used since Milestone 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Reserved for Milestone 3's real activity detection.
 pub enum AgentActivity {
     Unknown,
     Starting,
@@ -126,19 +134,37 @@ impl SessionRuntime {
         self.sessions.keys().copied().collect()
     }
 
-    /// What's knowable about `id`'s agent right now. See [`AgentActivity`]'s
-    /// doc comment for why only `Unknown`/`Finished`/`Failed` are ever
-    /// actually returned.
+    /// Seconds since `id`'s session last produced PTY output, refreshed only
+    /// as a side effect of `try_recv_output` (same caveat as `has_exited`).
+    /// `None` when `id` names no live session, or that session hasn't
+    /// produced output yet.
+    pub fn seconds_since_output(&self, id: Uuid) -> Option<f64> {
+        self.sessions
+            .get(&id)
+            .and_then(Session::seconds_since_output)
+    }
+
+    /// What's knowable about `id`'s agent from its own PTY/exit status
+    /// alone — see [`AgentActivity`]'s doc comment for the full picture,
+    /// which also folds in node existence and inbox state one layer up.
+    /// `Unknown` (not `Offline`) when `id` names no tracked session at all:
+    /// this module alone can't tell "never spawned" from "detached and
+    /// terminated", which is exactly why `orchestration::activity` exists.
     pub fn activity(&self, id: Uuid) -> AgentActivity {
-        match self.sessions.get(&id).and_then(Session::exit_status) {
-            None => AgentActivity::Unknown,
-            Some(status) => {
-                if status.success() {
-                    AgentActivity::Finished
-                } else {
-                    AgentActivity::Failed
-                }
-            }
+        let Some(session) = self.sessions.get(&id) else {
+            return AgentActivity::Unknown;
+        };
+        if let Some(status) = session.exit_status() {
+            return if status.success() {
+                AgentActivity::Finished
+            } else {
+                AgentActivity::Failed
+            };
+        }
+        match session.seconds_since_output() {
+            None => AgentActivity::Starting,
+            Some(secs) if secs <= WORKING_WINDOW_SECS => AgentActivity::Working,
+            Some(_) => AgentActivity::Idle,
         }
     }
 
@@ -234,7 +260,7 @@ mod tests {
         let id = Uuid::new_v4();
         assert_eq!(runtime.activity(id), AgentActivity::Unknown); // never spawned
         runtime.spawn(id, std::env::temp_dir(), sleeper()).unwrap();
-        assert_eq!(runtime.activity(id), AgentActivity::Unknown); // still running
+        assert_eq!(runtime.activity(id), AgentActivity::Starting); // alive, no output yet
 
         let ok = Uuid::new_v4();
         runtime

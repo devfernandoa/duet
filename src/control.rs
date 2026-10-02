@@ -1,8 +1,10 @@
-//! A minimal local control interface: a Unix-domain socket (the smallest
-//! IPC primitive that already fits duet's local-first, single-user-desktop
-//! scope — no new dependency, no network exposure) that an agent's own
-//! shell talks to via `duet agent list`/`duet agent send`, both dispatched
-//! from `main.rs` before GTK is ever touched.
+//! `duetctl`: the local control interface — a Unix-domain socket (the
+//! smallest IPC primitive that already fits duet's local-first,
+//! single-user-desktop scope) that agents and the `duetctl`/`duet agent`
+//! CLIs talk to, both dispatched from `main.rs` before GTK is ever touched.
+//! See Milestone 3 section 6: GTK and `duetctl` invoke the exact same
+//! `App`/`orchestration` services — this module only parses argv and the
+//! wire protocol, never routes or authorizes anything itself.
 //!
 //! The socket is accepted on a background thread (`spawn_server`), but
 //! every request is actually answered on the GTK main thread: each
@@ -14,13 +16,17 @@
 //! and GTK widgets are not `Send`, so this is the one safe way to reach
 //! them from a request that arrived on another thread.
 
+use crate::agent::Agent;
 use crate::app::App;
-use crate::message::{AgentMessage, AgentSummary, LinkSummary};
+use crate::message::{
+    AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, WorkspaceInfo,
+};
 use crate::store::default_control_socket_path;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
@@ -29,12 +35,52 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
+    /// `duet agent list` (preserved for backward compatibility; prefer
+    /// `AgentsList`/`duetctl agents list` for new scripts).
     List,
+    /// `duet agent send <target> "..."` (preserved; prefer `SendMessage`/
+    /// `duetctl send --from --to`).
     Send {
         #[serde(default)]
         source_session_id: Option<Uuid>,
         target: String,
         content: String,
+    },
+    AgentsList,
+    AgentsInspect {
+        target: String,
+    },
+    SendMessage {
+        #[serde(default)]
+        from: Option<Uuid>,
+        to: String,
+        content: String,
+    },
+    ConnectionsList,
+    WorkspaceInspect,
+    AgentsCreate {
+        name: String,
+        cwd: PathBuf,
+        /// A provider keyword (`claude`/`codex`/`opencode`/`shell`) — see
+        /// `parse_provider`. `Agent::Custom` isn't reachable from this CLI
+        /// yet (no acceptance-test or roadmap need for it this milestone).
+        agent: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    AgentsRemove {
+        target: String,
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    AgentsAssignRole {
+        target: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        requested_by: Option<Uuid>,
     },
 }
 
@@ -48,6 +94,23 @@ pub enum ControlResponse {
     Sent {
         message: AgentMessage,
     },
+    AgentList {
+        agents: Vec<AgentInfo>,
+    },
+    AgentDetail {
+        agent: AgentInfo,
+    },
+    Connections {
+        connections: Vec<ConnectionInfo>,
+    },
+    Workspace {
+        workspace: WorkspaceInfo,
+    },
+    Created {
+        id: Uuid,
+    },
+    Removed,
+    RoleAssigned,
     Error {
         error: String,
     },
@@ -135,6 +198,44 @@ fn handle_connection(stream: UnixStream, tx: &Sender<ControlEvent>) {
     let _ = (&stream).write_all(out.as_bytes());
 }
 
+/// A provider keyword as `duetctl agents create --agent <...>` accepts it.
+/// Case-insensitive; `Agent::Custom` isn't reachable from the CLI (see
+/// `ControlRequest::AgentsCreate`'s doc comment).
+fn parse_provider(name: &str) -> Result<Agent, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "claude" => Ok(Agent::Claude),
+        "codex" => Ok(Agent::Codex),
+        "opencode" => Ok(Agent::OpenCode),
+        "shell" => Ok(Agent::Shell),
+        other => Err(format!(
+            "unknown provider '{other}' (expected claude, codex, opencode, or shell)"
+        )),
+    }
+}
+
+/// Resolves a role name to its id against the live role roster (built-in
+/// plus custom) — the same name-matching style `agent::find_identity`
+/// already uses for agents. `"none"` is handled by the caller before this
+/// (it means "clear the role", not "a role literally named none").
+fn resolve_role_id(app: &App, name: &str) -> Result<Uuid, String> {
+    app.roles()
+        .into_iter()
+        .find(|role| role.name == name)
+        .map(|role| role.id)
+        .ok_or_else(|| format!("no role named '{name}'"))
+}
+
+/// Resolves an optional role flag's value: `None` leaves the role
+/// unspecified (used by `AgentsCreate`, where no `--role` just means no
+/// role), `Some("none")` explicitly clears an existing role (used by
+/// `AgentsAssignRole`), anything else resolves by name.
+fn resolve_optional_role(app: &App, role: Option<String>) -> Result<Option<Uuid>, String> {
+    match role.as_deref() {
+        None | Some("none") => Ok(None),
+        Some(name) => resolve_role_id(app, name).map(Some),
+    }
+}
+
 /// Answers one request against the live `App` — called from `main.rs`'s
 /// poll loop, on the GTK main thread.
 pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> ControlResponse {
@@ -154,66 +255,281 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             Ok(message) => ControlResponse::Sent { message },
             Err(error) => ControlResponse::Error { error },
         },
+        ControlRequest::SendMessage { from, to, content } => {
+            match App::send_message(app, from, &to, content) {
+                Ok(message) => ControlResponse::Sent { message },
+                Err(error) => ControlResponse::Error { error },
+            }
+        }
+        ControlRequest::AgentsList => ControlResponse::AgentList {
+            agents: app.borrow().agent_infos(),
+        },
+        ControlRequest::AgentsInspect { target } => {
+            let app_ref = app.borrow();
+            let Some(identity) = app_ref.agent_registry().resolve(&target).cloned() else {
+                return ControlResponse::Error {
+                    error: format!("no agent named '{target}'"),
+                };
+            };
+            match app_ref
+                .agent_infos()
+                .into_iter()
+                .find(|info| info.id == identity.id)
+            {
+                Some(agent) => ControlResponse::AgentDetail { agent },
+                None => ControlResponse::Error {
+                    error: format!("no agent named '{target}'"),
+                },
+            }
+        }
+        ControlRequest::ConnectionsList => ControlResponse::Connections {
+            connections: app.borrow().connection_infos(),
+        },
+        ControlRequest::WorkspaceInspect => ControlResponse::Workspace {
+            workspace: app.borrow().workspace_info(),
+        },
+        ControlRequest::AgentsCreate {
+            name,
+            cwd,
+            agent,
+            role,
+            requested_by,
+        } => {
+            let provider = match parse_provider(&agent) {
+                Ok(provider) => provider,
+                Err(error) => return ControlResponse::Error { error },
+            };
+            let role_id = match resolve_optional_role(&app.borrow(), role) {
+                Ok(role_id) => role_id,
+                Err(error) => return ControlResponse::Error { error },
+            };
+            // A CLI creation has no cursor position to spawn at (unlike the
+            // GUI's "New session" dialog, which uses the viewport center) —
+            // cascade by however many nodes already exist so agents created
+            // back-to-back (as the acceptance scenario's setup does) don't
+            // all land exactly on top of each other.
+            let position = {
+                let count = app.borrow().nodes.len() as f64;
+                (120.0 + count * 40.0, 120.0 + count * 40.0)
+            };
+            match App::create_agent(app, requested_by, name, cwd, provider, role_id, position) {
+                Ok(id) => ControlResponse::Created { id },
+                Err(error) => ControlResponse::Error {
+                    error: error.to_string(),
+                },
+            }
+        }
+        ControlRequest::AgentsRemove {
+            target,
+            requested_by,
+        } => {
+            let Some(id) = app.borrow().agent_registry().resolve(&target).map(|i| i.id) else {
+                return ControlResponse::Error {
+                    error: format!("no agent named '{target}'"),
+                };
+            };
+            match App::remove_agent(app, requested_by, id) {
+                Ok(()) => ControlResponse::Removed,
+                Err(error) => ControlResponse::Error {
+                    error: error.to_string(),
+                },
+            }
+        }
+        ControlRequest::AgentsAssignRole {
+            target,
+            role,
+            requested_by,
+        } => {
+            let Some(id) = app.borrow().agent_registry().resolve(&target).map(|i| i.id) else {
+                return ControlResponse::Error {
+                    error: format!("no agent named '{target}'"),
+                };
+            };
+            let role_id = match resolve_optional_role(&app.borrow(), role) {
+                Ok(role_id) => role_id,
+                Err(error) => return ControlResponse::Error { error },
+            };
+            match App::assign_role(app, requested_by, id, role_id) {
+                Ok(()) => ControlResponse::RoleAssigned,
+                Err(error) => ControlResponse::Error {
+                    error: error.to_string(),
+                },
+            }
+        }
     }
 }
 
-/// `duet agent list` / `duet agent send <target> "<message>"` — connects to
-/// the running duet instance's control socket, sends one request, prints
-/// its answer, and exits. Dispatched from `main.rs` before GTK is touched,
-/// so it works from inside a plain agent shell with no display needed.
-/// Returns `true` on success; every failure path prints its own message
-/// (to stderr) before returning `false`, so the caller only needs to turn
-/// that into a process exit code.
-pub fn run_agent_cli(args: &[String]) -> bool {
+/// `true` for every first argument `duet`'s pre-GTK dispatch (and
+/// `duetctl`'s own `main`) recognizes as a control-CLI invocation rather
+/// than "launch the GUI".
+pub fn is_cli_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "agent" | "agents" | "send" | "connections" | "workspace"
+    )
+}
+
+/// `duetctl <verb> ...` / `duet <verb> ...`: connects to the running duet
+/// instance's control socket, sends one request, prints its answer, and
+/// returns whether it succeeded. Works from inside a headless agent shell —
+/// no display needed.
+pub fn run_cli(args: &[String]) -> bool {
     let request = match parse_cli_request(args) {
         Ok(request) => request,
         Err(error) => {
-            eprintln!("duet agent: {error}");
+            eprintln!("duetctl: {error}");
             return false;
         }
     };
-
-    let send_and_read = || -> anyhow::Result<ControlResponse> {
-        let path = default_control_socket_path()?;
-        let stream = UnixStream::connect(&path).map_err(|error| {
-            anyhow::anyhow!(
-                "couldn't reach duet at {} ({error}); is duet running?",
-                path.display()
-            )
-        })?;
-        let mut payload = serde_json::to_string(&request)?;
-        payload.push('\n');
-        (&stream).write_all(payload.as_bytes())?;
-        let mut reply = String::new();
-        BufReader::new(&stream).read_line(&mut reply)?;
-        Ok(serde_json::from_str(reply.trim_end())?)
-    };
-
-    match send_and_read() {
+    match send_and_read(&request) {
         Ok(response) => {
             let ok = !matches!(response, ControlResponse::Error { .. });
             print_response(&response);
             ok
         }
         Err(error) => {
-            eprintln!("duet agent: {error}");
+            eprintln!("duetctl: {error}");
             false
         }
     }
 }
 
+fn send_and_read(request: &ControlRequest) -> anyhow::Result<ControlResponse> {
+    let path = default_control_socket_path()?;
+    let stream = UnixStream::connect(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "couldn't reach duet at {} ({error}); is duet running?",
+            path.display()
+        )
+    })?;
+    let mut payload = serde_json::to_string(request)?;
+    payload.push('\n');
+    (&stream).write_all(payload.as_bytes())?;
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply)?;
+    Ok(serde_json::from_str(reply.trim_end())?)
+}
+
+/// The acting agent's id for a request issued from inside its own launched
+/// shell: `DUET_AGENT_ID` first (section 8's canonical variable), falling
+/// back to the older `DUET_SESSION_ID` a pre-Milestone-3 launch still set.
+/// `None` from a bare interactive shell — the human operator, trusted the
+/// same way the GTK UI already is.
+fn acting_agent_id() -> Option<Uuid> {
+    std::env::var("DUET_AGENT_ID")
+        .or_else(|_| std::env::var("DUET_SESSION_ID"))
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+}
+
 fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [cmd, rest @ ..] if cmd == "agent" => parse_legacy_agent(rest),
+        [cmd, rest @ ..] if cmd == "agents" => parse_agents(rest),
+        [cmd, rest @ ..] if cmd == "send" => parse_send(rest),
+        [cmd, only] if cmd == "connections" && only == "list" => {
+            Ok(ControlRequest::ConnectionsList)
+        }
+        [cmd, only] if cmd == "workspace" && only == "inspect" => {
+            Ok(ControlRequest::WorkspaceInspect)
+        }
+        _ => anyhow::bail!(USAGE),
+    }
+}
+
+const USAGE: &str = r#"usage:
+  duetctl agents list
+  duetctl agents inspect <id-or-name>
+  duetctl agents create --name <name> --cwd <dir> --agent <claude|codex|opencode|shell> [--role <role>]
+  duetctl agents remove <id-or-name>
+  duetctl agents assign-role <id-or-name> <role-or-none>
+  duetctl send --from <id> --to <id-or-name> "<message>"
+  duetctl connections list
+  duetctl workspace inspect"#;
+
+fn parse_legacy_agent(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [only] if only == "list" => Ok(ControlRequest::List),
         [cmd, target, rest @ ..] if cmd == "send" && !rest.is_empty() => Ok(ControlRequest::Send {
-            source_session_id: std::env::var("DUET_SESSION_ID")
-                .ok()
-                .and_then(|id| Uuid::parse_str(&id).ok()),
+            source_session_id: acting_agent_id(),
             target: target.clone(),
             content: rest.join(" "),
         }),
         _ => anyhow::bail!(r#"usage: duet agent list | duet agent send <agent> "<message>""#),
     }
+}
+
+fn parse_agents(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [only] if only == "list" => Ok(ControlRequest::AgentsList),
+        [cmd, target] if cmd == "inspect" => Ok(ControlRequest::AgentsInspect {
+            target: target.clone(),
+        }),
+        [cmd, rest @ ..] if cmd == "create" => parse_agents_create(rest),
+        [cmd, target] if cmd == "remove" => Ok(ControlRequest::AgentsRemove {
+            target: target.clone(),
+            requested_by: acting_agent_id(),
+        }),
+        [cmd, target, role] if cmd == "assign-role" => Ok(ControlRequest::AgentsAssignRole {
+            target: target.clone(),
+            role: Some(role.clone()),
+            requested_by: acting_agent_id(),
+        }),
+        _ => anyhow::bail!(USAGE),
+    }
+}
+
+fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut name, mut cwd, mut agent, mut role) = (None, None, None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].clone());
+        match flag {
+            "--name" => name = Some(value),
+            "--cwd" => cwd = Some(value),
+            "--agent" => agent = Some(value),
+            "--role" => role = Some(value),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::AgentsCreate {
+        name: name.ok_or_else(|| anyhow::anyhow!("agents create needs --name\n\n{USAGE}"))?,
+        cwd: PathBuf::from(
+            cwd.ok_or_else(|| anyhow::anyhow!("agents create needs --cwd\n\n{USAGE}"))?,
+        ),
+        agent: agent.ok_or_else(|| anyhow::anyhow!("agents create needs --agent\n\n{USAGE}"))?,
+        role,
+        requested_by: acting_agent_id(),
+    })
+}
+
+fn parse_send(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let mut from = acting_agent_id();
+    let mut to = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" if i + 1 < args.len() => {
+                from = Some(
+                    Uuid::parse_str(&args[i + 1])
+                        .map_err(|_| anyhow::anyhow!("--from must be an agent id"))?,
+                );
+                i += 2;
+            }
+            "--to" if i + 1 < args.len() => {
+                to = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    let to = to.ok_or_else(|| anyhow::anyhow!("send needs --to <agent>\n\n{USAGE}"))?;
+    let content = args[i..].join(" ");
+    if content.is_empty() {
+        anyhow::bail!("send needs a message\n\n{USAGE}");
+    }
+    Ok(ControlRequest::SendMessage { from, to, content })
 }
 
 fn print_response(response: &ControlResponse) {
@@ -232,8 +548,56 @@ fn print_response(response: &ControlResponse) {
         ControlResponse::Sent { message } => {
             println!("{:?} (message {})", message.status, message.id);
         }
+        ControlResponse::AgentList { agents } => {
+            if agents.is_empty() {
+                println!("no agents running");
+            }
+            for agent in agents {
+                let role = agent.role.as_deref().unwrap_or("-");
+                let manager = if agent.manager { " (manager)" } else { "" };
+                println!(
+                    "{}\t{}\t{}\t{role}{manager}\t{}",
+                    agent.id, agent.name, agent.provider, agent.activity
+                );
+            }
+        }
+        ControlResponse::AgentDetail { agent } => {
+            println!("id:       {}", agent.id);
+            println!("name:     {}", agent.name);
+            println!("provider: {}", agent.provider);
+            println!("role:     {}", agent.role.as_deref().unwrap_or("-"));
+            println!("manager:  {}", agent.manager);
+            println!("activity: {}", agent.activity);
+        }
+        ControlResponse::Connections { connections } => {
+            if connections.is_empty() {
+                println!("no connections");
+            }
+            for connection in connections {
+                let capabilities = if connection.capabilities.is_empty() {
+                    "visual only".to_string()
+                } else {
+                    connection.capabilities.join(",")
+                };
+                println!(
+                    "{} -> {} [{capabilities}]",
+                    connection.source_name, connection.target_name
+                );
+            }
+        }
+        ControlResponse::Workspace { workspace } => {
+            println!("id:          {}", workspace.id);
+            println!("name:        {}", workspace.name);
+            println!("root:        {}", workspace.root_dir);
+            println!("environment: {}", workspace.environment);
+            println!("nodes:       {}", workspace.node_count);
+            println!("edges:       {}", workspace.edge_count);
+        }
+        ControlResponse::Created { id } => println!("created agent {id}"),
+        ControlResponse::Removed => println!("removed"),
+        ControlResponse::RoleAssigned => println!("role assigned"),
         ControlResponse::Error { error } => {
-            eprintln!("duet agent: {error}");
+            eprintln!("duetctl: {error}");
         }
     }
 }
@@ -243,16 +607,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_parses_with_no_arguments() {
+    fn legacy_list_still_parses_with_no_arguments() {
         assert!(matches!(
-            parse_cli_request(&["list".to_string()]).unwrap(),
+            parse_cli_request(&["agent".to_string(), "list".to_string()]).unwrap(),
             ControlRequest::List
         ));
     }
 
     #[test]
-    fn send_joins_trailing_words_into_one_content_string() {
+    fn legacy_send_joins_trailing_words_into_one_content_string() {
         let args = [
+            "agent".to_string(),
             "send".to_string(),
             "dev".to_string(),
             "hello".to_string(),
@@ -269,8 +634,11 @@ mod tests {
     }
 
     #[test]
-    fn send_without_content_is_rejected() {
-        assert!(parse_cli_request(&["send".to_string(), "dev".to_string()]).is_err());
+    fn legacy_send_without_content_is_rejected() {
+        assert!(
+            parse_cli_request(&["agent".to_string(), "send".to_string(), "dev".to_string()])
+                .is_err()
+        );
     }
 
     #[test]
@@ -297,7 +665,134 @@ mod tests {
                 assert_eq!(target, "dev");
                 assert_eq!(content, "hi");
             }
-            ControlRequest::List => panic!("expected Send"),
+            _ => panic!("expected Send"),
         }
+    }
+
+    #[test]
+    fn agents_list_parses() {
+        assert!(matches!(
+            parse_cli_request(&["agents".to_string(), "list".to_string()]).unwrap(),
+            ControlRequest::AgentsList
+        ));
+    }
+
+    #[test]
+    fn agents_inspect_parses_its_target() {
+        let ControlRequest::AgentsInspect { target } = parse_cli_request(&[
+            "agents".to_string(),
+            "inspect".to_string(),
+            "backend".to_string(),
+        ])
+        .unwrap() else {
+            panic!("expected AgentsInspect");
+        };
+        assert_eq!(target, "backend");
+    }
+
+    #[test]
+    fn send_parses_from_and_to_flags_and_joins_the_rest_as_content() {
+        let from = Uuid::new_v4();
+        let args = [
+            "send".to_string(),
+            "--from".to_string(),
+            from.to_string(),
+            "--to".to_string(),
+            "backend".to_string(),
+            "please".to_string(),
+            "inspect".to_string(),
+        ];
+        let ControlRequest::SendMessage {
+            from: parsed_from,
+            to,
+            content,
+        } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected SendMessage");
+        };
+        assert_eq!(parsed_from, Some(from));
+        assert_eq!(to, "backend");
+        assert_eq!(content, "please inspect");
+    }
+
+    #[test]
+    fn send_without_to_is_rejected() {
+        assert!(parse_cli_request(&["send".to_string(), "hello".to_string()]).is_err());
+    }
+
+    #[test]
+    fn agents_create_parses_every_flag() {
+        let args = [
+            "agents".to_string(),
+            "create".to_string(),
+            "--name".to_string(),
+            "backend".to_string(),
+            "--cwd".to_string(),
+            "/tmp".to_string(),
+            "--agent".to_string(),
+            "claude".to_string(),
+            "--role".to_string(),
+            "Developer".to_string(),
+        ];
+        let ControlRequest::AgentsCreate {
+            name,
+            cwd,
+            agent,
+            role,
+            ..
+        } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected AgentsCreate");
+        };
+        assert_eq!(name, "backend");
+        assert_eq!(cwd, PathBuf::from("/tmp"));
+        assert_eq!(agent, "claude");
+        assert_eq!(role, Some("Developer".to_string()));
+    }
+
+    #[test]
+    fn agents_assign_role_parses_none_as_a_literal_value() {
+        let args = [
+            "agents".to_string(),
+            "assign-role".to_string(),
+            "backend".to_string(),
+            "none".to_string(),
+        ];
+        let ControlRequest::AgentsAssignRole { target, role, .. } =
+            parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected AgentsAssignRole");
+        };
+        assert_eq!(target, "backend");
+        assert_eq!(role, Some("none".to_string()));
+    }
+
+    #[test]
+    fn connections_and_workspace_inspect_parse() {
+        assert!(matches!(
+            parse_cli_request(&["connections".to_string(), "list".to_string()]).unwrap(),
+            ControlRequest::ConnectionsList
+        ));
+        assert!(matches!(
+            parse_cli_request(&["workspace".to_string(), "inspect".to_string()]).unwrap(),
+            ControlRequest::WorkspaceInspect
+        ));
+    }
+
+    #[test]
+    fn parse_provider_accepts_every_builtin_case_insensitively() {
+        assert_eq!(parse_provider("Claude").unwrap(), Agent::Claude);
+        assert_eq!(parse_provider("CODEX").unwrap(), Agent::Codex);
+        assert_eq!(parse_provider("opencode").unwrap(), Agent::OpenCode);
+        assert_eq!(parse_provider("shell").unwrap(), Agent::Shell);
+        assert!(parse_provider("custom").is_err());
+    }
+
+    #[test]
+    fn is_cli_verb_recognizes_every_dispatched_verb_and_nothing_else() {
+        for verb in ["agent", "agents", "send", "connections", "workspace"] {
+            assert!(is_cli_verb(verb));
+        }
+        assert!(!is_cli_verb("--version"));
     }
 }

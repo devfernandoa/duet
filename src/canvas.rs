@@ -29,6 +29,12 @@ pub struct CanvasState {
     pub zoom: f64,
 }
 
+impl Default for CanvasState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CanvasState {
     pub fn new() -> Self {
         CanvasState {
@@ -79,6 +85,12 @@ pub struct Canvas {
     /// hold their own `Rc` clone, which is all they ever need after
     /// construction.
     marquee_end: Rc<RefCell<Option<MarqueeEndCallback>>>,
+}
+
+impl Default for Canvas {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Canvas {

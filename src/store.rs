@@ -254,6 +254,7 @@ mod tests {
             instructions: "Be custom.".to_string(),
             icon: Some("face-smile-symbolic".to_string()),
             accent: Some("blue".to_string()),
+            manager: false,
         };
         let store = Store::new(
             vec![workspace.clone()],
