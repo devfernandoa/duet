@@ -228,7 +228,7 @@ mod tests {
                 agent: Agent::Claude,
                 claude_session_id: Some(Uuid::nil()),
                 claude_account: Some("work".to_string()),
-                claude_fresh: false,
+                never_launched: false,
                 role_id: None,
                 environment: EnvironmentKind::LocalPty,
             }),
@@ -373,7 +373,7 @@ mod tests {
             },
             claude_session_id: None,
             claude_account: None,
-            claude_fresh: false,
+            never_launched: false,
             role_id: None,
             environment: EnvironmentKind::LocalPty,
         });
