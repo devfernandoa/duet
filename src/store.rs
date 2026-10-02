@@ -1,5 +1,4 @@
-use crate::environment::EnvironmentKind;
-use crate::model::{EdgeRecord, NodeRecord};
+use crate::model::{EdgeRecord, EnvironmentKind, NodeRecord};
 use crate::role::Role;
 use serde::{Deserialize, Serialize};
 use std::io::Write;

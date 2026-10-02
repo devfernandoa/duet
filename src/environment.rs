@@ -18,23 +18,15 @@
 //! deterministically from the terminal's own stable `Uuid` — no separate
 //! bookkeeping of a Duet-id-to-tmux-session-name table is needed because the
 //! mapping is a pure function of the id.
+//!
+//! [`EnvironmentKind`] itself lives in `model.rs`, not here — it's pure
+//! persisted data, and this module (which shells out to `tmux`) depends on
+//! it, not the other way around.
 
 use crate::agent::Launch;
-use serde::{Deserialize, Serialize};
+pub use crate::model::EnvironmentKind;
+use crate::runtime::SessionRuntime;
 use uuid::Uuid;
-
-/// Which runtime a terminal node's process runs under. Persisted on
-/// `model::TerminalPayload` (per-terminal) and as a default on
-/// `store::WorkspaceRecord` (new terminals in that workspace start with the
-/// workspace's own default unless the new-session dialog is given a reason
-/// to override it — no such override UI exists yet, so today every new
-/// terminal simply inherits its workspace's default).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum EnvironmentKind {
-    #[default]
-    LocalPty,
-    LocalTmux,
-}
 
 /// The deterministic tmux session name for a terminal node's id. Pure
 /// function of the id, not stored anywhere separately — this IS the
@@ -92,6 +84,22 @@ pub fn kill_tmux_session(terminal_id: Uuid) {
         .output();
 }
 
+/// Genuinely terminates `terminal_id`'s process: stops `runtime` tracking it
+/// (the local-PTY case, and the only thing that happens for a `LocalTmux`
+/// terminal that's merely being detached — see `kill_tmux_session`'s doc)
+/// and, for `LocalTmux`, additionally kills the underlying tmux session so
+/// the real work actually stops. The single call site every genuine-
+/// termination path (close a node, delete/unload a workspace, hand off to a
+/// different agent, restart a terminal) should use instead of repeating the
+/// `runtime.terminate` + conditional `kill_tmux_session` pair inline — one
+/// seam to extend if a third backend ever needs its own termination step.
+pub fn terminate(runtime: &mut SessionRuntime, terminal_id: Uuid, kind: EnvironmentKind) {
+    runtime.terminate(terminal_id);
+    if kind == EnvironmentKind::LocalTmux {
+        kill_tmux_session(terminal_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +152,47 @@ mod tests {
     #[test]
     fn environment_kind_defaults_to_local_pty() {
         assert_eq!(EnvironmentKind::default(), EnvironmentKind::LocalPty);
+    }
+
+    /// `terminate` must stop `runtime` tracking the id for both kinds (the
+    /// one guarantee every call site relies on); the `LocalTmux` extra step
+    /// (actually killing a real tmux session) isn't exercised here since
+    /// tmux isn't assumed to be installed wherever this test suite runs —
+    /// `kill_tmux_session`'s own errors are deliberately swallowed, so a
+    /// missing `tmux` binary can't make this test flaky either way.
+    #[test]
+    fn terminate_always_stops_the_runtime_from_tracking_the_id() {
+        let mut runtime = SessionRuntime::new();
+        let id = Uuid::new_v4();
+        runtime
+            .spawn(
+                id,
+                std::env::temp_dir(),
+                Launch {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), "sleep 5".to_string()],
+                    envs: vec![],
+                },
+            )
+            .unwrap();
+        assert!(runtime.is_alive(id));
+        terminate(&mut runtime, id, EnvironmentKind::LocalPty);
+        assert!(!runtime.is_alive(id));
+
+        let id = Uuid::new_v4();
+        runtime
+            .spawn(
+                id,
+                std::env::temp_dir(),
+                Launch {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), "sleep 5".to_string()],
+                    envs: vec![],
+                },
+            )
+            .unwrap();
+        assert!(runtime.is_alive(id));
+        terminate(&mut runtime, id, EnvironmentKind::LocalTmux);
+        assert!(!runtime.is_alive(id));
     }
 }

@@ -13,10 +13,26 @@
 //! owning features are built.
 
 use crate::agent::Agent;
-use crate::environment::EnvironmentKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// Which runtime a terminal node's process runs under. Persisted on
+/// [`TerminalPayload`] (per-terminal) and as a default on
+/// `store::WorkspaceRecord` (new terminals in that workspace start with the
+/// workspace's own default unless the new-session dialog is given a reason
+/// to override it — no such override UI exists yet, so today every new
+/// terminal simply inherits its workspace's default). A pure data enum
+/// deliberately kept here rather than in `environment.rs`: that module is
+/// the runtime/process-spawning layer (it shells out to `tmux`), and this
+/// crate's dependency direction keeps the domain model independent of it —
+/// `environment.rs` depends on this type, not the other way around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EnvironmentKind {
+    #[default]
+    LocalPty,
+    LocalTmux,
+}
 
 /// Which floor a node lives on. `Ground` is the default and, until Milestone
 /// 9 introduces git-isolated floors, the only value that ever occurs.

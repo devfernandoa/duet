@@ -4,13 +4,13 @@ use crate::canvas::{
     Canvas, NodeGeometry, TITLE_BAR_HEIGHT, allocated_size, canvas_point, card_center, card_edge,
     card_intersection, card_rect, card_vertical_edge, world_drag_delta,
 };
-use crate::environment::{self, EnvironmentKind};
+use crate::environment;
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::layout;
 use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary, now_epoch_secs};
 use crate::model::{
-    EdgeRecord, FloorRef, GroupPayload, NodeKind, NodeRecord, NotePayload, NoteViewMode,
-    TerminalPayload, TextPayload,
+    EdgeRecord, EnvironmentKind, FloorRef, GroupPayload, NodeKind, NodeRecord, NotePayload,
+    NoteViewMode, TerminalPayload, TextPayload,
 };
 use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
 use crate::role::{Role, with_role_instructions};
@@ -574,10 +574,7 @@ impl App {
             .filter_map(|(id, entry)| entry.record.as_terminal().map(|t| (*id, t.environment)))
             .collect();
         for (id, env) in terminals {
-            app.borrow_mut().runtime.terminate(id);
-            if env == EnvironmentKind::LocalTmux {
-                environment::kill_tmux_session(id);
-            }
+            environment::terminate(&mut app.borrow_mut().runtime, id, env);
         }
         App::detach_active_workspace(app);
     }
@@ -797,10 +794,7 @@ impl App {
                 .collect()
         };
         for (node_id, env) in terminals {
-            app.borrow_mut().runtime.terminate(node_id);
-            if env == EnvironmentKind::LocalTmux {
-                environment::kill_tmux_session(node_id);
-            }
+            environment::terminate(&mut app.borrow_mut().runtime, node_id, env);
         }
         Ok(())
     }
@@ -1337,10 +1331,7 @@ impl App {
                 record.agent.display_name()
             );
         }
-        app.borrow_mut().runtime.terminate(id);
-        if record.environment == EnvironmentKind::LocalTmux {
-            environment::kill_tmux_session(id);
-        }
+        environment::terminate(&mut app.borrow_mut().runtime, id, record.environment);
 
         let is_claude = matches!(record.agent, Agent::Claude);
         let summary_result = if is_claude {
@@ -1450,7 +1441,12 @@ impl App {
             let mut app_mut = app.borrow_mut();
             let canvas = app_mut.canvas.clone();
             let removed = app_mut.nodes.remove(&id);
-            app_mut.runtime.terminate(id);
+            let env = removed
+                .as_ref()
+                .and_then(|entry| entry.record.as_terminal())
+                .map(|t| t.environment)
+                .unwrap_or_default();
+            environment::terminate(&mut app_mut.runtime, id, env);
             app_mut.edges.retain(|e| e.source != id && e.target != id);
             if app_mut.pending_edge_source == Some(id) {
                 app_mut.pending_edge_source = None;
@@ -1468,14 +1464,6 @@ impl App {
             app_mut.refresh_link_highlight();
             (canvas, removed)
         };
-        if let Some(entry) = &removed
-            && entry
-                .record
-                .as_terminal()
-                .is_some_and(|t| t.environment == EnvironmentKind::LocalTmux)
-        {
-            environment::kill_tmux_session(id);
-        }
         if let Some(entry) = removed {
             canvas.remove_node(entry.widget.container());
         }
@@ -1504,10 +1492,7 @@ impl App {
                 .collect()
         };
         for (id, env) in targets {
-            app.borrow_mut().runtime.terminate(id);
-            if env == EnvironmentKind::LocalTmux {
-                environment::kill_tmux_session(id);
-            }
+            environment::terminate(&mut app.borrow_mut().runtime, id, env);
             let mut app_mut = app.borrow_mut();
             if let Some(entry) = app_mut.nodes.get_mut(&id) {
                 if let NodeWidget::Terminal(node) = &entry.widget {
@@ -1520,10 +1505,14 @@ impl App {
 
     /// Respawns a fresh process for every selected `Terminal` node,
     /// replacing whatever it had (running or already exited) — the
-    /// complement of `terminate_selected_terminals`. A `LocalTmux` terminal
-    /// attaches to its still-alive tmux session rather than starting a
-    /// second shell, via the same `-A` semantics `materialize_node` relies
-    /// on when reconnecting after a restart.
+    /// complement of `terminate_selected_terminals`. For a `LocalTmux`
+    /// terminal this is a genuine restart, not a reconnect: the tmux session
+    /// itself is killed (via `environment::terminate`) before a new one is
+    /// created under the same name, so "Restart Terminal" means what it
+    /// says — a clean process, not a resumed one. (Returning to a workspace
+    /// that was merely backgrounded, not explicitly restarted, is the
+    /// `materialize_node`/`-A` reconnect path; this function never takes
+    /// that path.)
     pub fn restart_selected_terminals(app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) {
         let ids: Vec<Uuid> = {
             let app_ref = app.borrow();
@@ -1549,10 +1538,7 @@ impl App {
             else {
                 continue;
             };
-            app.borrow_mut().runtime.terminate(id);
-            if terminal.environment == EnvironmentKind::LocalTmux {
-                environment::kill_tmux_session(id);
-            }
+            environment::terminate(&mut app.borrow_mut().runtime, id, terminal.environment);
             let spawn_result = {
                 let app_ref = app.borrow();
                 build_terminal_launch(&app_ref, id, &terminal)

@@ -37,9 +37,9 @@
 //! file by hand) is the only way to recover it.
 
 use crate::agent::Agent;
-use crate::environment::EnvironmentKind;
 use crate::model::{
-    EdgeRecord, FloorRef, NodeKind, NodeRecord, NotePayload, NoteViewMode, TerminalPayload,
+    EdgeRecord, EnvironmentKind, FloorRef, NodeKind, NodeRecord, NotePayload, NoteViewMode,
+    TerminalPayload,
 };
 use crate::role::Role;
 use crate::store::{CanvasRecord, Store, WorkspaceRecord};
