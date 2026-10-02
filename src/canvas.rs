@@ -31,6 +31,11 @@ use gtk4::{glib, graphene, gsk};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// A tracked canvas child, paired with its world-space position (see
+/// `Canvas::nodes`'s doc comment for why the position is tracked
+/// independently of the widget's own GTK transform).
+type CanvasNode = (gtk4::Widget, (f64, f64));
+
 #[derive(Clone)]
 pub struct Canvas {
     pub overlay: gtk4::Overlay,
@@ -45,7 +50,7 @@ pub struct Canvas {
     /// line that disappeared under a card would read as broken.
     pub links_area: gtk4::DrawingArea,
     pub state: Rc<RefCell<CanvasState>>,
-    nodes: Rc<RefCell<Vec<(gtk4::Widget, (f64, f64))>>>,
+    nodes: Rc<RefCell<Vec<CanvasNode>>>,
 }
 
 impl Canvas {
@@ -64,7 +69,7 @@ impl Canvas {
         overlay.add_overlay(&links_area);
 
         let state = Rc::new(RefCell::new(CanvasState::new()));
-        let nodes: Rc<RefCell<Vec<(gtk4::Widget, (f64, f64))>>> = Rc::new(RefCell::new(Vec::new()));
+        let nodes: Rc<RefCell<Vec<CanvasNode>>> = Rc::new(RefCell::new(Vec::new()));
 
         // GestureDrag's offsets are relative to the drag's start point (not
         // an incremental delta since the last event), so the pan at drag
@@ -480,7 +485,7 @@ fn draw_link(cairo_ctx: &gtk4::cairo::Context, link: &LinkLine, state: &CanvasSt
 
     // A dot at the source end and an arrowhead at the target end show the
     // direction selected when the logical connection was created.
-    let _ = cairo_ctx.arc(
+    cairo_ctx.arc(
         screen[0].0,
         screen[0].1,
         width * 1.6,
@@ -591,7 +596,7 @@ fn apply_transform(
 fn apply_view(
     fixed: &gtk4::Fixed,
     grid_area: &gtk4::DrawingArea,
-    nodes: &[(gtk4::Widget, (f64, f64))],
+    nodes: &[CanvasNode],
     state: &CanvasState,
 ) {
     for (child, world_pos) in nodes {

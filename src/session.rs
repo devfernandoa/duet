@@ -129,6 +129,12 @@ impl Session {
         let _ = self.child.kill();
     }
 
+    /// Not yet read by any caller — the detection in `try_recv_output` above
+    /// is complete, but no UI affordance surfaces a failed resume yet (unlike
+    /// the "exited" badge `App::pump_output` already shows). Kept, with the
+    /// lint explicitly silenced, rather than deleted: this is a finished
+    /// building block for that future affordance, not leftover cruft.
+    #[allow(dead_code)]
     pub fn missing_conversation(&self) -> bool {
         self.missing_conversation
     }

@@ -23,6 +23,10 @@ use std::rc::Rc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// One link's world-space endpoints, as `link_lines` resolves it: the link
+/// itself, then its `from`/`to` points.
+type LinkEndpoints = (LinkRecord, (f64, f64), (f64, f64));
+
 /// How long to wait after the last edit before writing the store to disk.
 /// Keeps rapid-fire events (e.g. every keystroke in a sticky note) from each
 /// triggering their own synchronous `File::create` + `write_all` +
@@ -592,11 +596,11 @@ impl App {
             // for why a request is not what VTE ends up rendering, and why
             // resizing the PTY to the *requested* grid garbles the text of a
             // card narrower than its own title bar.
-            if let Some(grid) = entry.node.actual_grid() {
-                if entry.pty_grid != Some(grid) {
-                    let _ = self.runtime.resize(id, grid.1, grid.0);
-                    entry.pty_grid = Some(grid);
-                }
+            if let Some(grid) = entry.node.actual_grid()
+                && entry.pty_grid != Some(grid)
+            {
+                let _ = self.runtime.resize(id, grid.1, grid.0);
+                entry.pty_grid = Some(grid);
             }
             let chunks = self.runtime.try_recv_output(id);
             for chunk in &chunks {
@@ -714,6 +718,10 @@ impl App {
     /// Spawns a brand-new Session + SessionNode at `viewport_center_world`,
     /// inserts it, wires its commit signal (same pattern as `restore`), and
     /// persists the store. Used by the new-session dialog in `main.rs`.
+    // Every parameter is an independent piece of what the new-session dialog
+    // collected; bundling them into a params struct would just move the same
+    // fields one level out without clarifying anything at this single call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         app: &Rc<RefCell<App>>,
         name: String,
@@ -875,7 +883,7 @@ impl App {
 
     /// Every live link's world-space endpoints, chosen from the sides that
     /// face each other so stacked cards use a vertical route.
-    pub fn link_lines(&self) -> Vec<(LinkRecord, (f64, f64), (f64, f64))> {
+    pub fn link_lines(&self) -> Vec<LinkEndpoints> {
         self.links
             .iter()
             .filter_map(|&link| {
@@ -1381,6 +1389,10 @@ impl CardEntry for NoteEntry {
 /// widget's ancestor chain during the bubble phase unless one of them claims
 /// the event sequence — so without claiming, moving/resizing a card would
 /// simultaneously pan the whole canvas underneath it.
+// Each parameter is a distinct widget handle or accessor this one generic
+// wiring function needs; grouping them would just hide the same list inside
+// a struct built fresh at each of its two call sites.
+#[allow(clippy::too_many_arguments)]
 fn wire_node_chrome<T: CardEntry + 'static>(
     app: &Rc<RefCell<App>>,
     container: &gtk4::Box,
@@ -1808,10 +1820,10 @@ fn build_launch_and_record(
     role_id: Option<Uuid>,
     position: (f64, f64),
 ) -> anyhow::Result<(Launch, SessionRecord)> {
-    if let Agent::Custom { program, .. } = &agent {
-        if program.trim().is_empty() {
-            anyhow::bail!("give the custom command a program to run");
-        }
+    if let Agent::Custom { program, .. } = &agent
+        && program.trim().is_empty()
+    {
+        anyhow::bail!("give the custom command a program to run");
     }
     let claude = resolve_claude_account(app, &agent, claude_account)?;
     let claude_session_id = claude.is_some().then(Uuid::new_v4);
