@@ -1,16 +1,17 @@
 //! The Duet orchestration skill: discovery and role knowledge installed
-//! once into a Claude account's config dir, so it no longer has to be
-//! resent as prompt text on every single launch. Claude Code auto-discovers
-//! any skill under `<CLAUDE_CONFIG_DIR>/skills/<name>/SKILL.md`, the same
-//! way it discovers one under a normal, non-isolated `~/.claude/skills/`.
+//! once into an agent's own config dir, so it no longer has to be resent as
+//! prompt text on every single launch. Both Claude Code and Codex
+//! auto-discover any skill at the identical `skills/<name>/SKILL.md`
+//! convention (frontmatter `name`/`description` plus a Markdown body),
+//! just rooted at a different directory per provider — `CLAUDE_CONFIG_DIR`
+//! for Claude, `CODEX_HOME` for Codex (confirmed against a real `codex`
+//! install: `~/.codex/skills/.system/*/SKILL.md` uses this exact shape).
+//! `install` itself doesn't know or care which — it just writes the file
+//! under whatever config dir its caller resolved.
 //!
-//! Scoped to Claude only, matching CLAUDE.md's "Claude Code priority": it's
-//! the one provider whose CLI has a documented, auto-discovered skills
-//! mechanism this install can target. Codex/OpenCode/Shell/Custom still get
-//! the short prompt-based discovery text from `env.rs` — extending this to
-//! Codex's own `AGENTS.md` convention is future work, not done here (it
-//! writes into the user's *project* directory rather than an isolated
-//! config dir, a bigger decision than this pass needs to make).
+//! OpenCode/Shell/Custom still get the short prompt-based discovery text
+//! from `env.rs` instead — none of them has a documented, auto-discovered
+//! skills mechanism this install can target.
 
 use std::path::Path;
 

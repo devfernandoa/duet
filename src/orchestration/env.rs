@@ -11,11 +11,11 @@ use std::path::Path;
 /// exists and how to use it — section 8: "Keep injected context compact."
 /// Sent only once, on a terminal's actual first-ever launch (see
 /// `model::TerminalPayload::never_launched`), and only for providers with
-/// no installed Duet skill to rely on instead (Codex, OpenCode, Shell,
-/// Custom — see `skill.rs`'s doc comment on why that's Claude-only today).
-/// A Claude launch with its skill installed gets no prompt at all: the
-/// skill's own description ("use at the very start of every session,
-/// before responding to anything else") is what's supposed to make it
+/// no installed Duet skill to rely on instead (OpenCode/Shell/Custom — see
+/// `skill.rs`'s doc comment; Claude and Codex both get the skill). A
+/// launch with its skill installed gets no prompt at all: the skill's own
+/// description ("use at the very start of every session, before
+/// responding to anything else") is what's supposed to make it
 /// self-trigger, the same way any other skill does — a synthetic nudge on
 /// top of that would just be a redundant extra turn.
 pub const DISCOVERY_INSTRUCTION: &str = "You are running inside Duet, a multi-agent workspace. \

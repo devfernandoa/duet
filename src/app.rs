@@ -1668,8 +1668,12 @@ impl App {
                 (launch, updated)
             } else {
                 let codex_home = ensure_codex_home(&Agent::Codex, id)?;
+                let skill_installed = codex_home
+                    .as_ref()
+                    .is_some_and(|dir| orchestration::skill::install(dir).is_ok());
                 let initial_prompt =
-                    orchestration::env::discovery_prompt(Some(&summary), false).unwrap_or_default();
+                    orchestration::env::discovery_prompt(Some(&summary), skill_installed)
+                        .unwrap_or_default();
                 let launch = with_session_env(
                     to.launch(LaunchRequest {
                         initial_prompt: Some(&initial_prompt),
@@ -3104,19 +3108,24 @@ fn build_terminal_launch(
     let claude = resolve_claude_account(app, &terminal.agent, terminal.claude_account.clone())?;
     let codex_home = ensure_codex_home(&terminal.agent, id)?;
     let resume = claude_should_resume(terminal);
-    // A Claude launch always gets the `duet` skill (re)installed into its
-    // config dir (idempotent — see `skill::install`'s doc comment), so it's
-    // there before the agent's very first real turn. Whether a *prompt*
-    // also goes out depends on `never_launched`: only this terminal's
-    // actual first-ever launch sends anything at all — a returning agent
-    // (restored, reattached, or restarted) already knows, either because
-    // its `duet` skill is still installed (Claude) or because it's still
-    // in its own resumed conversation history (every other provider), and
-    // resending it would just add a stray synthetic turn every time `duet`
-    // itself restarts.
+    // Claude and Codex both get the `duet` skill (re)installed into their
+    // own config dir every launch (idempotent — see `skill::install`'s doc
+    // comment), so it's there before the agent's very first real turn —
+    // both use the identical `skills/<name>/SKILL.md` convention, Codex
+    // under `CODEX_HOME` the same way Claude uses `CLAUDE_CONFIG_DIR`.
+    // Whether a *prompt* also goes out depends on `never_launched`: only
+    // this terminal's actual first-ever launch sends anything at all — a
+    // returning agent (restored, reattached, or restarted) already knows,
+    // either because its `duet` skill is still installed or because it's
+    // still in its own resumed conversation history (OpenCode/Shell/
+    // Custom, with no skill mechanism), and resending it would just add a
+    // stray synthetic turn every time `duet` itself restarts.
     let skill_installed = claude
         .as_ref()
-        .is_some_and(|(_, dir)| orchestration::skill::install(dir).is_ok());
+        .is_some_and(|(_, dir)| orchestration::skill::install(dir).is_ok())
+        || codex_home
+            .as_ref()
+            .is_some_and(|dir| orchestration::skill::install(dir).is_ok());
     let initial_prompt = terminal
         .never_launched
         .then(|| orchestration::env::discovery_prompt(None, skill_installed))
