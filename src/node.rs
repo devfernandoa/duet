@@ -123,7 +123,6 @@ fn role_badge_widgets() -> (gtk4::Box, gtk4::Image, gtk4::Label) {
 
 pub struct SessionNode {
     pub container: gtk4::Box,
-    pub title_bar: gtk4::Box,
     /// The session's name, shown when not being renamed. Click it to rename
     /// (wired in `app.rs`, which owns the uniqueness rule and persistence).
     pub title_label: gtk4::Label,
@@ -242,7 +241,6 @@ impl SessionNode {
 
         let node = SessionNode {
             container,
-            title_bar,
             title_label,
             title_entry,
             role_badge,
@@ -364,7 +362,6 @@ impl SessionNode {
 /// notes and session cards behave the same way on the canvas.
 pub struct NoteNode {
     pub container: gtk4::Box,
-    pub title_bar: gtk4::Box,
     pub text_view: gtk4::TextView,
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
@@ -419,7 +416,6 @@ impl NoteNode {
 
         NoteNode {
             container,
-            title_bar,
             text_view,
             drag_handle,
             close_button,
