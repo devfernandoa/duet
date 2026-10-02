@@ -73,8 +73,15 @@ pub struct WorkspaceRecord {
     pub canvas: CanvasRecord,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Store {
+    /// Explicit on-disk schema version — see `migration.rs`, the only module
+    /// that reads or writes this field directly. `#[serde(default = ...)]`
+    /// so a file written before this field existed (every shipped version so
+    /// far) loads as the current version rather than failing: that shape has
+    /// only ever meant one schema.
+    #[serde(default = "crate::migration::current_schema_version_default")]
+    pub schema_version: u32,
     #[serde(default)]
     pub workspaces: Vec<WorkspaceRecord>,
     #[serde(default)]
@@ -86,170 +93,42 @@ pub struct Store {
     pub custom_roles: Vec<Role>,
 }
 
-/// The pre-canvas on-disk shape. Kept only to migrate old `tabs.json` files
-/// written by the ratatui version of duet.
-#[derive(Debug, Deserialize)]
-struct LegacyTabRecord {
-    name: String,
-    cwd: PathBuf,
-    agent: Agent,
-    claude_session_id: Option<Uuid>,
-    claude_account: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyStore {
-    tabs: Vec<LegacyTabRecord>,
-}
-
-/// The pre-workspace on-disk shape: a single flat canvas, no `workspaces`
-/// key. Kept only to migrate files written before workspaces existed.
-#[derive(Debug, Deserialize)]
-struct PreWorkspaceStore {
-    #[serde(default)]
-    sessions: Vec<SessionRecord>,
-    #[serde(default)]
-    notes: Vec<StickyNoteRecord>,
-    #[serde(default)]
-    links: Vec<LinkRecord>,
-    #[serde(default)]
-    canvas: CanvasRecord,
-}
-
-const GRID_COLUMNS: f64 = 3.0;
-const GRID_CELL_WIDTH: f64 = 520.0;
-const GRID_CELL_HEIGHT: f64 = 360.0;
-const DEFAULT_NODE_SIZE: (f64, f64) = (480.0, 320.0);
-
-/// Name and root directory given to a workspace created by migrating an
-/// older single-canvas store, so existing users don't lose their canvas.
-fn default_workspace_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-}
-
-/// Wraps one flat canvas's worth of records into a `Store` containing a
-/// single "Default" workspace, used by both migration paths below.
-fn wrap_single_workspace(
-    sessions: Vec<SessionRecord>,
-    notes: Vec<StickyNoteRecord>,
-    links: Vec<LinkRecord>,
-    canvas: CanvasRecord,
-) -> Store {
-    let id = Uuid::new_v4();
-    Store {
-        workspaces: vec![WorkspaceRecord {
-            id,
-            name: "Default".to_string(),
-            root_dir: default_workspace_root(),
-            sessions,
-            notes,
-            links,
-            canvas,
-        }],
-        active_workspace: Some(id),
-        custom_roles: Vec::new(),
+impl Default for Store {
+    fn default() -> Self {
+        Store::new(Vec::new(), None, Vec::new())
     }
 }
 
-fn migrate_legacy(legacy: LegacyStore) -> Store {
-    let sessions = legacy
-        .tabs
-        .into_iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            let column = (index as f64) % GRID_COLUMNS;
-            let row = (index as f64 / GRID_COLUMNS).floor();
-            SessionRecord {
-                id: Uuid::new_v4(),
-                name: tab.name,
-                cwd: tab.cwd,
-                agent: tab.agent,
-                claude_session_id: tab.claude_session_id,
-                claude_account: tab.claude_account,
-                role_id: None,
-                position: (column * GRID_CELL_WIDTH, row * GRID_CELL_HEIGHT),
-                size: DEFAULT_NODE_SIZE,
-            }
-        })
-        .collect();
-    wrap_single_workspace(sessions, Vec::new(), Vec::new(), CanvasRecord::default())
-}
-
-fn backup_corrupt_file(path: &Path, reason: &str) -> (Store, Option<String>) {
-    let backup = path.with_extension("corrupt.json");
-    let backup_note = match std::fs::copy(path, &backup) {
-        Ok(_) => format!(" A backup was saved to {}.", backup.display()),
-        Err(_) => String::new(),
-    };
-    (
-        Store::default(),
-        Some(format!(
-            "Couldn't read the saved workspace ({reason}).{backup_note}"
-        )),
-    )
-}
-
 impl Store {
+    /// Builds a `Store` at [`crate::migration::CURRENT_SCHEMA_VERSION`] — the
+    /// one place that stamps `schema_version` on a freshly-built `Store`, so
+    /// no caller (or migration) can forget to tag what it writes.
+    pub fn new(
+        workspaces: Vec<WorkspaceRecord>,
+        active_workspace: Option<Uuid>,
+        custom_roles: Vec<Role>,
+    ) -> Store {
+        Store {
+            schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
+            workspaces,
+            active_workspace,
+            custom_roles,
+        }
+    }
+
     #[cfg(test)]
     pub fn load(path: &Path) -> Store {
         Self::load_with_warning(path).0
     }
 
+    /// Reads the store file and migrates it to the current shape, whatever
+    /// vintage it turns out to be (see `migration::load`). A missing file is
+    /// simply "nothing saved yet", not an error; any other read failure is
+    /// reported but still yields a usable (empty) `Store` rather than a
+    /// crash.
     pub fn load_with_warning(path: &Path) -> (Store, Option<String>) {
         match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                // Try to parse as JSON value to detect format
-                let value: Result<serde_json::Value, _> = serde_json::from_str(&contents);
-
-                if let Ok(value) = value {
-                    // If it has "tabs" key, it's legacy format
-                    if value.get("tabs").is_some() {
-                        match serde_json::from_value::<LegacyStore>(value) {
-                            Ok(legacy) => return (migrate_legacy(legacy), None),
-                            Err(error) => {
-                                return backup_corrupt_file(path, &error.to_string());
-                            }
-                        }
-                    }
-
-                    // Check if it's a JSON object with at least one recognized key
-                    if let Some(obj) = value.as_object() {
-                        if obj.contains_key("workspaces") {
-                            // Current format; try to deserialize directly.
-                            if let Ok(store) = serde_json::from_value::<Store>(value) {
-                                return (store, None);
-                            }
-                        } else if obj.contains_key("sessions")
-                            || obj.contains_key("notes")
-                            || obj.contains_key("links")
-                            || obj.contains_key("canvas")
-                        {
-                            // Pre-workspace single-canvas format.
-                            if let Ok(pre) = serde_json::from_value::<PreWorkspaceStore>(value) {
-                                return (
-                                    wrap_single_workspace(
-                                        pre.sessions,
-                                        pre.notes,
-                                        pre.links,
-                                        pre.canvas,
-                                    ),
-                                    None,
-                                );
-                            }
-                        } else {
-                            // Valid JSON object but has no recognized keys and no "tabs"
-                            // This is ambiguous/truncated data — treat as corrupt
-                            return backup_corrupt_file(path, "unrecognized JSON structure");
-                        }
-                    } else {
-                        // JSON is not an object (e.g., array, string, number, null)
-                        return backup_corrupt_file(path, "JSON is not an object");
-                    }
-                }
-
-                // If JSON parsing itself failed, it's corrupt
-                backup_corrupt_file(path, "Invalid JSON")
-            }
+            Ok(contents) => crate::migration::load(path, &contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Store::default(), None),
             Err(error) => (
                 Store::default(),
@@ -356,57 +235,31 @@ mod tests {
             icon: Some("face-smile-symbolic".to_string()),
             accent: Some("blue".to_string()),
         };
-        let store = Store {
-            workspaces: vec![workspace.clone()],
-            active_workspace: Some(workspace.id),
-            custom_roles: vec![role.clone()],
-        };
+        let store = Store::new(
+            vec![workspace.clone()],
+            Some(workspace.id),
+            vec![role.clone()],
+        );
         store.save(&path).unwrap();
         let loaded = Store::load(&path);
+        assert_eq!(
+            loaded.schema_version,
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(loaded.workspaces, vec![workspace.clone()]);
         assert_eq!(loaded.active_workspace, Some(workspace.id));
         assert_eq!(loaded.custom_roles, vec![role]);
-    }
-
-    /// A store saved before milestone 4 has no `"custom_roles"` key and no
-    /// session record has a `"role_id"` key at all — confirms both default
-    /// to empty/`None` rather than failing to load.
-    #[test]
-    fn store_without_roles_still_loads_with_sessions_unassigned() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "workspaces": [{
-                    "id": "00000000-0000-0000-0000-000000000000",
-                    "name": "web",
-                    "root_dir": "/home/fernando",
-                    "sessions": [
-                        {"id": "00000000-0000-0000-0000-000000000001", "name": "a", "cwd": "/tmp", "agent": "Claude", "claude_session_id": null, "claude_account": null, "position": [0.0, 0.0], "size": [480.0, 320.0]}
-                    ],
-                    "notes": [],
-                    "links": [],
-                    "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
-                }],
-                "active_workspace": "00000000-0000-0000-0000-000000000000"
-            }"#,
-        )
-        .unwrap();
-        let store = Store::load(&path);
-        assert_eq!(store.workspaces[0].sessions[0].role_id, None);
-        assert!(store.custom_roles.is_empty());
     }
 
     #[test]
     fn save_creates_parent_directories() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nested").join("dir").join("store.json");
-        let store = Store {
-            workspaces: vec![sample_workspace(vec![sample_record()])],
-            active_workspace: None,
-            custom_roles: Vec::new(),
-        };
+        let store = Store::new(
+            vec![sample_workspace(vec![sample_record()])],
+            None,
+            Vec::new(),
+        );
         store.save(&path).unwrap();
         assert!(path.exists());
         assert!(!path.with_extension("json.tmp").exists());
@@ -417,107 +270,6 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("does-not-exist.json");
         assert!(Store::load(&path).workspaces.is_empty());
-    }
-
-    #[test]
-    fn load_corrupt_file_returns_empty_store() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        std::fs::write(&path, "{not valid json").unwrap();
-        assert!(Store::load(&path).workspaces.is_empty());
-        assert!(path.with_extension("corrupt.json").exists());
-    }
-
-    #[test]
-    fn loading_old_tabs_shape_migrates_into_one_default_workspace() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        std::fs::write(
-            &path,
-            r#"{"tabs": [
-                {"name": "a", "cwd": "/tmp", "agent": "Codex", "claude_session_id": null, "claude_account": null, "codex_used": true},
-                {"name": "b", "cwd": "/tmp", "agent": "Codex", "claude_session_id": null, "claude_account": null, "codex_used": true}
-            ]}"#,
-        )
-        .unwrap();
-        let store = Store::load(&path);
-        assert_eq!(store.workspaces.len(), 1);
-        let workspace = &store.workspaces[0];
-        assert_eq!(store.active_workspace, Some(workspace.id));
-        assert_eq!(workspace.sessions.len(), 2);
-        assert_ne!(workspace.sessions[0].id, workspace.sessions[1].id);
-        assert_eq!(workspace.sessions[0].position, (0.0, 0.0));
-        assert_eq!(workspace.sessions[1].position, (520.0, 0.0));
-        assert_eq!(workspace.canvas.zoom, 1.0);
-    }
-
-    /// The exact scenario the migration exists for: a user upgrading from the
-    /// single-canvas (pre-workspace) version must not lose their canvas — it
-    /// becomes one workspace, not an empty store.
-    #[test]
-    fn loading_pre_workspace_single_canvas_shape_migrates_into_one_default_workspace() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "sessions": [{"id": "00000000-0000-0000-0000-000000000000", "name": "web", "cwd": "/tmp", "agent": "Codex", "claude_session_id": null, "claude_account": null, "position": [10.0, 20.0], "size": [480.0, 320.0]}],
-                "notes": [],
-                "links": [],
-                "canvas": {"zoom": 2.0, "pan": [5.0, 6.0]}
-            }"#,
-        )
-        .unwrap();
-        let store = Store::load(&path);
-        assert_eq!(store.workspaces.len(), 1);
-        let workspace = &store.workspaces[0];
-        assert_eq!(store.active_workspace, Some(workspace.id));
-        assert_eq!(workspace.sessions.len(), 1);
-        assert_eq!(workspace.sessions[0].name, "web");
-        assert_eq!(workspace.canvas.zoom, 2.0);
-    }
-
-    #[test]
-    fn load_of_ambiguous_json_object_is_treated_as_corrupt() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        std::fs::write(&path, "{}").unwrap();
-        assert!(Store::load(&path).workspaces.is_empty());
-        assert!(path.with_extension("corrupt.json").exists());
-    }
-
-    /// Milestone 3 added three `Agent` variants alongside the original
-    /// `Claude`/`Codex` unit variants. A workspace saved by an older duet
-    /// binary has `"agent": "Claude"`/`"agent": "Codex"` as bare JSON
-    /// strings (serde's default unit-variant representation) — confirms
-    /// that literal shape still deserializes under the expanded enum with
-    /// zero migration code, i.e. existing saved sessions are preserved.
-    #[test]
-    fn old_bare_string_agent_values_still_deserialize() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("store.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "workspaces": [{
-                    "id": "00000000-0000-0000-0000-000000000000",
-                    "name": "web",
-                    "root_dir": "/home/fernando",
-                    "sessions": [
-                        {"id": "00000000-0000-0000-0000-000000000001", "name": "a", "cwd": "/tmp", "agent": "Claude", "claude_session_id": null, "claude_account": null, "position": [0.0, 0.0], "size": [480.0, 320.0]},
-                        {"id": "00000000-0000-0000-0000-000000000002", "name": "b", "cwd": "/tmp", "agent": "Codex", "claude_session_id": null, "claude_account": null, "position": [0.0, 0.0], "size": [480.0, 320.0]}
-                    ],
-                    "notes": [],
-                    "links": [],
-                    "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
-                }],
-                "active_workspace": "00000000-0000-0000-0000-000000000000"
-            }"#,
-        )
-        .unwrap();
-        let store = Store::load(&path);
-        assert_eq!(store.workspaces[0].sessions[0].agent, Agent::Claude);
-        assert_eq!(store.workspaces[0].sessions[1].agent, Agent::Codex);
     }
 
     /// A custom-provider session's `Agent::Custom { program, args }` carries
@@ -534,11 +286,7 @@ mod tests {
             args: vec!["--flag".to_string()],
         };
         let workspace = sample_workspace(vec![record.clone()]);
-        let store = Store {
-            workspaces: vec![workspace.clone()],
-            active_workspace: Some(workspace.id),
-            custom_roles: Vec::new(),
-        };
+        let store = Store::new(vec![workspace.clone()], Some(workspace.id), Vec::new());
         store.save(&path).unwrap();
         let loaded = Store::load(&path);
         assert_eq!(loaded.workspaces[0].sessions[0].agent, record.agent);

@@ -196,11 +196,11 @@ impl App {
     pub fn persist(&self) -> std::io::Result<()> {
         let mut workspaces = self.inactive_workspaces.clone();
         workspaces.push(self.snapshot_active_workspace());
-        let store = Store {
+        let store = Store::new(
             workspaces,
-            active_workspace: Some(self.workspace_id),
-            custom_roles: self.custom_roles.clone(),
-        };
+            Some(self.workspace_id),
+            self.custom_roles.clone(),
+        );
         store.save(&self.store_path)
     }
 
