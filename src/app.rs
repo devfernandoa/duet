@@ -7,12 +7,13 @@ use crate::canvas::{
 use crate::environment;
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::layout;
-use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary, now_epoch_secs};
+use crate::message::{AgentMessage, AgentSummary, LinkSummary, now_epoch_secs};
 use crate::model::{
-    EdgeRecord, EnvironmentKind, FloorRef, GroupPayload, NodeKind, NodeRecord, NotePayload,
-    NoteViewMode, TerminalPayload, TextPayload,
+    EdgeCapability, EdgeRecord, EnvironmentKind, FloorRef, GroupPayload, NodeKind, NodeRecord,
+    NotePayload, NoteViewMode, TerminalPayload, TextPayload,
 };
 use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
+use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
 use crate::role::{Role, with_role_instructions};
 use crate::runtime::{AgentActivity, SessionRuntime};
 use crate::store::{CanvasRecord, Store, WorkspaceRecord};
@@ -50,10 +51,6 @@ type NodeMove = (Uuid, (f64, f64), (f64, f64));
 /// triggering their own synchronous `File::create` + `write_all` +
 /// `sync_all` + `rename`.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
-
-/// Caps `App::messages` so a long-running duet with chatty agents doesn't
-/// grow the log unboundedly in memory.
-const MESSAGE_LOG_LIMIT: usize = 200;
 
 /// How long to wait after writing a message's text before writing the
 /// trailing `\r` that submits it. Needed because Claude/Codex's own input
@@ -179,6 +176,11 @@ pub struct NodeEntry {
     /// Whether the "exited" status badge has already been shown. Meaningless
     /// for every non-`Terminal` kind.
     pub exit_shown: bool,
+    /// The `AgentActivity` last written to a `Terminal` node's status label,
+    /// so `pump_output` only touches the widget (and triggers a relayout)
+    /// when the activity actually changed, not on every 33ms tick.
+    /// Meaningless for every non-`Terminal` kind.
+    pub last_activity: Option<AgentActivity>,
 }
 
 /// One undoable canvas edit. Each variant stores exactly what its own
@@ -267,10 +269,11 @@ pub struct App {
     /// `nodes`. See `runtime.rs`'s module doc for why this is a separate map.
     pub runtime: SessionRuntime,
     pub edges: Vec<EdgeRecord>,
-    /// A capped, in-memory log of agent-to-agent messages sent via
-    /// `control.rs` — not persisted, just enough to answer "what was just
-    /// sent".
-    pub messages: Vec<AgentMessage>,
+    /// Routing, permissions and per-agent queueing for agent-to-agent
+    /// messages — see `orchestration::bus`. Not persisted: a message is a
+    /// runtime event, not workspace state, the same reasoning that keeps
+    /// `runtime: SessionRuntime` out of `store::WorkspaceRecord`.
+    pub bus: MessageBus,
     /// Set while the user has clicked a node's link button and is waiting to
     /// click a target node to complete the edge. `None` otherwise.
     pub pending_edge_source: Option<Uuid>,
@@ -317,7 +320,7 @@ impl App {
             nodes: HashMap::new(),
             runtime: SessionRuntime::new(),
             edges: Vec::new(),
-            messages: Vec::new(),
+            bus: MessageBus::new(),
             pending_edge_source: None,
             selected_edge: None,
             selected: HashSet::new(),
@@ -410,6 +413,29 @@ impl App {
             .map(|role| role.instructions)
     }
 
+    /// Every live agent and connection in the active workspace, as a fresh
+    /// `AgentRegistry` snapshot — the one place GTK, `control.rs`'s CLI
+    /// dispatch, and `send_message` all build this view, so none of them can
+    /// compute it differently. See `orchestration::registry`'s doc comment
+    /// for why this is recomputed on demand rather than kept in sync.
+    pub fn agent_registry(&self) -> AgentRegistry {
+        let roles = self.roles();
+        let nodes: Vec<NodeRecord> = self
+            .nodes
+            .values()
+            .map(|entry| entry.record.clone())
+            .collect();
+        let identities = orchestration::agent_identities(&nodes, self.workspace_id, &roles);
+        AgentRegistry::new(identities, self.edges.clone())
+    }
+
+    /// `identity`'s own `AgentIdentity`, if it still names a live `Terminal`
+    /// node — the single lookup `agents inspect`/`send --from` resolve the
+    /// acting agent through.
+    pub fn find_agent_identity(&self, needle: &str) -> Option<AgentIdentity> {
+        self.agent_registry().resolve(needle).cloned()
+    }
+
     /// Creates a user-defined role and persists it.
     pub fn create_role(
         app: &Rc<RefCell<App>>,
@@ -428,6 +454,10 @@ impl App {
             instructions,
             icon,
             accent,
+            // Manager permissions aren't exposed in the role-editor dialog
+            // yet; a custom role starts without recruiting rights, same as
+            // every built-in role except Lead.
+            manager: false,
         });
         app.borrow().persist()?;
         Ok(())
@@ -863,18 +893,110 @@ impl App {
             for chunk in &chunks {
                 node.feed(chunk);
             }
-            if !entry.exit_shown && self.runtime.has_exited(id) {
-                // `activity` only ever distinguishes Finished/Failed from a
-                // real exit status this milestone (see `AgentActivity`'s doc
-                // comment) — safe to surface directly as the badge text.
-                let label = if self.runtime.activity(id) == AgentActivity::Failed {
-                    "failed"
-                } else {
-                    "exited"
-                };
-                node.status_label.set_text(label);
-                entry.exit_shown = true;
+            if !entry.exit_shown {
+                // Section 10: show the agent's current activity on its own
+                // card. Only touches the widget when the value actually
+                // changed, the same change-detection `pty_grid` above
+                // already uses, so this doesn't force a relayout every tick.
+                let activity = orchestration::activity::activity_for(
+                    id,
+                    true,
+                    &self.runtime,
+                    self.bus.inbox_len(id),
+                );
+                if entry.last_activity != Some(activity) {
+                    node.status_label.set_text(activity_label(activity));
+                    entry.last_activity = Some(activity);
+                }
+                if self.runtime.has_exited(id) {
+                    // `activity` distinguishes Finished/Failed from a real
+                    // exit status — safe to surface directly as the badge
+                    // text, overriding the line just above with the final
+                    // word on it.
+                    let label = if self.runtime.activity(id) == AgentActivity::Failed {
+                        "failed"
+                    } else {
+                        "exited"
+                    };
+                    node.status_label.set_text(label);
+                    entry.exit_shown = true;
+                }
             }
+        }
+    }
+
+    /// Every live agent, as `duetctl agents list`/`agents inspect` report
+    /// it — the richer view built from `agent_registry()`, distinct from
+    /// `agent_summaries` (kept for `duet agent list`'s existing shape).
+    pub fn agent_infos(&self) -> Vec<crate::message::AgentInfo> {
+        let registry = self.agent_registry();
+        registry
+            .list_agents()
+            .iter()
+            .map(|identity| crate::message::AgentInfo {
+                id: identity.id,
+                name: identity.name.clone(),
+                provider: identity.provider.display_name(),
+                role: identity.role.as_ref().map(|role| role.name.clone()),
+                manager: identity.is_manager(),
+                activity: format!(
+                    "{:?}",
+                    orchestration::activity::activity_for(
+                        identity.id,
+                        true,
+                        &self.runtime,
+                        self.bus.inbox_len(identity.id),
+                    )
+                ),
+            })
+            .collect()
+    }
+
+    /// Every edge, by both endpoints' id and name plus its capabilities —
+    /// `duetctl connections list`'s output. An endpoint that's no longer a
+    /// live node (shouldn't happen — edges are cleaned up when a node is
+    /// removed — but this is read-only reporting, not an invariant check)
+    /// shows as `"?"` rather than panicking.
+    pub fn connection_infos(&self) -> Vec<crate::message::ConnectionInfo> {
+        let label_of = |id: Uuid| {
+            self.nodes
+                .get(&id)
+                .map(|entry| {
+                    entry
+                        .record
+                        .as_terminal()
+                        .map(|terminal| terminal.name.clone())
+                        .unwrap_or_else(|| entry.record.kind.label().to_string())
+                })
+                .unwrap_or_else(|| "?".to_string())
+        };
+        self.edges
+            .iter()
+            .map(|edge| crate::message::ConnectionInfo {
+                id: edge.id,
+                source_id: edge.source,
+                source_name: label_of(edge.source),
+                target_id: edge.target,
+                target_name: label_of(edge.target),
+                capabilities: edge
+                    .capabilities
+                    .iter()
+                    .map(|cap| format!("{cap:?}"))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The active workspace's own metadata and size — `duetctl workspace
+    /// inspect`'s output.
+    pub fn workspace_info(&self) -> crate::message::WorkspaceInfo {
+        crate::message::WorkspaceInfo {
+            id: self.workspace_id,
+            name: self.workspace_name.clone(),
+            root_dir: self.workspace_root.to_string_lossy().to_string(),
+            node_count: self.nodes.len(),
+            edge_count: self.edges.len(),
+            environment: format!("{:?}", self.workspace_environment),
         }
     }
 
@@ -920,73 +1042,103 @@ impl App {
             .collect()
     }
 
-    /// Resolves `duet agent send`'s target: an exact node id, or failing
-    /// that an exact (case-sensitive) terminal name.
-    fn find_session_id(&self, target: &str) -> Option<Uuid> {
-        if let Ok(id) = Uuid::parse_str(target)
-            && self
-                .nodes
-                .get(&id)
-                .is_some_and(|e| e.record.as_terminal().is_some())
-        {
-            return Some(id);
-        }
-        self.nodes
-            .iter()
-            .find(|(_, entry)| entry.record.as_terminal().is_some_and(|t| t.name == target))
-            .map(|(id, _)| *id)
-    }
-
-    /// Delivers a structured agent-to-agent message: writes a clearly
-    /// labeled envelope into the target terminal's PTY input, and records
-    /// the attempt in `messages`.
+    /// Delivers a structured agent-to-agent message: routes it through
+    /// `bus` (permission-checked against live edges, queued per target —
+    /// see `orchestration::bus::MessageBus::send`) and immediately attempts
+    /// one dispatch, so a single `send` still resolves right away in the
+    /// common case. A target that's mid-delivery of an earlier message, or
+    /// currently offline, simply stays `Queued` for `pump_inboxes` (called
+    /// every poll tick — see `main.rs`) to pick up later.
     pub fn send_message(
         app: &Rc<RefCell<App>>,
         source_session_id: Option<Uuid>,
         target: &str,
         content: String,
     ) -> Result<AgentMessage, String> {
-        let mut app_mut = app.borrow_mut();
-        let Some(target_id) = app_mut.find_session_id(target) else {
+        let registry = app.borrow().agent_registry();
+        let Some(target_id) = registry.resolve(target).map(|identity| identity.id) else {
             return Err(format!("no agent named '{target}'"));
         };
-        let source_session_id = source_session_id.filter(|id| app_mut.nodes.contains_key(id));
-        let source_label = source_session_id
-            .and_then(|id| app_mut.nodes.get(&id))
-            .and_then(|entry| entry.record.as_terminal().map(|t| (t, entry)))
-            .map(|(terminal, _)| format!("{} ({})", terminal.name, terminal.agent.display_name()))
-            .unwrap_or_else(|| "an external sender".to_string());
-        let envelope = crate::message::message_envelope(&source_label, &content);
-        let delivered = app_mut.runtime.write_input(target_id, envelope.as_bytes());
-        let status = if delivered {
-            DeliveryStatus::Delivered
-        } else {
-            DeliveryStatus::Failed
+        let source_session_id = {
+            let app_ref = app.borrow();
+            source_session_id.filter(|id| app_ref.nodes.contains_key(id))
         };
-        if delivered {
-            let app = Rc::clone(app);
-            glib::timeout_add_local_once(MESSAGE_SUBMIT_DELAY, move || {
-                let _ = app.borrow_mut().runtime.write_input(target_id, b"\r");
-            });
+        let message =
+            app.borrow_mut()
+                .bus
+                .send(&registry, source_session_id, target_id, content)?;
+        App::pump_inboxes(app);
+        // The pump above may have already resolved this message past
+        // `Queued` — return its current status, not the stale snapshot
+        // `bus.send` handed back before any delivery was attempted.
+        Ok(app
+            .borrow()
+            .bus
+            .recent()
+            .iter()
+            .rev()
+            .find(|logged| logged.id == message.id)
+            .cloned()
+            .unwrap_or(message))
+    }
+
+    /// Attempts delivery of every agent's next queued message, if any — see
+    /// `orchestration::bus::MessageBus::next_dispatchable`. Called every
+    /// poll tick, the same shape `pump_output` already uses. An offline
+    /// target is left `Queued` for a later tick (section 9's "reconnect
+    /// behavior"); a target actually written to but reporting failure is
+    /// marked `Failed`; a successful write still waits out the existing
+    /// `MESSAGE_SUBMIT_DELAY`-separated trailing `\r` (see that constant's
+    /// doc comment) before the message counts as truly `Delivered`.
+    pub fn pump_inboxes(app: &Rc<RefCell<App>>) {
+        let ready = app.borrow_mut().bus.next_dispatchable();
+        for message in ready {
+            let dispatch = {
+                let mut app_mut = app.borrow_mut();
+                if !app_mut.runtime.is_alive(message.target) {
+                    app_mut.bus.cancel_dispatch(message.id);
+                    continue;
+                }
+                let Some(terminal) = app_mut
+                    .nodes
+                    .get(&message.target)
+                    .and_then(|entry| entry.record.as_terminal())
+                else {
+                    // The node was removed after the message was queued —
+                    // nothing left to ever deliver this to.
+                    app_mut.bus.mark_failed(message.id);
+                    continue;
+                };
+                let source_label = message
+                    .source
+                    .and_then(|id| app_mut.nodes.get(&id))
+                    .and_then(|entry| entry.record.as_terminal())
+                    .map(|terminal| {
+                        format!("{} ({})", terminal.name, terminal.agent.display_name())
+                    })
+                    .unwrap_or_else(|| "an external sender".to_string());
+                let bytes =
+                    adapter_for(&terminal.agent).format_message(&source_label, &message.content);
+                let delivered = app_mut.runtime.write_input(message.target, &bytes);
+                (message.target, message.id, delivered)
+            };
+            let (target, message_id, delivered) = dispatch;
+            if delivered {
+                let app = Rc::clone(app);
+                glib::timeout_add_local_once(MESSAGE_SUBMIT_DELAY, move || {
+                    let _ = app.borrow_mut().runtime.write_input(target, b"\r");
+                    app.borrow_mut().bus.mark_delivered(message_id);
+                });
+            } else {
+                app.borrow_mut().bus.mark_failed(message_id);
+            }
         }
-        let message = AgentMessage {
-            id: Uuid::new_v4(),
-            source: source_session_id,
-            target: target_id,
-            content,
-            timestamp: crate::message::now_epoch_secs(),
-            status,
-        };
-        app_mut.messages.push(message.clone());
-        if app_mut.messages.len() > MESSAGE_LOG_LIMIT {
-            let overflow = app_mut.messages.len() - MESSAGE_LOG_LIMIT;
-            app_mut.messages.drain(0..overflow);
-        }
-        Ok(message)
     }
 
     /// Spawns a brand-new terminal node at `viewport_center_world`, wires it,
-    /// and persists. Used by the new-session dialog in `main.rs`.
+    /// and persists. Used by the new-session dialog in `main.rs`, and by
+    /// `create_agent` (the manager-gated service `duetctl agents create`
+    /// and the GUI dialog both call into). Returns the new node's id.
     // Every parameter is an independent piece of what the new-session dialog
     // collected; bundling them into a params struct would just move the same
     // fields one level out without clarifying anything at this single call site.
@@ -1000,7 +1152,7 @@ impl App {
         role_id: Option<Uuid>,
         viewport_center_world: (f64, f64),
         toast_overlay: &adw::ToastOverlay,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Uuid> {
         let name = name.trim().to_string();
         if name.is_empty() {
             anyhow::bail!("give this session a name");
@@ -1031,6 +1183,7 @@ impl App {
                 viewport_center_world,
             )?
         };
+        let id = record.id;
         materialize_node(app, record.clone(), toast_overlay)
             .map_err(|error| anyhow::anyhow!(error))?;
         App::push_undo(
@@ -1041,7 +1194,104 @@ impl App {
             },
         );
         app.borrow().persist()?;
+        Ok(id)
+    }
+
+    /// `duetctl agents create`'s service: the same `create_session` the GUI
+    /// dialog uses, gated by manager permission when `requested_by` names an
+    /// agent (section 11: "do not give recruitment permissions to every
+    /// agent"). `requested_by: None` is the human operator via a bare shell
+    /// or the GUI, trusted the same way `send_message`'s sourceless case is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_agent(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        name: String,
+        cwd: PathBuf,
+        agent: Agent,
+        role_id: Option<Uuid>,
+        viewport_center_world: (f64, f64),
+    ) -> anyhow::Result<Uuid> {
+        App::require_manager(app, requested_by)?;
+        App::create_session(
+            app,
+            name,
+            cwd,
+            agent,
+            None,
+            role_id,
+            viewport_center_world,
+            &adw::ToastOverlay::new(),
+        )
+    }
+
+    /// `duetctl agents remove`'s service: tears down `target`'s process and
+    /// node the same way the GUI's close button does (`close_node`), gated
+    /// by manager permission exactly like `create_agent`.
+    pub fn remove_agent(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        target: Uuid,
+    ) -> anyhow::Result<()> {
+        App::require_manager(app, requested_by)?;
+        if !app.borrow().nodes.contains_key(&target) {
+            anyhow::bail!("no agent with id {target}");
+        }
+        App::close_node(app, target);
         Ok(())
+    }
+
+    /// `duetctl agents assign-role`'s service: changes an existing
+    /// terminal's `role_id` without relaunching it (a role only affects a
+    /// *future* launch's injected instructions — see `role.rs`'s doc
+    /// comment — so reassigning one doesn't restart anything), gated by
+    /// manager permission exactly like `create_agent`.
+    pub fn assign_role(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        target: Uuid,
+        role_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        App::require_manager(app, requested_by)?;
+        let role = role_id.and_then(|id| app.borrow().find_role(id));
+        {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get_mut(&target) else {
+                anyhow::bail!("no agent with id {target}");
+            };
+            let Some(terminal) = entry.record.as_terminal_mut() else {
+                anyhow::bail!("{target} is not a terminal/agent node");
+            };
+            terminal.role_id = role_id;
+            if let NodeWidget::Terminal(node) = &entry.widget {
+                node.set_role(
+                    role.as_ref().map(|role| role.name.as_str()),
+                    role.as_ref().and_then(|role| role.icon.as_deref()),
+                    role.as_ref().and_then(|role| role.accent.as_deref()),
+                );
+            }
+        }
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// `Ok(())` when `requested_by` is the human operator (`None`) or names
+    /// an agent whose assigned role has `Role::manager` set; a clear error
+    /// otherwise. The one gate every manager-only `duetctl` action checks.
+    fn require_manager(app: &Rc<RefCell<App>>, requested_by: Option<Uuid>) -> anyhow::Result<()> {
+        let Some(requested_by) = requested_by else {
+            return Ok(());
+        };
+        let app_ref = app.borrow();
+        let is_manager = app_ref
+            .agent_registry()
+            .get_agent(requested_by)
+            .is_some_and(|identity| identity.is_manager());
+        if is_manager {
+            Ok(())
+        } else {
+            anyhow::bail!("not authorized: {requested_by} does not have a manager role")
+        }
     }
 
     /// Spawns a blank Markdown note at `position`, wires it, and persists.
@@ -1124,6 +1374,15 @@ impl App {
     /// Records a logical connection between `source` and `target`. A no-op
     /// if the edge already exists, `source == target`, or either id no
     /// longer names a live node. Returns whether a new edge was recorded.
+    ///
+    /// A connection between two `Terminal` nodes is granted `SendMessages`
+    /// by default: today's only GTK edge-creation gesture (the link button)
+    /// is Terminal-only (see CLAUDE.md's Milestone 1 note), so a freshly
+    /// drawn agent-to-agent link would otherwise be visually connected but
+    /// functionally inert — there's no capability-editing UI yet to grant it
+    /// any other way. A future pass can expose revoking/editing capabilities
+    /// explicitly; until then this is the one default that makes the
+    /// existing connect gesture actually do what it visually promises.
     pub fn create_edge(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
         let mut app = app.borrow_mut();
         if source != target
@@ -1134,7 +1393,18 @@ impl App {
                 .iter()
                 .any(|e| e.source == source && e.target == target)
         {
-            let edge = EdgeRecord::visual(Uuid::new_v4(), source, target);
+            let mut edge = EdgeRecord::visual(Uuid::new_v4(), source, target);
+            let both_terminals = app
+                .nodes
+                .get(&source)
+                .is_some_and(|e| e.record.as_terminal().is_some())
+                && app
+                    .nodes
+                    .get(&target)
+                    .is_some_and(|e| e.record.as_terminal().is_some());
+            if both_terminals {
+                edge.capabilities.insert(EdgeCapability::SendMessages);
+            }
             app.edges.push(edge.clone());
             app.undo_stack.push(CanvasCommand::AddEdge { edge });
             app.redo_stack.clear();
@@ -1365,15 +1635,17 @@ impl App {
         };
         let (launch, updated) = {
             let app_ref = app.borrow();
-            let initial_prompt =
-                with_role_instructions(app_ref.role_instructions(record.role_id), Some(&summary));
+            let initial_prompt = orchestration::env::with_discovery(with_role_instructions(
+                app_ref.role_instructions(record.role_id),
+                Some(&summary),
+            ));
             if matches!(to, Agent::Claude) {
                 let account = crate::account::DEFAULT_ACCOUNT.to_string();
                 let config_dir = app_ref.accounts.ensure(&account)?;
                 let session_id = Uuid::new_v4();
                 let launch = with_session_env(
                     to.launch(LaunchRequest {
-                        initial_prompt: initial_prompt.as_deref(),
+                        initial_prompt: Some(&initial_prompt),
                         claude_session_id: Some(session_id),
                         claude_config_dir: Some(&config_dir),
                         ..Default::default()
@@ -1388,7 +1660,7 @@ impl App {
             } else {
                 let launch = with_session_env(
                     to.launch(LaunchRequest {
-                        initial_prompt: initial_prompt.as_deref(),
+                        initial_prompt: Some(&initial_prompt),
                         ..Default::default()
                     }),
                     id,
@@ -1400,6 +1672,24 @@ impl App {
                 (launch, updated)
             }
         };
+        let identity = AgentIdentity {
+            id,
+            terminal_id: id,
+            workspace_id: app.borrow().workspace_id,
+            floor: FloorRef::Ground,
+            name: updated.name.clone(),
+            provider: updated.agent.clone(),
+            role: updated
+                .role_id
+                .and_then(|role_id| app.borrow().find_role(role_id)),
+        };
+        let socket_path = crate::store::default_control_socket_path()?;
+        let launch = orchestration::env::apply(
+            launch,
+            &identity,
+            &app.borrow().workspace_name,
+            &socket_path,
+        );
         let prepared = environment::prepare_launch(updated.environment, id, launch);
         app.borrow_mut()
             .runtime
@@ -2684,6 +2974,7 @@ fn materialize_node(
             widget,
             pty_grid: None,
             exit_shown: false,
+            last_activity: None,
         },
     );
     wire_node_chrome(app, id);
@@ -2736,13 +3027,15 @@ fn resolve_claude_account(
 }
 
 /// Builds the `Launch` for (re)starting a `Terminal` node's process from its
-/// persisted payload — account resolution and the resume flag, shared by
-/// `materialize_node` (first spawn, restore, and background reattach) and
-/// `restart_selected_terminals` (explicit respawn) so that logic lives in
-/// exactly one place. Does NOT apply `environment::prepare_launch` — callers
-/// do that themselves, since which environment applies differs by caller
-/// (always `terminal.environment` today, but keeping it a separate step
-/// keeps this function usable for a future override).
+/// persisted payload — account resolution, the resume flag, role
+/// instructions, and the orchestration env/discovery text (section 8),
+/// shared by `materialize_node` (first spawn, restore, and background
+/// reattach) and `restart_selected_terminals` (explicit respawn) so that
+/// logic lives in exactly one place. Does NOT apply
+/// `environment::prepare_launch` — callers do that themselves, since which
+/// environment applies differs by caller (always `terminal.environment`
+/// today, but keeping it a separate step keeps this function usable for a
+/// future override).
 fn build_terminal_launch(
     app: &App,
     id: Uuid,
@@ -2753,15 +3046,58 @@ fn build_terminal_launch(
         Agent::Claude => terminal.claude_session_id.is_some(),
         _ => true,
     };
-    Ok(with_session_env(
+    // Every launch (fresh, resumed, or reattached) carries its role's
+    // instructions plus the orchestration discovery text — see
+    // `orchestration::env`'s doc comment. Providers that don't consult
+    // `initial_prompt` at all (OpenCode/Shell/Custom — see `agent.rs`'s own
+    // launch builders) simply ignore it.
+    let role_prompt = with_role_instructions(app.role_instructions(terminal.role_id), None);
+    let initial_prompt = orchestration::env::with_discovery(role_prompt);
+    let launch = with_session_env(
         terminal.agent.launch(LaunchRequest {
             resume,
+            initial_prompt: Some(&initial_prompt),
             claude_session_id: terminal.claude_session_id,
             claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
-            ..Default::default()
         }),
         id,
+    );
+    let identity = AgentIdentity {
+        id,
+        terminal_id: id,
+        workspace_id: app.workspace_id,
+        // Every node is `FloorRef::Ground` until Milestone 9 introduces real
+        // floors, so there's no persisted floor to read here yet.
+        floor: FloorRef::Ground,
+        name: terminal.name.clone(),
+        provider: terminal.agent.clone(),
+        role: terminal.role_id.and_then(|role_id| app.find_role(role_id)),
+    };
+    let socket_path = crate::store::default_control_socket_path()?;
+    Ok(orchestration::env::apply(
+        launch,
+        &identity,
+        &app.workspace_name,
+        &socket_path,
     ))
+}
+
+/// Short, user-facing text for a terminal card's status label — section 10:
+/// "expose activity in useful existing UI locations." `Unknown` shows
+/// nothing rather than a guess, the same "Unknown is better than false
+/// confidence" reasoning `AgentActivity` itself documents.
+fn activity_label(activity: AgentActivity) -> &'static str {
+    match activity {
+        AgentActivity::Unknown => "",
+        AgentActivity::Starting => "starting",
+        AgentActivity::Idle => "idle",
+        AgentActivity::Working => "working",
+        AgentActivity::AwaitingUser => "awaiting input",
+        AgentActivity::AwaitingAgent => "awaiting reply",
+        AgentActivity::Finished => "finished",
+        AgentActivity::Failed => "failed",
+        AgentActivity::Offline => "offline",
+    }
 }
 
 /// Looks up `role_id` and updates `node`'s title-bar badge to match.

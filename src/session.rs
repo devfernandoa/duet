@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
+use std::time::Instant;
 
 const OUTPUT_TAIL_LIMIT: usize = 512;
 
@@ -29,6 +30,11 @@ pub struct Session {
     exit_status: Option<portable_pty::ExitStatus>,
     missing_conversation: bool,
     output_tail: String,
+    /// When this session last actually produced output, for
+    /// `orchestration::activity`'s Working/Idle distinction. `None` until the
+    /// first chunk arrives — the honest "hasn't said anything yet" state a
+    /// freshly-spawned process starts in.
+    last_output_at: Option<Instant>,
 }
 
 impl Session {
@@ -76,6 +82,7 @@ impl Session {
             exit_status: None,
             missing_conversation: false,
             output_tail: String::new(),
+            last_output_at: None,
         })
     }
 
@@ -101,6 +108,7 @@ impl Session {
     pub fn try_recv_output(&mut self) -> Vec<Vec<u8>> {
         let mut chunks = Vec::new();
         while let Ok(chunk) = self.output_rx.try_recv() {
+            self.last_output_at = Some(Instant::now());
             self.output_tail
                 .push_str(&String::from_utf8_lossy(&chunk).to_ascii_lowercase());
             trim_output_tail(&mut self.output_tail);
@@ -123,6 +131,14 @@ impl Session {
 
     pub fn exit_status(&self) -> Option<&portable_pty::ExitStatus> {
         self.exit_status.as_ref()
+    }
+
+    /// Seconds since this session last produced output, refreshed only as a
+    /// side effect of `try_recv_output` (same caveat as `exit_status`).
+    /// `None` before its first output ever arrives.
+    pub fn seconds_since_output(&self) -> Option<f64> {
+        self.last_output_at
+            .map(|instant| instant.elapsed().as_secs_f64())
     }
 
     pub fn kill(&mut self) {
