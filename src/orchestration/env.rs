@@ -9,25 +9,19 @@ use std::path::Path;
 
 /// One short paragraph telling a freshly-launched agent that `duetctl`
 /// exists and how to use it — section 8: "Keep injected context compact."
-/// Used for every provider without an installed Duet skill (Codex,
-/// OpenCode, Shell, Custom — see `skill.rs`'s doc comment on why that's
-/// Claude-only today). Not a tutorial: just enough that the agent knows to
-/// look, the same way a `man` page's one-line summary is enough to know
-/// whether to read further.
+/// Sent only once, on a terminal's actual first-ever launch (see
+/// `model::TerminalPayload::never_launched`), and only for providers with
+/// no installed Duet skill to rely on instead (Codex, OpenCode, Shell,
+/// Custom — see `skill.rs`'s doc comment on why that's Claude-only today).
+/// A Claude launch with its skill installed gets no prompt at all: the
+/// skill's own description ("use at the very start of every session,
+/// before responding to anything else") is what's supposed to make it
+/// self-trigger, the same way any other skill does — a synthetic nudge on
+/// top of that would just be a redundant extra turn.
 pub const DISCOVERY_INSTRUCTION: &str = "You are running inside Duet, a multi-agent workspace. \
 Run `duetctl whoami` to see your own role and who you're connected to, `duetctl agents list` \
 to see every agent, and `duetctl send --to <agent> \"message\"` to message one you're connected \
 to (your id is already in $DUET_AGENT_ID).";
-
-/// What a Claude launch gets instead, once its `duet` skill (see
-/// `skill.rs`) has been installed — a pointer rather than the content
-/// itself, since the skill is already the content. This is the whole
-/// point of the skill: a few words resent every launch instead of the full
-/// `DISCOVERY_INSTRUCTION` (and, before this, the role's full instructions
-/// too — now looked up on demand via `duetctl whoami` instead of resent as
-/// a prompt).
-pub const SKILL_POINTER: &str = "You are running inside Duet. Before responding to anything else, use your `duet` skill \
-(run `duetctl whoami`) to learn your role and who you're connected to.";
 
 /// The `DUET_*` variables section 8 asks every launched agent to receive.
 /// `DUET_FLOOR_ID` is `"ground"` until Milestone 9 introduces real floors —
@@ -71,21 +65,21 @@ pub fn env_vars(
     ]
 }
 
-/// Prepends the discovery text to whatever prompt content a launch already
-/// carries (a handoff summary, or nothing for a brand-new session) —
-/// always present, since an agent needs to learn how to reach `duetctl` on
-/// its very first launch. `skill_installed` picks `SKILL_POINTER` (Claude,
-/// once `skill::install` has run) over the fuller `DISCOVERY_INSTRUCTION`
-/// (every other provider).
-pub fn with_discovery(prompt: Option<String>, skill_installed: bool) -> String {
-    let discovery = if skill_installed {
-        SKILL_POINTER
-    } else {
-        DISCOVERY_INSTRUCTION
-    };
-    match prompt {
-        Some(existing) => format!("{discovery}\n\n{existing}"),
-        None => discovery.to_string(),
+/// Prepends `DISCOVERY_INSTRUCTION` to `base` (a handoff summary, or
+/// nothing for a brand-new session) — unless `skill_installed`, in which
+/// case nothing is prepended at all, trusting the installed skill to
+/// trigger on its own. Callers only invoke this for a terminal's actual
+/// first-ever launch (`never_launched`); every later relaunch of the same
+/// terminal passes `None` through unconditionally instead of calling this
+/// at all, since a returning agent already knows and resending would just
+/// add a stray synthetic turn to its real conversation.
+pub fn discovery_prompt(base: Option<&str>, skill_installed: bool) -> Option<String> {
+    let discovery = (!skill_installed).then_some(DISCOVERY_INSTRUCTION);
+    match (discovery, base) {
+        (None, None) => None,
+        (None, Some(base)) => Some(base.to_string()),
+        (Some(discovery), None) => Some(discovery.to_string()),
+        (Some(discovery), Some(base)) => Some(format!("{discovery}\n\n{base}")),
     }
 }
 
@@ -155,23 +149,30 @@ mod tests {
     }
 
     #[test]
-    fn discovery_instruction_is_prepended_not_replacing_existing_prompt() {
-        let combined = with_discovery(Some("Continuing from before.".to_string()), false);
+    fn no_skill_prepends_discovery_instruction_to_an_existing_base() {
+        let combined = discovery_prompt(Some("Continuing from before."), false).unwrap();
         assert!(combined.starts_with(DISCOVERY_INSTRUCTION));
         assert!(combined.ends_with("Continuing from before."));
     }
 
     #[test]
-    fn discovery_instruction_stands_alone_with_no_existing_prompt() {
-        assert_eq!(with_discovery(None, false), DISCOVERY_INSTRUCTION);
+    fn no_skill_and_no_base_is_just_the_discovery_instruction() {
+        assert_eq!(
+            discovery_prompt(None, false).as_deref(),
+            Some(DISCOVERY_INSTRUCTION)
+        );
     }
 
     #[test]
-    fn skill_installed_uses_the_short_pointer_instead() {
-        let combined = with_discovery(Some("Continuing from before.".to_string()), true);
-        assert!(combined.starts_with(SKILL_POINTER));
-        assert!(combined.contains("duetctl whoami"));
-        assert!(combined.ends_with("Continuing from before."));
-        assert_eq!(with_discovery(None, true), SKILL_POINTER);
+    fn an_installed_skill_is_trusted_with_no_prompt_at_all() {
+        assert_eq!(discovery_prompt(None, true), None);
+    }
+
+    #[test]
+    fn an_installed_skill_still_passes_a_real_base_through_unprefixed() {
+        assert_eq!(
+            discovery_prompt(Some("Continuing from before."), true).as_deref(),
+            Some("Continuing from before.")
+        );
     }
 }
