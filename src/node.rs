@@ -131,8 +131,11 @@ fn role_badge_widgets() -> (gtk4::Box, gtk4::Image, gtk4::Label) {
 }
 
 /// The full text of a `GtkTextBuffer`, for reading back whatever the user
-/// typed/edited — shared by every text-bearing node kind below.
-fn buffer_text(buffer: &gtk4::TextBuffer) -> String {
+/// typed/edited — shared by every text-bearing node kind below, and by
+/// `app.rs`'s own buffer-changed handlers (which already have the buffer in
+/// hand as the signal's own argument, so they can read it directly instead
+/// of re-borrowing `App` to look the widget back up).
+pub(crate) fn buffer_text(buffer: &gtk4::TextBuffer) -> String {
     buffer
         .text(&buffer.start_iter(), &buffer.end_iter(), false)
         .to_string()
@@ -520,12 +523,6 @@ impl NoteNode {
         node
     }
 
-    /// The Markdown source — always available and always the single source
-    /// of truth; Preview is derived from this, never the other way round.
-    pub fn markdown(&self) -> String {
-        buffer_text(&self.edit_view.buffer())
-    }
-
     pub fn set_view_mode(&self, mode: crate::model::NoteViewMode) {
         use crate::model::NoteViewMode;
         let (edit_visible, preview_visible) = match mode {
@@ -601,10 +598,6 @@ impl TextNode {
             close_button,
             resize_handle,
         }
-    }
-
-    pub fn text(&self) -> String {
-        buffer_text(&self.text_view.buffer())
     }
 }
 

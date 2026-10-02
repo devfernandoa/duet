@@ -2264,12 +2264,12 @@ fn materialize_node(
             );
             node.edit_view.buffer().connect_changed({
                 let app = Rc::clone(app);
-                move |_| {
+                move |buffer| {
+                    let markdown = crate::node::buffer_text(buffer);
                     if let Some(entry) = app.borrow_mut().nodes.get_mut(&id)
                         && let Some(note) = entry.record.as_note_mut()
                     {
-                        note.markdown = entry_markdown(&app, id);
-                        let _ = note;
+                        note.markdown = markdown;
                     }
                     App::schedule_persist(&app);
                 }
@@ -2311,8 +2311,8 @@ fn materialize_node(
             });
             node.text_view.buffer().connect_changed({
                 let app = Rc::clone(app);
-                move |_| {
-                    let content = entry_text(&app, id);
+                move |buffer| {
+                    let content = crate::node::buffer_text(buffer);
                     if let Some(entry) = app.borrow_mut().nodes.get_mut(&id)
                         && let NodeKind::Text(text) = &mut entry.record.kind
                     {
@@ -2364,27 +2364,6 @@ fn materialize_node(
     );
     wire_node_chrome(app, id);
     Ok(())
-}
-
-/// Reads back a note's current Markdown source from its live widget — used
-/// right after an edit to keep `NodeRecord::as_note_mut().markdown` in sync
-/// without the buffer's `connect_changed` handler needing to borrow `app`
-/// twice (once for the widget, once for the record).
-fn entry_markdown(app: &Rc<RefCell<App>>, id: Uuid) -> String {
-    let app_ref = app.borrow();
-    match app_ref.nodes.get(&id).map(|e| &e.widget) {
-        Some(NodeWidget::Note(node)) => node.markdown(),
-        _ => String::new(),
-    }
-}
-
-/// Same idea as `entry_markdown`, for a `Text` node's plain content.
-fn entry_text(app: &Rc<RefCell<App>>, id: Uuid) -> String {
-    let app_ref = app.borrow();
-    match app_ref.nodes.get(&id).map(|e| &e.widget) {
-        Some(NodeWidget::Text(node)) => node.text(),
-        _ => String::new(),
-    }
 }
 
 /// Spawns one `NodeEntry` per record into the (already-cleared) canvas via
@@ -2551,5 +2530,60 @@ mod tests {
         let note = note_record();
         materialize_node(&app, note.clone(), &toast_overlay).unwrap();
         assert!(app.borrow().nodes.contains_key(&note.id));
+    }
+
+    /// Regression test for a RefCell double-borrow panic found in review: a
+    /// `Note` node's `edit_view` buffer-changed handler held an
+    /// `app.borrow_mut()` live (via an `if let` scrutinee's extended
+    /// temporary lifetime) while calling a helper that itself did
+    /// `app.borrow()` — "already mutably borrowed" on every keystroke, which
+    /// crashed instantly since `create_note` defaults a new note to Edit
+    /// mode. Typing into the live `edit_view` buffer (as a user keystroke
+    /// would) is what actually exercises this path; the sibling test above
+    /// only materializes the node without touching its buffer, so it alone
+    /// would not have caught this.
+    #[test]
+    #[ignore = "needs a display"]
+    fn typing_into_a_note_does_not_panic() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let toast_overlay = adw::ToastOverlay::new();
+
+        let mut note = note_record();
+        note.kind = NodeKind::Note(NotePayload {
+            markdown: String::new(),
+            color: "yellow".to_string(),
+            view_mode: NoteViewMode::Edit,
+        });
+        let id = note.id;
+        materialize_node(&app, note, &toast_overlay).unwrap();
+
+        let edit_view = {
+            let app_ref = app.borrow();
+            let NodeWidget::Note(note_node) = &app_ref.nodes.get(&id).unwrap().widget else {
+                panic!("expected a Note widget");
+            };
+            note_node.edit_view.clone()
+        };
+        // Triggers `connect_changed` exactly as a keystroke would.
+        edit_view.buffer().set_text("hello");
+
+        assert_eq!(
+            app.borrow()
+                .nodes
+                .get(&id)
+                .unwrap()
+                .record
+                .as_note()
+                .unwrap()
+                .markdown,
+            "hello"
+        );
     }
 }
