@@ -133,12 +133,19 @@ impl NodeWidget {
     }
 
     /// Applies a size mid-drag. A `Terminal` additionally keeps the VTE
-    /// character grid in step (see `SessionNode::request_grid`); every other
-    /// kind just requests a widget size.
+    /// character grid in step (see `SessionNode::request_grid`); a `Note`
+    /// additionally schedules a Preview re-render (see
+    /// `NoteNode::refresh_preview_after_resize`'s doc comment for why a
+    /// resize needs that); every other kind just requests a widget size.
     fn apply_resize(&self, size: (f64, f64)) {
         match self {
             NodeWidget::Terminal(node) => node.request_grid(size.0, size.1),
-            NodeWidget::Note(_) | NodeWidget::Text(_) | NodeWidget::Placeholder(_) => {
+            NodeWidget::Note(node) => {
+                self.container()
+                    .set_size_request(size.0 as i32, size.1 as i32);
+                node.refresh_preview_after_resize();
+            }
+            NodeWidget::Text(_) | NodeWidget::Placeholder(_) => {
                 self.container()
                     .set_size_request(size.0 as i32, size.1 as i32);
             }
@@ -1923,10 +1930,28 @@ impl App {
     pub fn align_bottom(app: &Rc<RefCell<App>>) {
         App::apply_layout(app, layout::align_bottom);
     }
-    pub fn distribute_horizontal(app: &Rc<RefCell<App>>) {
+    /// Below 3 selected nodes, `layout::distribute_horizontal` is a
+    /// documented no-op (there's nothing "in between" two fixed ends to
+    /// redistribute) — but a silent no-op reads indistinguishably from a
+    /// broken command, so this surfaces a toast explaining why nothing
+    /// moved instead of leaving `apply_layout` to do nothing quietly.
+    pub fn distribute_horizontal(app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) {
+        if app.borrow().selected.len() < 3 {
+            toast_overlay.add_toast(adw::Toast::new(
+                "Select at least 3 nodes to distribute horizontally",
+            ));
+            return;
+        }
         App::apply_layout(app, layout::distribute_horizontal);
     }
-    pub fn distribute_vertical(app: &Rc<RefCell<App>>) {
+    /// Vertical counterpart of [`App::distribute_horizontal`].
+    pub fn distribute_vertical(app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) {
+        if app.borrow().selected.len() < 3 {
+            toast_overlay.add_toast(adw::Toast::new(
+                "Select at least 3 nodes to distribute vertically",
+            ));
+            return;
+        }
         App::apply_layout(app, layout::distribute_vertical);
     }
 

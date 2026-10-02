@@ -187,6 +187,33 @@ impl Canvas {
         }
         fixed.add_controller(drag);
 
+        // `EventControllerScroll`'s own `scroll` signal carries only a delta
+        // (`dx`, `dy`), never a position, and `GdkEvent::position()` on its
+        // current event is unreliable for a scroll (observed returning
+        // `None` outright for some scroll sources) — falling back to a fixed
+        // `(0.0, 0.0)` whenever that happened is what made zooming read as
+        // "always drifts toward a corner" instead of staying under the
+        // cursor. An `EventControllerMotion` on the same widget, by
+        // contrast, reports the pointer's position directly in `fixed`'s own
+        // local coordinates on every real motion event — tracking the most
+        // recent one here and reading it from the scroll handler is the
+        // standard GTK4 way to give a controller that has no position of its
+        // own a reliable one.
+        let pointer_position: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((0.0, 0.0)));
+        let motion = gtk4::EventControllerMotion::new();
+        // Capture (not the default Bubble) so this reliably sees pointer
+        // motion over every card too, not just empty canvas — a child
+        // widget's own controllers never get a chance to stop a Capture-
+        // phase observer from seeing the event first.
+        motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        {
+            let pointer_position = Rc::clone(&pointer_position);
+            motion.connect_motion(move |_controller, x, y| {
+                *pointer_position.borrow_mut() = (x, y);
+            });
+        }
+        fixed.add_controller(motion);
+
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         // A terminal consumes its own scrolls for scrollback before this
         // bubble-phase canvas handler sees them. On empty canvas, the wheel
@@ -197,15 +224,13 @@ impl Canvas {
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
-            scroll.connect_scroll(move |controller, _dx, dy| {
+            let pointer_position = Rc::clone(&pointer_position);
+            scroll.connect_scroll(move |_controller, _dx, dy| {
                 let mut state = state.borrow_mut();
                 // Preserve the world-space point under the pointer, rather
                 // than scaling from the canvas origin. This makes the card or
                 // empty region the user is looking at stay under the cursor.
-                let cursor = controller
-                    .current_event()
-                    .and_then(|event| event.position())
-                    .unwrap_or((0.0, 0.0));
+                let cursor = *pointer_position.borrow();
                 let world = screen_to_world(cursor, state.pan, state.zoom);
                 state.zoom *= if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
                 state.clamp_zoom();
@@ -247,13 +272,29 @@ impl Canvas {
 
     /// Multiplies the zoom by `ZOOM_STEP` (`steps` positive zooms in,
     /// negative out), the keyboard equivalent of Ctrl+scroll. Wired to
-    /// Ctrl+Plus/Ctrl+Minus in `main.rs`, because a modifier+scroll gesture
-    /// is not discoverable — the user asked to be able to zoom without ever
-    /// finding the one that already existed.
+    /// Ctrl+Plus/Ctrl+Minus and the zoom in/out buttons in `main.rs`, because
+    /// a modifier+scroll gesture is not discoverable — the user asked to be
+    /// able to zoom without ever finding the one that already existed.
+    /// Neither a keyboard shortcut nor a toolbar button has a pointer
+    /// position to anchor on the way scroll-to-zoom does, so this anchors on
+    /// the viewport's own center instead of leaving `pan` untouched — the
+    /// previous behavior effectively anchored on the world origin, which
+    /// (whenever the current `pan` has scrolled that point away from the
+    /// viewport's center) reads as "zooming drifts everything toward a
+    /// corner" rather than zooming on what's actually in view.
     pub fn zoom_by_steps(&self, steps: i32) {
         let mut state = self.state.borrow_mut();
+        let center = (
+            self.fixed.width() as f64 / 2.0,
+            self.fixed.height() as f64 / 2.0,
+        );
+        let world = screen_to_world(center, state.pan, state.zoom);
         state.zoom *= ZOOM_STEP.powi(steps);
         state.clamp_zoom();
+        state.pan = (
+            center.0 / state.zoom - world.0,
+            center.1 / state.zoom - world.1,
+        );
         apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
     }
 

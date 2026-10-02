@@ -108,3 +108,17 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
     outline-offset: 2px;
     box-shadow: 0 0 0 5px rgba(53, 132, 228, 0.25);
 }
+
+/* A Markdown thematic break (`markdown::render_to_buffer`), a real
+   `GtkSeparator` anchored into the note's text buffer so it always spans the
+   note's current width exactly. The default GtkSeparator color is too
+   subtle against a pastel note background (the same class of invisible-by-
+   default problem `.card.selected` above exists to fix) and a bare 1px line
+   butted right against the surrounding lines reads as a stray pixel rather
+   than a deliberate divider, hence the explicit color and vertical margin. */
+.md-rule {
+    background-color: #8a8a8a;
+    min-height: 2px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+}
