@@ -1,27 +1,51 @@
 //! Owns every live session's PTY/process handle, independent of the
-//! persisted record that describes it (`store.rs::SessionRecord`) and the
+//! persisted record that describes it (`store.rs::WorkspaceRecord`) and the
 //! GTK widget that displays it (`node.rs::SessionNode`). `App` holds one
-//! `SessionRuntime` alongside its `sessions: HashMap<Uuid, SessionEntry>` —
-//! the two maps share the same `Uuid` keys (a session's identity is that
-//! id, not the `Session`/`SessionNode` instance), but neither owns the
-//! other.
+//! `SessionRuntime` alongside its `nodes: HashMap<Uuid, NodeEntry>` — the two
+//! maps share the same `Uuid` keys (a session's identity is that id, not the
+//! `Session`/`SessionNode` instance), but neither owns the other, and
+//! `nodes` only ever holds the *active* workspace's entries while this
+//! registry holds every live session regardless of which workspace (if any)
+//! currently has it on screen.
 //!
 //! This is a boundary around *what a running session is*: spawn it, send it
-//! input, resize it, tell whether it exited, terminate it. It is
-//! deliberately not yet a registry that outlives a workspace switch —
-//! `App::teardown_active_workspace` still terminates every session when the
-//! active workspace changes, exactly as it did before this module existed.
-//! See the crate-level note in `app.rs` near `teardown_active_workspace` for
-//! what Milestone 2's background workspaces will need to change here (in
-//! short: stop terminating on switch, and key a single app-wide
-//! `SessionRuntime` by session id only, independent of which workspace is
-//! currently showing its widgets).
+//! input, resize it, tell whether it exited, terminate it. Since Milestone 2
+//! it genuinely outlives a workspace switch — `App::detach_active_workspace`
+//! removes a workspace's widgets without calling `terminate`, so a session
+//! started here keeps running in the background until something explicitly
+//! terminates it (`App::teardown_active_workspace` on real deletion,
+//! `App::unload_workspace`, `App::close_node`, or one of the explicit
+//! terminate/restart terminal actions). `is_alive`/`live_ids` are what let a
+//! caller tell "still running in the background" apart from "never spawned
+//! or already gone" without guessing from `App::nodes` membership, which
+//! only reflects the active workspace.
 
 use crate::agent::Launch;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// What's knowable right now about a session's agent, without inspecting
+/// terminal output — that kind of detection (idle vs. working vs. awaiting
+/// input) is explicitly deferred to Milestone 3. `Unknown` is the honest
+/// default for anything still running; `Finished`/`Failed` are the only
+/// other values this milestone ever actually produces, derived from a real
+/// exit status. The remaining variants exist now so Milestone 3's real
+/// detection work doesn't need another enum migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Reserved for Milestone 3's real activity detection.
+pub enum AgentActivity {
+    Unknown,
+    Starting,
+    Idle,
+    Working,
+    AwaitingUser,
+    AwaitingAgent,
+    Finished,
+    Failed,
+    Offline,
+}
 
 /// The live half of a session: not persisted, not a GTK widget, just "is
 /// there a process running, and what does its PTY say". Keyed by the same
@@ -85,6 +109,39 @@ impl SessionRuntime {
             .is_some_and(|session| session.exit_status().is_some())
     }
 
+    /// Whether `id` names a session this registry is currently tracking,
+    /// alive or exited-but-not-yet-terminated. `materialize_node` uses this
+    /// to tell "this workspace's terminal is already running in the
+    /// background, just reattach a widget to it" apart from "spawn a fresh
+    /// process" — the core of switching workspaces without killing anything.
+    pub fn is_alive(&self, id: Uuid) -> bool {
+        self.sessions.contains_key(&id)
+    }
+
+    /// Every id this registry is currently tracking, regardless of which
+    /// workspace (if any) has it visible. Used to drain backgrounded
+    /// sessions' output so their PTY's output channel doesn't grow without
+    /// bound while nobody's watching — see `App::pump_output`.
+    pub fn live_ids(&self) -> Vec<Uuid> {
+        self.sessions.keys().copied().collect()
+    }
+
+    /// What's knowable about `id`'s agent right now. See [`AgentActivity`]'s
+    /// doc comment for why only `Unknown`/`Finished`/`Failed` are ever
+    /// actually returned.
+    pub fn activity(&self, id: Uuid) -> AgentActivity {
+        match self.sessions.get(&id).and_then(Session::exit_status) {
+            None => AgentActivity::Unknown,
+            Some(status) => {
+                if status.success() {
+                    AgentActivity::Finished
+                } else {
+                    AgentActivity::Failed
+                }
+            }
+        }
+    }
+
     /// Kills `id`'s process (if any) and stops tracking it. A no-op when
     /// `id` names no live session — every call site that used to do
     /// `if let Some(entry) = ... { entry.session.kill(); }` collapses to an
@@ -142,5 +199,83 @@ mod tests {
         runtime.spawn(id, std::env::temp_dir(), sleeper()).unwrap();
         assert!(runtime.write_input(id, b"\n"));
         runtime.terminate(id);
+    }
+
+    /// The exact predicate `materialize_node` relies on to decide "reattach
+    /// to the already-running process" vs. "spawn a fresh one" when a
+    /// workspace comes back from the background.
+    #[test]
+    fn is_alive_and_live_ids_reflect_tracked_sessions_independent_of_any_workspace() {
+        let mut runtime = SessionRuntime::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(!runtime.is_alive(a));
+
+        runtime.spawn(a, std::env::temp_dir(), sleeper()).unwrap();
+        runtime.spawn(b, std::env::temp_dir(), sleeper()).unwrap();
+        assert!(runtime.is_alive(a));
+        assert!(runtime.is_alive(b));
+        let mut ids = runtime.live_ids();
+        ids.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        runtime.terminate(a);
+        assert!(!runtime.is_alive(a));
+        assert!(runtime.is_alive(b));
+        assert_eq!(runtime.live_ids(), vec![b]);
+        runtime.terminate(b);
+    }
+
+    #[test]
+    fn activity_is_unknown_until_exit_then_reflects_success_or_failure() {
+        let mut runtime = SessionRuntime::new();
+        let id = Uuid::new_v4();
+        assert_eq!(runtime.activity(id), AgentActivity::Unknown); // never spawned
+        runtime.spawn(id, std::env::temp_dir(), sleeper()).unwrap();
+        assert_eq!(runtime.activity(id), AgentActivity::Unknown); // still running
+
+        let ok = Uuid::new_v4();
+        runtime
+            .spawn(
+                ok,
+                std::env::temp_dir(),
+                Launch {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 0".to_string()],
+                    envs: vec![],
+                },
+            )
+            .unwrap();
+        let fail = Uuid::new_v4();
+        runtime
+            .spawn(
+                fail,
+                std::env::temp_dir(),
+                Launch {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 1".to_string()],
+                    envs: vec![],
+                },
+            )
+            .unwrap();
+        // Give both short-lived processes a moment to actually exit. Exit
+        // status is only refreshed as a side effect of `try_recv_output`
+        // (see `Session::try_recv_output`'s `child.try_wait()` call), so the
+        // poll loop has to drive that, not just read `has_exited`.
+        for _ in 0..200 {
+            runtime.try_recv_output(ok);
+            runtime.try_recv_output(fail);
+            if runtime.has_exited(ok) && runtime.has_exited(fail) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(runtime.activity(ok), AgentActivity::Finished);
+        assert_eq!(runtime.activity(fail), AgentActivity::Failed);
+        runtime.terminate(id);
+        runtime.terminate(ok);
+        runtime.terminate(fail);
     }
 }

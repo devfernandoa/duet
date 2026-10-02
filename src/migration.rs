@@ -14,13 +14,21 @@
 //!   Files written before the `schema_version` field existed have this shape
 //!   but no `"schema_version"` key at all; they are treated as 3, since 3 is
 //!   the only version this shape has ever had.
-//! - 4 (current): each workspace holds generic `nodes`/`edges`
+//! - 4: each workspace holds generic `nodes`/`edges`
 //!   (`model::NodeRecord`/`model::EdgeRecord`) instead of the kind-specific
 //!   `sessions`/`notes`/`links` — Milestone 1's generalized canvas model. A
 //!   schema-3 session becomes a `Terminal` node, a sticky note becomes a
 //!   `Note` node (its plain text becoming Markdown source unchanged — plain
 //!   text is already valid Markdown), and a link becomes a visual-only
 //!   (empty-capability) edge.
+//! - 5 (current): purely additive — Milestone 2's runtime-survival work adds
+//!   `TerminalPayload::environment` and `WorkspaceRecord::{environment,
+//!   color, icon, created_at, last_opened}`. Every new field is
+//!   `#[serde(default)]`, so a schema-4 file (which has none of them)
+//!   deserializes directly as the current `Store` with no dedicated
+//!   conversion step — unlike schema 3 -> 4, the on-disk *shape* of a node
+//!   didn't change, only which optional fields a `WorkspaceRecord`/
+//!   `TerminalPayload` may carry.
 //!
 //! A `schema_version` *greater* than [`CURRENT_SCHEMA_VERSION`] means the
 //! file was written by a newer duet. Rather than guess at a shape it has
@@ -30,7 +38,8 @@
 
 use crate::agent::Agent;
 use crate::model::{
-    EdgeRecord, FloorRef, NodeKind, NodeRecord, NotePayload, NoteViewMode, TerminalPayload,
+    EdgeRecord, EnvironmentKind, FloorRef, NodeKind, NodeRecord, NotePayload, NoteViewMode,
+    TerminalPayload,
 };
 use crate::role::Role;
 use crate::store::{CanvasRecord, Store, WorkspaceRecord};
@@ -40,7 +49,7 @@ use uuid::Uuid;
 
 /// The schema version this binary reads and writes. Bump this and add a
 /// migration step below whenever `Store`'s on-disk shape changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Plain-function form of [`CURRENT_SCHEMA_VERSION`], for serde's
 /// `#[serde(default = "...")]` attribute on `Store::schema_version` (which
@@ -164,6 +173,7 @@ fn convert_session(session: V3SessionRecord) -> NodeRecord {
             claude_session_id: session.claude_session_id,
             claude_account: session.claude_account,
             role_id: session.role_id,
+            environment: EnvironmentKind::LocalPty,
         }),
     }
 }
@@ -211,6 +221,13 @@ fn convert_workspace(workspace: V3WorkspaceRecord) -> WorkspaceRecord {
         nodes,
         edges,
         canvas: workspace.canvas,
+        environment: EnvironmentKind::LocalPty,
+        color: None,
+        icon: None,
+        // Unknown, not fabricated: a pre-Milestone-2 file never recorded
+        // when a workspace was created or last opened.
+        created_at: 0,
+        last_opened: 0,
     }
 }
 
@@ -333,7 +350,7 @@ pub fn load(path: &Path, contents: &str) -> (Store, Option<String>) {
         return backup_corrupt_file(path, "JSON is not an object");
     };
 
-    // Schemas 3 and 4 both have a top-level "workspaces" key; a missing
+    // Schemas 3, 4 and 5 all have a top-level "workspaces" key; a missing
     // `schema_version` has only ever meant 3 (the shape before the field
     // existed), so that's the default rather than assuming "current".
     if obj.contains_key("workspaces") {
@@ -341,15 +358,19 @@ pub fn load(path: &Path, contents: &str) -> (Store, Option<String>) {
         if version > CURRENT_SCHEMA_VERSION {
             return backup_future_schema_file(path, version);
         }
-        if version == CURRENT_SCHEMA_VERSION {
+        if version >= 4 {
+            // Schema 4 and 5 share the same nodes/edges shape; 5 only adds
+            // new `WorkspaceRecord`/`TerminalPayload` fields, every one
+            // `#[serde(default)]`, so a schema-4 file deserializes directly
+            // as the current `Store` with no dedicated conversion step.
             return match serde_json::from_value::<Store>(value) {
                 Ok(store) => (store, None),
                 Err(error) => backup_corrupt_file(path, &error.to_string()),
             };
         }
         // Only schema 3 can appear here today (version <= 3, since anything
-        // greater returned above and 4 is current) — migrate sessions/notes/
-        // links into nodes/edges.
+        // greater returned above and 4+ is handled above) — migrate
+        // sessions/notes/links into nodes/edges.
         return match serde_json::from_value::<V3Store>(value) {
             Ok(v3) => (migrate_v3_to_v4(v3), None),
             Err(error) => backup_corrupt_file(path, &error.to_string()),
@@ -409,6 +430,57 @@ mod tests {
         assert!(warning.is_none());
         assert_eq!(store.schema_version, 4);
         assert_eq!(store.workspaces.len(), 1);
+    }
+
+    /// A schema-4 file (Milestone 1, pre-Milestone-2) has none of
+    /// `WorkspaceRecord`'s new `environment`/`color`/`icon`/`created_at`/
+    /// `last_opened` keys and no `TerminalPayload::environment` key either.
+    /// Confirms it loads directly (no dedicated v4->v5 struct needed) with
+    /// every new field defaulting sensibly rather than failing to parse.
+    #[test]
+    fn v4_shape_loads_with_new_milestone_2_fields_defaulted() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        write(
+            &path,
+            r#"{
+                "schema_version": 4,
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000000",
+                    "name": "web",
+                    "root_dir": "/home/fernando",
+                    "nodes": [{
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "position": [0.0, 0.0],
+                        "size": [480.0, 320.0],
+                        "kind": {
+                            "kind": "Terminal",
+                            "name": "a",
+                            "cwd": "/tmp",
+                            "agent": "Codex",
+                            "claude_session_id": null,
+                            "claude_account": null
+                        }
+                    }],
+                    "edges": [],
+                    "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
+                }],
+                "active_workspace": "00000000-0000-0000-0000-000000000000"
+            }"#,
+        );
+        let (store, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
+        assert!(warning.is_none());
+        assert_eq!(store.schema_version, 4);
+        let workspace = &store.workspaces[0];
+        assert_eq!(workspace.environment, EnvironmentKind::LocalPty);
+        assert_eq!(workspace.color, None);
+        assert_eq!(workspace.icon, None);
+        assert_eq!(workspace.created_at, 0);
+        assert_eq!(workspace.last_opened, 0);
+        assert_eq!(
+            workspace.nodes[0].as_terminal().unwrap().environment,
+            EnvironmentKind::LocalPty
+        );
     }
 
     /// A schema-3 file saved by the pre-Milestone-1 binary has no
