@@ -15,6 +15,7 @@ pub mod env;
 pub mod identity;
 pub mod permissions;
 pub mod registry;
+pub mod skill;
 
 pub use adapter::{AgentAdapter, adapter_for};
 pub use bus::MessageBus;
