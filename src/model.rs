@@ -55,18 +55,30 @@ pub struct TerminalPayload {
     pub agent: Agent,
     pub claude_session_id: Option<Uuid>,
     pub claude_account: Option<String>,
-    /// `true` exactly while `claude_session_id` is pinned to an id that has
-    /// never actually been used to launch Claude yet (freshly created,
-    /// duplicated, or handed off to) — the signal `build_terminal_launch`
-    /// uses to pick `--session-id` (create) over `--resume` (continue).
-    /// Without this, a brand-new id with `claude_session_id.is_some()` but
-    /// no real conversation behind it would launch with `--resume` and fail
-    /// with "No conversation found with ID ...". `#[serde(default)]` so
-    /// every terminal saved before this field existed loads as `false` —
-    /// the safe assumption for a session that, by virtue of already being
-    /// persisted, has necessarily been launched at least once before.
+    /// `true` until this terminal's process has actually been spawned for
+    /// the very first time (freshly created, duplicated, or handed off to —
+    /// never on restore/reattach/restart of one that has run before). Two
+    /// things key off it:
+    ///
+    /// - For Claude specifically, whether `build_terminal_launch` picks
+    ///   `--session-id` (create) over `--resume` (continue). Without this,
+    ///   a brand-new id with `claude_session_id.is_some()` but no real
+    ///   conversation behind it would launch with `--resume` and fail with
+    ///   "No conversation found with ID ...".
+    /// - For every provider, whether a launch sends any discovery/skill
+    ///   prompt at all. An agent that has already launched once already
+    ///   knows how to reach `duetctl` (Claude's `duet` skill is installed
+    ///   once and persists; a resumed Codex/other conversation still has it
+    ///   in its own history) — resending it on every reattach/restore would
+    ///   just add a stray synthetic turn to an otherwise real conversation
+    ///   every time `duet` itself restarts.
+    ///
+    /// `#[serde(default)]` so every terminal saved before this field
+    /// existed loads as `false` — the safe assumption for a session that,
+    /// by virtue of already being persisted, has necessarily launched
+    /// before.
     #[serde(default)]
-    pub claude_fresh: bool,
+    pub never_launched: bool,
     #[serde(default)]
     pub role_id: Option<Uuid>,
     /// Which runtime this terminal's process runs under. `#[serde(default)]`
@@ -298,7 +310,7 @@ mod tests {
                 agent: Agent::Shell,
                 claude_session_id: None,
                 claude_account: None,
-                claude_fresh: false,
+                never_launched: false,
                 role_id: None,
                 environment: EnvironmentKind::LocalPty,
             })

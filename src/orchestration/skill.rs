@@ -1,16 +1,17 @@
 //! The Duet orchestration skill: discovery and role knowledge installed
-//! once into a Claude account's config dir, so it no longer has to be
-//! resent as prompt text on every single launch. Claude Code auto-discovers
-//! any skill under `<CLAUDE_CONFIG_DIR>/skills/<name>/SKILL.md`, the same
-//! way it discovers one under a normal, non-isolated `~/.claude/skills/`.
+//! once into an agent's own config dir, so it no longer has to be resent as
+//! prompt text on every single launch. Both Claude Code and Codex
+//! auto-discover any skill at the identical `skills/<name>/SKILL.md`
+//! convention (frontmatter `name`/`description` plus a Markdown body),
+//! just rooted at a different directory per provider — `CLAUDE_CONFIG_DIR`
+//! for Claude, `CODEX_HOME` for Codex (confirmed against a real `codex`
+//! install: `~/.codex/skills/.system/*/SKILL.md` uses this exact shape).
+//! `install` itself doesn't know or care which — it just writes the file
+//! under whatever config dir its caller resolved.
 //!
-//! Scoped to Claude only, matching CLAUDE.md's "Claude Code priority": it's
-//! the one provider whose CLI has a documented, auto-discovered skills
-//! mechanism this install can target. Codex/OpenCode/Shell/Custom still get
-//! the short prompt-based discovery text from `env.rs` — extending this to
-//! Codex's own `AGENTS.md` convention is future work, not done here (it
-//! writes into the user's *project* directory rather than an isolated
-//! config dir, a bigger decision than this pass needs to make).
+//! OpenCode/Shell/Custom still get the short prompt-based discovery text
+//! from `env.rs` instead — none of them has a documented, auto-discovered
+//! skills mechanism this install can target.
 
 use std::path::Path;
 
@@ -27,15 +28,27 @@ You are one agent among several running inside Duet. Before doing anything
 else in this session:
 
 1. Run `duetctl whoami` to see your own agent id, name, assigned role and
-   full role instructions, and which other agents you're connected to.
+   full role instructions, whether you have manager/coordinator permissions,
+   and which other agents you're connected to.
 2. Act according to the role instructions `whoami` returned, if any.
-3. Run `duetctl agents list` any time to see every agent in the workspace
+3. If `whoami` shows `manager: true`, you are a coordinator: prefer
+   delegating work to connected agents over doing it yourself. Send each
+   agent its own piece of the task with `duetctl send`, wait for their
+   replies, and combine the results — the same way a real lead doesn't
+   personally implement everything a team is asked to do. You can also
+   create new agents (`duetctl agents create`), remove them
+   (`duetctl agents remove`), and reassign roles
+   (`duetctl agents assign-role`) — only managers can.
+4. If `whoami` shows `manager: false`, focus on your own role's work and
+   report back to whichever agent delegated to you, via `duetctl send`,
+   rather than trying to coordinate others yourself.
+5. Run `duetctl agents list` any time to see every agent in the workspace
    and its current activity (working, idle, awaiting a reply, ...).
-4. Use `duetctl send --to <agent-name-or-id> "<message>"` to message an
+6. Use `duetctl send --to <agent-name-or-id> "<message>"` to message an
    agent you're connected to — your own id is already in `$DUET_AGENT_ID`
    and used automatically as the sender. Sending to an agent you have no
    connection to is refused with a clear error.
-5. Use `duetctl connections list` to see every connection and its granted
+7. Use `duetctl connections list` to see every connection and its granted
    capabilities, and `duetctl workspace inspect` for the active workspace.
 
 A message from another agent arrives as ordinary input in your own
