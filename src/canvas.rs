@@ -26,10 +26,11 @@ impl CanvasState {
 }
 
 use gtk4::prelude::*;
-use gtk4::{gdk, glib, graphene, gsk};
+use gtk4::{glib, graphene, gsk};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[derive(Clone)]
 pub struct Canvas {
     pub overlay: gtk4::Overlay,
     pub fixed: gtk4::Fixed,
@@ -101,32 +102,33 @@ impl Canvas {
         fixed.add_controller(drag);
 
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-        // Capture, not the default bubble phase: a card's VTE terminal handles
-        // scroll itself (scrollback) and stops the event, so in the bubble
-        // phase `fixed` — an ancestor of every card — only ever saw a scroll
-        // that happened over empty canvas. Ctrl+scroll therefore did nothing
-        // wherever there was something to zoom. Capture runs root-to-target,
-        // so this sees the scroll first and still returns `Proceed` for a
-        // plain scroll, leaving the terminal's own scrollback intact.
-        scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        // A terminal consumes its own scrolls for scrollback before this
+        // bubble-phase canvas handler sees them. On empty canvas, the wheel
+        // reaches here and zooms the spatial view.
+        scroll.set_propagation_phase(gtk4::PropagationPhase::Bubble);
         {
             let state = Rc::clone(&state);
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
             scroll.connect_scroll(move |controller, _dx, dy| {
-                if controller
-                    .current_event_state()
-                    .contains(gdk::ModifierType::CONTROL_MASK)
-                {
-                    let mut state = state.borrow_mut();
-                    state.zoom *= if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
-                    state.clamp_zoom();
-                    apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
+                let mut state = state.borrow_mut();
+                // Preserve the world-space point under the pointer, rather
+                // than scaling from the canvas origin. This makes the card or
+                // empty region the user is looking at stay under the cursor.
+                let cursor = controller
+                    .current_event()
+                    .and_then(|event| event.position())
+                    .unwrap_or((0.0, 0.0));
+                let world = screen_to_world(cursor, state.pan, state.zoom);
+                state.zoom *= if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+                state.clamp_zoom();
+                state.pan = (
+                    cursor.0 / state.zoom - world.0,
+                    cursor.1 / state.zoom - world.1,
+                );
+                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+                glib::Propagation::Stop
             });
         }
         fixed.add_controller(scroll);
@@ -187,6 +189,13 @@ impl Canvas {
         apply_transform(&self.fixed, &widget, world_pos, &self.state.borrow());
     }
 
+    /// Moves an existing card to the end of the `Fixed` child order, which
+    /// GTK paints last. Called when a card begins moving so the active card
+    /// remains visible above every overlapping card throughout the drag.
+    pub fn raise_node(&self, child: &impl IsA<gtk4::Widget>) {
+        child.insert_before(&self.fixed, None::<&gtk4::Widget>);
+    }
+
     /// Removes a child from both the `Fixed` container and the internal
     /// tracking list used by `retransform_children`. Callers that remove a
     /// node from the canvas (e.g. deleting a session) must use this instead
@@ -203,12 +212,13 @@ impl Canvas {
     /// world-space endpoints plus whether it is currently selected.
     pub fn set_link_lines_source(&self, anchors: impl Fn() -> Vec<LinkLine> + 'static) {
         let state = Rc::clone(&self.state);
-        self.links_area.set_draw_func(move |_area, cairo_ctx, _width, _height| {
-            let state = *state.borrow();
-            for link in anchors() {
-                draw_link(cairo_ctx, &link, &state);
-            }
-        });
+        self.links_area
+            .set_draw_func(move |_area, cairo_ctx, _width, _height| {
+                let state = *state.borrow();
+                for link in anchors() {
+                    draw_link(cairo_ctx, &link, &state);
+                }
+            });
     }
 
     /// Calls `on_click` with the clicked point in *world* coordinates, for
@@ -248,6 +258,10 @@ pub struct LinkLine {
     pub from: (f64, f64),
     pub to: (f64, f64),
     pub selected: bool,
+    /// The two card bounds when they overlap. In that case the ordinary
+    /// directional cord is hidden and their exposed outer edges are drawn as
+    /// one blue combined shape instead.
+    pub overlap: Option<[(f64, f64, f64, f64); 2]>,
 }
 
 /// World-space spacing of the faint canvas grid, and of its stronger every-
@@ -266,13 +280,25 @@ const ZOOM_STEP: f64 = 1.1;
 /// (with `bezier_point`/`distance_to_link`) so hit-testing a click uses the
 /// exact same curve that was drawn.
 pub fn link_curve(from: (f64, f64), to: (f64, f64)) -> [(f64, f64); 4] {
-    let reach = ((to.0 - from.0).abs() * 0.5).clamp(40.0, 220.0);
-    [
-        from,
-        (from.0 + reach, from.1),
-        (to.0 - reach, to.1),
-        to,
-    ]
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let reach = (dx.abs().max(dy.abs()) * 0.5).clamp(40.0, 220.0);
+    if dx.abs() >= dy.abs() {
+        let direction = if dx >= 0.0 { 1.0 } else { -1.0 };
+        [
+            from,
+            (from.0 + direction * reach, from.1),
+            (to.0 - direction * reach, to.1),
+            to,
+        ]
+    } else {
+        let direction = if dy >= 0.0 { 1.0 } else { -1.0 };
+        [
+            from,
+            (from.0, from.1 + direction * reach),
+            (to.0, to.1 - direction * reach),
+            to,
+        ]
+    }
 }
 
 pub fn bezier_point(curve: &[(f64, f64); 4], t: f64) -> (f64, f64) {
@@ -331,14 +357,20 @@ fn draw_grid(cairo_ctx: &gtk4::cairo::Context, width: f64, height: f64, state: &
         cairo_ctx.set_source_rgba(0.5, 0.5, 0.5, alpha);
         let mut world_x = (top_left.0 / step).floor() * step;
         while world_x <= bottom_right.0 {
-            let x = world_to_screen((world_x, 0.0), state.pan, state.zoom).0.floor() + 0.5;
+            let x = world_to_screen((world_x, 0.0), state.pan, state.zoom)
+                .0
+                .floor()
+                + 0.5;
             cairo_ctx.move_to(x, 0.0);
             cairo_ctx.line_to(x, height);
             world_x += step;
         }
         let mut world_y = (top_left.1 / step).floor() * step;
         while world_y <= bottom_right.1 {
-            let y = world_to_screen((0.0, world_y), state.pan, state.zoom).1.floor() + 0.5;
+            let y = world_to_screen((0.0, world_y), state.pan, state.zoom)
+                .1
+                .floor()
+                + 0.5;
             cairo_ctx.move_to(0.0, y);
             cairo_ctx.line_to(width, y);
             world_y += step;
@@ -348,6 +380,19 @@ fn draw_grid(cairo_ctx: &gtk4::cairo::Context, width: f64, height: f64, state: &
 }
 
 fn draw_link(cairo_ctx: &gtk4::cairo::Context, link: &LinkLine, state: &CanvasState) {
+    if let Some([first, second]) = link.overlap {
+        // Drawing only portions of each card border that sit outside its
+        // partner produces the outline of their union. That makes a complete
+        // overlap read as a single connected shape without a stray cord or a
+        // rectangle in the shared area.
+        cairo_ctx.set_source_rgba(0.21, 0.52, 0.89, 0.90);
+        cairo_ctx.set_line_width(3.0);
+        cairo_ctx.set_line_cap(gtk4::cairo::LineCap::Round);
+        draw_exposed_rect(cairo_ctx, first, second, state);
+        draw_exposed_rect(cairo_ctx, second, first, state);
+        let _ = cairo_ctx.stroke();
+        return;
+    }
     // A cubic Bezier is affine-invariant, so transforming the four control
     // points is the same as transforming the curve.
     let curve = link_curve(link.from, link.to);
@@ -367,16 +412,24 @@ fn draw_link(cairo_ctx: &gtk4::cairo::Context, link: &LinkLine, state: &CanvasSt
     cairo_ctx.set_line_width(width);
     cairo_ctx.move_to(screen[0].0, screen[0].1);
     cairo_ctx.curve_to(
-        screen[1].0, screen[1].1,
-        screen[2].0, screen[2].1,
-        screen[3].0, screen[3].1,
+        screen[1].0,
+        screen[1].1,
+        screen[2].0,
+        screen[2].1,
+        screen[3].0,
+        screen[3].1,
     );
     let _ = cairo_ctx.stroke();
 
-    // A dot at the source end and an arrowhead at the target end: the link
-    // is directional (the source's output feeds the target's input) and a
-    // plain line said nothing about which way the bytes flow.
-    let _ = cairo_ctx.arc(screen[0].0, screen[0].1, width * 1.6, 0.0, std::f64::consts::TAU);
+    // A dot at the source end and an arrowhead at the target end show the
+    // direction selected when the logical connection was created.
+    let _ = cairo_ctx.arc(
+        screen[0].0,
+        screen[0].1,
+        width * 1.6,
+        0.0,
+        std::f64::consts::TAU,
+    );
     let _ = cairo_ctx.fill();
 
     let (dx, dy) = (screen[3].0 - screen[2].0, screen[3].1 - screen[2].1);
@@ -396,6 +449,65 @@ fn draw_link(cairo_ctx: &gtk4::cairo::Context, link: &LinkLine, state: &CanvasSt
         cairo_ctx.close_path();
         let _ = cairo_ctx.fill();
     }
+}
+
+/// Adds the parts of `rect`'s border that do not lie inside `other` to the
+/// current Cairo path. Both rectangles are world-space `(x, y, width, height)`
+/// bounds; the transform is applied once per visible segment.
+fn draw_exposed_rect(
+    cairo_ctx: &gtk4::cairo::Context,
+    rect: (f64, f64, f64, f64),
+    other: (f64, f64, f64, f64),
+    state: &CanvasState,
+) {
+    let (x, y, width, height) = rect;
+    let (other_x, other_y, other_width, other_height) = other;
+    let (right, bottom) = (x + width, y + height);
+    let (other_right, other_bottom) = (other_x + other_width, other_y + other_height);
+
+    let horizontal = |edge_y: f64, context: &gtk4::cairo::Context| {
+        if edge_y > other_y && edge_y < other_bottom {
+            // Clamp both cut points to this edge. Without that, a card fully
+            // inside another can produce a backwards segment across the
+            // opposite corner of the card.
+            let before_end = other_x.clamp(x, right);
+            let after_start = other_right.clamp(x, right);
+            draw_world_segment(context, (x, edge_y), (before_end, edge_y), state);
+            draw_world_segment(context, (after_start, edge_y), (right, edge_y), state);
+        } else {
+            draw_world_segment(context, (x, edge_y), (right, edge_y), state);
+        }
+    };
+    let vertical = |edge_x: f64, context: &gtk4::cairo::Context| {
+        if edge_x > other_x && edge_x < other_right {
+            let before_end = other_y.clamp(y, bottom);
+            let after_start = other_bottom.clamp(y, bottom);
+            draw_world_segment(context, (edge_x, y), (edge_x, before_end), state);
+            draw_world_segment(context, (edge_x, after_start), (edge_x, bottom), state);
+        } else {
+            draw_world_segment(context, (edge_x, y), (edge_x, bottom), state);
+        }
+    };
+
+    horizontal(y, cairo_ctx);
+    horizontal(bottom, cairo_ctx);
+    vertical(x, cairo_ctx);
+    vertical(right, cairo_ctx);
+}
+
+fn draw_world_segment(
+    cairo_ctx: &gtk4::cairo::Context,
+    from: (f64, f64),
+    to: (f64, f64),
+    state: &CanvasState,
+) {
+    if from == to {
+        return;
+    }
+    let from = world_to_screen(from, state.pan, state.zoom);
+    let to = world_to_screen(to, state.pan, state.zoom);
+    cairo_ctx.move_to(from.0, from.1);
+    cairo_ctx.line_to(to.0, to.1);
 }
 
 fn apply_transform(
@@ -490,6 +602,12 @@ mod tests {
         assert_eq!(curve[1].1, 10.0);
         assert_eq!(curve[2].1, 90.0);
         assert!(curve[1].0 > curve[0].0 && curve[2].0 < curve[3].0);
+        let reversed = link_curve((500.0, 10.0), (0.0, 90.0));
+        assert!(reversed[1].0 < reversed[0].0 && reversed[2].0 > reversed[3].0);
+        let vertical = link_curve((10.0, 0.0), (90.0, 500.0));
+        assert_eq!(vertical[1].0, 10.0);
+        assert_eq!(vertical[2].0, 90.0);
+        assert!(vertical[1].1 > vertical[0].1 && vertical[2].1 < vertical[3].1);
         // Even for coincident endpoints the handles stay finite and apart.
         let degenerate = link_curve((5.0, 5.0), (5.0, 5.0));
         assert_eq!(degenerate[1].0, 45.0);

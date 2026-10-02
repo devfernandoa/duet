@@ -2,6 +2,7 @@ use crate::account::AccountStore;
 use crate::agent::{Agent, Launch, LaunchRequest};
 use crate::canvas::Canvas;
 use crate::handoff::{summarize_claude, summarize_codex};
+use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary};
 use crate::node::{NoteNode, SessionNode};
 use crate::role::Role;
 use crate::session::Session;
@@ -24,6 +25,28 @@ use uuid::Uuid;
 /// triggering their own synchronous `File::create` + `write_all` +
 /// `sync_all` + `rename`.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Caps `App::messages` so a long-running duet with chatty agents doesn't
+/// grow the log unboundedly in memory.
+const MESSAGE_LOG_LIMIT: usize = 200;
+
+/// Formats a message as terminal input. A single trailing carriage return is
+/// the terminal representation of the Return key, which submits the message
+/// in interactive agent UIs.
+fn message_envelope(source_label: &str, content: &str) -> String {
+    format!("[duet message from {source_label}]: {content}")
+}
+
+/// How long to wait after writing a message's text before writing the
+/// trailing `\r` that submits it. Needed because Claude/Codex's own input
+/// box (unlike a plain shell's line discipline) distinguishes a human
+/// keystroke from a paste by whether a newline arrived in the same burst of
+/// bytes as the rest of the line: written in one `write_input` call, the
+/// trailing `\r` reads exactly like a pasted newline and is inserted into
+/// the input instead of submitting it. A separate write, after the PTY
+/// reader has had a real chance to drain the first one, reads as a
+/// distinct keystroke instead.
+const MESSAGE_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
 pub struct SessionEntry {
     pub record: SessionRecord,
@@ -69,6 +92,10 @@ pub struct App {
     pub sessions: HashMap<Uuid, SessionEntry>,
     pub notes: HashMap<Uuid, NoteEntry>,
     pub links: Vec<LinkRecord>,
+    /// A capped, in-memory log of agent-to-agent messages sent via
+    /// `control.rs` — not persisted (ephemeral, like the canvas's own undo
+    /// history would be), just enough to answer "what was just sent".
+    pub messages: Vec<AgentMessage>,
     /// Set while the user has clicked a node's link button and is waiting to
     /// click a target node to complete the link. `None` otherwise.
     pub pending_link_source: Option<Uuid>,
@@ -98,6 +125,7 @@ impl App {
             sessions: HashMap::new(),
             notes: HashMap::new(),
             links: Vec::new(),
+            messages: Vec::new(),
             pending_link_source: None,
             selected_link: None,
             pending_save: None,
@@ -329,24 +357,27 @@ impl App {
     /// back later (`switch_workspace`, `create_workspace`) or deliberately
     /// skip that if it's being deleted (`delete_workspace`).
     fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
-        let (session_entries, note_entries) = {
+        let (canvas, session_entries, note_entries) = {
             let mut app_mut = app.borrow_mut();
             (
+                app_mut.canvas.clone(),
                 app_mut.sessions.drain().collect::<Vec<_>>(),
                 app_mut.notes.drain().collect::<Vec<_>>(),
             )
         };
-        let mut app_mut = app.borrow_mut();
         for (_, mut entry) in session_entries {
             entry.session.kill();
-            app_mut.canvas.remove_node(&entry.node.container);
+            canvas.remove_node(&entry.node.container);
         }
         for (_, entry) in note_entries {
-            app_mut.canvas.remove_node(&entry.node.container);
+            canvas.remove_node(&entry.node.container);
         }
-        app_mut.links.clear();
-        app_mut.pending_link_source = None;
-        app_mut.selected_link = None;
+        {
+            let mut app_mut = app.borrow_mut();
+            app_mut.links.clear();
+            app_mut.pending_link_source = None;
+            app_mut.selected_link = None;
+        }
     }
 
     /// Replaces or inserts `record` into `inactive_workspaces` by id — the
@@ -553,8 +584,7 @@ impl App {
     /// would require a second mutable borrow of the same `HashMap` while the
     /// first is still live, which the borrow checker rejects.
     pub fn pump_output(&mut self) {
-        let mut outgoing: Vec<(Uuid, Vec<Vec<u8>>)> = Vec::new();
-        for (&id, entry) in self.sessions.iter_mut() {
+        for entry in self.sessions.values_mut() {
             // The one authoritative place the PTY is sized, from VTE's real
             // post-allocation grid. Every other path (resize drag, restore,
             // create, collapse/expand, a font change) only ever asks the
@@ -576,26 +606,114 @@ impl App {
                 entry.node.status_label.set_text("exited");
                 entry.exit_shown = true;
             }
-            if !chunks.is_empty() {
-                outgoing.push((id, chunks));
-            }
         }
-        for (source_id, chunks) in outgoing {
-            let targets: Vec<Uuid> = self
-                .links
-                .iter()
-                .filter(|l| l.source == source_id)
-                .map(|l| l.target)
-                .collect();
-            for target_id in targets {
-                if let Some(target_entry) = self.sessions.get_mut(&target_id) {
-                    let _ = crate::link::forward(&chunks, &mut target_entry.session);
-                } else {
-                    // Target session is gone; drop the dangling link.
-                    self.links.retain(|l| l.target != target_id);
+    }
+
+    /// Every live session, as `duet agent list` (via `control.rs`) reports
+    /// it — enough to pick a target by name or id.
+    pub fn agent_summaries(&self) -> Vec<AgentSummary> {
+        self.sessions
+            .values()
+            .map(|entry| AgentSummary {
+                id: entry.record.id,
+                name: entry.record.name.clone(),
+                agent: entry.record.agent.display_name(),
+            })
+            .collect()
+    }
+
+    /// Every canvas link, by the connected sessions' names — "canvas
+    /// connections expose which agents are logically connected", resolved
+    /// for `duet agent list`'s output. Silently drops a link whose endpoint
+    /// session no longer exists, the same as `pump_output` does when
+    /// forwarding hits a missing target.
+    pub fn link_summaries(&self) -> Vec<LinkSummary> {
+        self.links
+            .iter()
+            .filter_map(|link| {
+                let source = self.sessions.get(&link.source)?.record.name.clone();
+                let target = self.sessions.get(&link.target)?.record.name.clone();
+                Some(LinkSummary { source, target })
+            })
+            .collect()
+    }
+
+    /// Resolves `duet agent send`'s target: an exact session id, or
+    /// failing that an exact (case-sensitive) session name — names are
+    /// already enforced unique by `create_session`, so this is unambiguous.
+    fn find_session_id(&self, target: &str) -> Option<Uuid> {
+        if let Ok(id) = Uuid::parse_str(target)
+            && self.sessions.contains_key(&id)
+        {
+            return Some(id);
+        }
+        self.sessions
+            .iter()
+            .find(|(_, entry)| entry.record.name == target)
+            .map(|(id, _)| *id)
+    }
+
+    /// Delivers a structured agent-to-agent message: writes a clearly
+    /// labeled envelope into the target session's PTY input — an explicit,
+    /// addressed message, the only way content moves from one session into
+    /// another (canvas links are logical-only; see `create_link`) — and
+    /// records the attempt in `messages`. Returns the recorded
+    /// `AgentMessage` whether delivery succeeded or not; `Err` only for a
+    /// target that doesn't resolve to any live session at all.
+    pub fn send_message(
+        app: &Rc<RefCell<App>>,
+        source_session_id: Option<Uuid>,
+        target: &str,
+        content: String,
+    ) -> Result<AgentMessage, String> {
+        let mut app_mut = app.borrow_mut();
+        let Some(target_id) = app_mut.find_session_id(target) else {
+            return Err(format!("no agent named '{target}'"));
+        };
+        let source_session_id = source_session_id.filter(|id| app_mut.sessions.contains_key(id));
+        let source_label = source_session_id
+            .and_then(|id| app_mut.sessions.get(&id))
+            .map(|entry| {
+                format!(
+                    "{} ({})",
+                    entry.record.name,
+                    entry.record.agent.display_name()
+                )
+            })
+            .unwrap_or_else(|| "an external sender".to_string());
+        let envelope = message_envelope(&source_label, &content);
+        let delivered = app_mut
+            .sessions
+            .get_mut(&target_id)
+            .is_some_and(|entry| entry.session.write_input(envelope.as_bytes()).is_ok());
+        let status = if delivered {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Failed
+        };
+        if delivered {
+            // Submit on a delay, as its own write — see `MESSAGE_SUBMIT_DELAY`.
+            let app = Rc::clone(app);
+            glib::timeout_add_local_once(MESSAGE_SUBMIT_DELAY, move || {
+                if let Some(entry) = app.borrow_mut().sessions.get_mut(&target_id) {
+                    let _ = entry.session.write_input(b"\r");
                 }
-            }
+            });
         }
+        let message = AgentMessage {
+            id: Uuid::new_v4(),
+            source: source_session_id,
+            target: target_id,
+            content,
+            timestamp: crate::message::now_epoch_secs(),
+            status,
+        };
+        app_mut.messages.push(message.clone());
+        if app_mut.messages.len() > MESSAGE_LOG_LIMIT {
+            let overflow = app_mut.messages.len() - MESSAGE_LOG_LIMIT;
+            app_mut.messages.drain(0..overflow);
+        }
+        Ok(message)
     }
 
     /// Spawns a brand-new Session + SessionNode at `viewport_center_world`,
@@ -711,11 +829,16 @@ impl App {
         let _ = app.borrow().persist();
     }
 
-    /// Records a link so `pump_output` starts forwarding `source`'s output
-    /// into `target`'s input. A no-op if the link already exists,
-    /// `source == target` (linking a session to itself would feed its own
-    /// output back into its own input), or either id no longer names a live
-    /// session — this last check is defense in depth against a stale
+    /// Records a logical connection between `source` and `target`. Links
+    /// appear on the canvas and in `duet agent list`; no content moves
+    /// automatically from one session to the other, since a linked source's
+    /// raw terminal output is mostly redraw/escape-code noise from the
+    /// agent's own TUI, not a transcript one agent could use as the other's
+    /// input (`duet agent send` is the only path that writes into a
+    /// session). A no-op if the link already exists, `source == target`
+    /// (linking a session to itself is a no-op either way), or either id no
+    /// longer names a live session — this last check is defense in depth
+    /// against a stale
     /// `pending_link_source` surviving the source session's closure (the
     /// primary fix for that is clearing `pending_link_source` in
     /// `close_session` itself; this is a second, independent guard so
@@ -758,23 +881,41 @@ impl App {
         }
     }
 
-    /// Every live link's world-space endpoints: out of the source card's
-    /// right edge, into the target card's left edge, each at the card's
-    /// vertical middle. One function so the curve that gets drawn and the
-    /// curve a click is hit-tested against can never disagree.
+    /// Every live link's world-space endpoints, chosen from the sides that
+    /// face each other so stacked cards use a vertical route.
     pub fn link_lines(&self) -> Vec<(LinkRecord, (f64, f64), (f64, f64))> {
         self.links
             .iter()
             .filter_map(|&link| {
                 let source = self.sessions.get(&link.source)?;
                 let target = self.sessions.get(&link.target)?;
-                Some((
-                    link,
-                    card_edge(&source.record, true),
-                    card_edge(&target.record, false),
-                ))
+                let source_center = card_center(&source.record);
+                let target_center = card_center(&target.record);
+                let horizontal = (target_center.0 - source_center.0).abs()
+                    >= (target_center.1 - source_center.1).abs();
+                let (from, to) = if horizontal {
+                    let source_is_left = source_center.0 <= target_center.0;
+                    (
+                        card_edge(&source.record, source_is_left),
+                        card_edge(&target.record, !source_is_left),
+                    )
+                } else {
+                    let source_is_above = source_center.1 <= target_center.1;
+                    (
+                        card_vertical_edge(&source.record, source_is_above),
+                        card_vertical_edge(&target.record, !source_is_above),
+                    )
+                };
+                Some((link, from, to))
             })
             .collect()
+    }
+
+    pub fn link_overlap(&self, link: LinkRecord) -> Option<[(f64, f64, f64, f64); 2]> {
+        let source = self.sessions.get(&link.source)?;
+        let target = self.sessions.get(&link.target)?;
+        card_intersection(&source.record, &target.record)
+            .map(|_| [card_rect(&source.record), card_rect(&target.record)])
     }
 
     /// Whether any card covers `world` (world-space). Used to keep a click
@@ -991,22 +1132,28 @@ impl App {
                 let account = crate::account::DEFAULT_ACCOUNT.to_string();
                 let config_dir = app_ref.accounts.ensure(&account)?;
                 let session_id = Uuid::new_v4();
-                let launch = to.launch(LaunchRequest {
-                    initial_prompt: initial_prompt.as_deref(),
-                    claude_session_id: Some(session_id),
-                    claude_config_dir: Some(&config_dir),
-                    ..Default::default()
-                });
+                let launch = with_session_env(
+                    to.launch(LaunchRequest {
+                        initial_prompt: initial_prompt.as_deref(),
+                        claude_session_id: Some(session_id),
+                        claude_config_dir: Some(&config_dir),
+                        ..Default::default()
+                    }),
+                    id,
+                );
                 let mut updated = record.clone();
                 updated.agent = Agent::Claude;
                 updated.claude_session_id = Some(session_id);
                 updated.claude_account = Some(account);
                 (launch, updated)
             } else {
-                let launch = to.launch(LaunchRequest {
-                    initial_prompt: initial_prompt.as_deref(),
-                    ..Default::default()
-                });
+                let launch = with_session_env(
+                    to.launch(LaunchRequest {
+                        initial_prompt: initial_prompt.as_deref(),
+                        ..Default::default()
+                    }),
+                    id,
+                );
                 let mut updated = record.clone();
                 updated.agent = Agent::Codex;
                 updated.claude_session_id = None;
@@ -1042,14 +1189,18 @@ impl App {
                 .map(|(id, _)| *id)
                 .collect()
         };
-        {
+        let (canvas, removed) = {
             let mut app_mut = app.borrow_mut();
-            for id in &to_remove {
-                if let Some(mut entry) = app_mut.sessions.remove(id) {
-                    entry.session.kill();
-                    app_mut.canvas.remove_node(&entry.node.container);
-                }
-            }
+            let canvas = app_mut.canvas.clone();
+            let removed = to_remove
+                .iter()
+                .filter_map(|id| app_mut.sessions.remove(id))
+                .collect::<Vec<_>>();
+            (canvas, removed)
+        };
+        for mut entry in removed {
+            entry.session.kill();
+            canvas.remove_node(&entry.node.container);
         }
         app.borrow().accounts.remove(name)?;
         app.borrow().persist()?;
@@ -1065,12 +1216,10 @@ impl App {
     /// the next unrelated click-to-complete on any other session would call
     /// `create_link` with a source id that no longer exists.
     pub fn close_session(app: &Rc<RefCell<App>>, id: Uuid) {
-        {
+        let (canvas, removed) = {
             let mut app_mut = app.borrow_mut();
-            if let Some(mut entry) = app_mut.sessions.remove(&id) {
-                entry.session.kill();
-                app_mut.canvas.remove_node(&entry.node.container);
-            }
+            let canvas = app_mut.canvas.clone();
+            let removed = app_mut.sessions.remove(&id);
             app_mut.links.retain(|l| l.source != id && l.target != id);
             if app_mut.pending_link_source == Some(id) {
                 app_mut.pending_link_source = None;
@@ -1082,6 +1231,11 @@ impl App {
                 app_mut.selected_link = None;
             }
             app_mut.refresh_link_highlight();
+            (canvas, removed)
+        };
+        if let Some(mut entry) = removed {
+            entry.session.kill();
+            canvas.remove_node(&entry.node.container);
         }
         let _ = app.borrow().persist();
     }
@@ -1089,11 +1243,12 @@ impl App {
     /// Removes a single sticky note from the canvas (its per-note close
     /// button).
     pub fn close_note(app: &Rc<RefCell<App>>, id: Uuid) {
-        {
+        let (canvas, removed) = {
             let mut app_mut = app.borrow_mut();
-            if let Some(entry) = app_mut.notes.remove(&id) {
-                app_mut.canvas.remove_node(&entry.node.container);
-            }
+            (app_mut.canvas.clone(), app_mut.notes.remove(&id))
+        };
+        if let Some(entry) = removed {
+            canvas.remove_node(&entry.node.container);
         }
         let _ = app.borrow().persist();
     }
@@ -1115,6 +1270,43 @@ fn card_edge(record: &SessionRecord, right: bool) -> (f64, f64) {
             record.position.0
         },
         record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+    )
+}
+
+fn card_vertical_edge(record: &SessionRecord, bottom: bool) -> (f64, f64) {
+    (
+        record.position.0 + record.size.0 / 2.0,
+        if bottom {
+            record.position.1 + record.size.1 + TITLE_BAR_HEIGHT
+        } else {
+            record.position.1
+        },
+    )
+}
+
+fn card_center(record: &SessionRecord) -> (f64, f64) {
+    (
+        record.position.0 + record.size.0 / 2.0,
+        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+    )
+}
+
+fn card_intersection(a: &SessionRecord, b: &SessionRecord) -> Option<(f64, f64, f64, f64)> {
+    let (a_x, a_y, a_width, a_height) = card_rect(a);
+    let (b_x, b_y, b_width, b_height) = card_rect(b);
+    let (a_right, a_bottom) = (a_x + a_width, a_y + a_height);
+    let (b_right, b_bottom) = (b_x + b_width, b_y + b_height);
+    let (left, top) = (a_x.max(b_x), a_y.max(b_y));
+    let (right, bottom) = (a_right.min(b_right), a_bottom.min(b_bottom));
+    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
+}
+
+fn card_rect(record: &SessionRecord) -> (f64, f64, f64, f64) {
+    (
+        record.position.0,
+        record.position.1,
+        record.size.0,
+        record.size.1 + TITLE_BAR_HEIGHT,
     )
 }
 
@@ -1356,11 +1548,25 @@ fn wire_node_chrome<T: CardEntry + 'static>(
     let drag = gtk4::GestureDrag::new();
     drag.connect_drag_begin({
         let app = Rc::clone(app);
+        let container = container.clone();
         let move_start = Rc::clone(&move_start);
         move |gesture, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             let mut app_mut = app.borrow_mut();
             let pointer = canvas_point(gesture, &app_mut.canvas.fixed, (x, y));
+            // Reparenting/reordering a live VTE widget while GTK is still
+            // dispatching its drag-begin event can invalidate the terminal's
+            // ongoing event handling. Do it on the next main-loop turn: it
+            // still happens before the first visible drag update, without
+            // changing the widget hierarchy mid-dispatch.
+            let app_for_raise = app.clone();
+            let container_for_raise = container.clone();
+            glib::idle_add_local_once(move || {
+                app_for_raise
+                    .borrow()
+                    .canvas
+                    .raise_node(&container_for_raise);
+            });
             let position = entries(&mut app_mut).get(&id).map(CardEntry::position);
             *move_start.borrow_mut() = match (position, pointer) {
                 (Some(position), Some(pointer)) => Some((position, pointer)),
@@ -1622,12 +1828,15 @@ fn spawn_workspace_contents(
                 Agent::Claude => record.claude_session_id.is_some(),
                 _ => true,
             };
-            record.agent.launch(LaunchRequest {
-                resume,
-                claude_session_id: record.claude_session_id,
-                claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
-                ..Default::default()
-            })
+            with_session_env(
+                record.agent.launch(LaunchRequest {
+                    resume,
+                    claude_session_id: record.claude_session_id,
+                    claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+                    ..Default::default()
+                }),
+                record.id,
+            )
         };
         match Session::spawn(record.cwd.clone(), launch) {
             Ok(session) => {
@@ -1735,6 +1944,18 @@ fn with_role_instructions(role_instructions: Option<String>, base: Option<&str>)
     }
 }
 
+/// Appends `DUET_SESSION_ID` so a session's own shell can tell `duet agent
+/// send`/`duet agent list` (`control.rs`) which live session issued the
+/// command. Applied uniformly to every `Launch` after `Agent::launch`
+/// builds the rest of its envs, so no provider in `agent.rs` needs to know
+/// anything about messaging.
+fn with_session_env(mut launch: Launch, session_id: Uuid) -> Launch {
+    launch
+        .envs
+        .push(("DUET_SESSION_ID".to_string(), session_id.to_string()));
+    launch
+}
+
 /// Looks up `role_id` and updates `node`'s title-bar badge to match —
 /// shared by `create_session` and `spawn_workspace_contents` so a session's
 /// assigned role is shown the same way whether it was just created or
@@ -1765,14 +1986,18 @@ fn build_launch_and_record(
     let claude = resolve_claude_account(app, &agent, claude_account)?;
     let claude_session_id = claude.is_some().then(Uuid::new_v4);
     let initial_prompt = with_role_instructions(app.role_instructions(role_id), None);
-    let launch = agent.launch(LaunchRequest {
-        claude_session_id,
-        claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
-        initial_prompt: initial_prompt.as_deref(),
-        ..Default::default()
-    });
+    let session_id = Uuid::new_v4();
+    let launch = with_session_env(
+        agent.launch(LaunchRequest {
+            claude_session_id,
+            claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+            initial_prompt: initial_prompt.as_deref(),
+            ..Default::default()
+        }),
+        session_id,
+    );
     let record = SessionRecord {
-        id: Uuid::new_v4(),
+        id: session_id,
         name: name.to_string(),
         cwd: cwd.to_path_buf(),
         claude_account: claude.map(|(account, _)| account),
@@ -1783,4 +2008,20 @@ fn build_launch_and_record(
         size: (720.0, 504.0),
     };
     Ok((launch, record))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No trailing `\r` here — the submitting keystroke is written as its
+    /// own, separately-timed `write_input` call (see `MESSAGE_SUBMIT_DELAY`),
+    /// not appended to the envelope text itself.
+    #[test]
+    fn message_envelope_has_no_trailing_submit_byte() {
+        assert_eq!(
+            message_envelope("sender (Codex)", "Please review this."),
+            "[duet message from sender (Codex)]: Please review this."
+        );
+    }
 }
