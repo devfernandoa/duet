@@ -1578,11 +1578,18 @@ impl App {
 
     /// Sends every selected node to the back (below every other node) —
     /// relative order among the selected nodes themselves is preserved, the
-    /// same guarantee `raise_selected` makes. `canvas.lower_node` inserts a
-    /// widget as the Fixed container's new *first* child each time it's
-    /// called, so processing the selection in reverse is what keeps the
-    /// group's own relative order intact: the last one lowered (the first
-    /// one in forward order) ends up truly first.
+    /// same guarantee `raise_selected` makes. Plain forward iteration is
+    /// what achieves that here, exactly as in `raise_selected`: each
+    /// `canvas.lower_node` call inserts its widget as the Fixed container's
+    /// new *first* (bottom-most) child, so processing the selection in its
+    /// original order pushes each already-lowered node up by one slot as the
+    /// next one is lowered beneath it — the first node processed ends up
+    /// closest to the rest of the canvas, the last one processed ends up the
+    /// very bottom, matching the ascending `z_order` values assigned in this
+    /// same forward pass. (An earlier version of this function reversed the
+    /// iteration to "compensate" for `lower_node` inserting at the opposite
+    /// end from `raise_node` — that reasoning was backwards and inverted the
+    /// group's relative order; see the code review that caught it.)
     pub fn lower_selected(app: &Rc<RefCell<App>>) {
         let mut app_mut = app.borrow_mut();
         let canvas = app_mut.canvas.clone();
@@ -1593,7 +1600,7 @@ impl App {
             .min()
             .unwrap_or(0);
         let ids: Vec<Uuid> = app_mut.selected.iter().copied().collect();
-        for (offset, id) in ids.iter().enumerate().rev() {
+        for (offset, id) in ids.iter().enumerate() {
             if let Some(entry) = app_mut.nodes.get_mut(id) {
                 entry.record.z_order = min_z - 1 - offset as i64;
                 canvas.lower_node(entry.widget.container());

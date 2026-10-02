@@ -902,4 +902,60 @@ mod tests {
         state.clamp_zoom();
         assert_eq!(state.zoom, 0.1);
     }
+
+    /// `fixed`'s child order from `GtkWidget::first_child`/`next_sibling`,
+    /// for asserting exact paint order (first = bottom, last = top) after a
+    /// sequence of `raise_node`/`lower_node` calls.
+    fn child_order(fixed: &gtk4::Fixed) -> Vec<String> {
+        let mut order = Vec::new();
+        let mut child = fixed.first_child();
+        while let Some(widget) = child {
+            order.push(widget.widget_name().to_string());
+            child = widget.next_sibling();
+        }
+        order
+    }
+
+    /// Regression test for exactly the bug a code review caught in
+    /// `App::lower_selected`: calling `lower_node` in the *wrong* order for
+    /// a multi-node "send to back" silently reverses the group's relative
+    /// stacking instead of preserving it. Needs a display (constructs real
+    /// `gtk4::Label` widgets and a real `Fixed`), so excluded from the
+    /// default `cargo test` run like this module's other GTK-dependent
+    /// tests — see `node.rs`'s `request_grid_drives_the_cards_real_allocation`
+    /// for the same pattern.
+    #[test]
+    #[ignore = "needs a display"]
+    fn lower_node_called_in_forward_order_preserves_relative_stacking() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let canvas = Canvas::new();
+        let labels: Vec<gtk4::Label> = ["a", "b", "x", "c", "y", "d", "z", "e"]
+            .iter()
+            .map(|name| {
+                let label = gtk4::Label::new(None);
+                label.set_widget_name(name);
+                canvas.add_node(&label, (0.0, 0.0));
+                label
+            })
+            .collect();
+        let find = |name: &str| labels.iter().find(|l| l.widget_name() == name).unwrap();
+
+        // Lower x, y, z in that forward order — the same order
+        // `App::lower_selected` now uses (after the fix) for a selection
+        // processed in its natural iteration order.
+        canvas.lower_node(find("x"));
+        canvas.lower_node(find("y"));
+        canvas.lower_node(find("z"));
+
+        // z was lowered last, so it's the new bottom-most child; x was
+        // lowered first, so two later calls each pushed it up one slot,
+        // leaving it closest to the untouched siblings. The untouched
+        // widgets (a, b, c, d, e) keep their original relative order.
+        assert_eq!(
+            child_order(&canvas.fixed),
+            vec!["z", "y", "x", "a", "b", "c", "d", "e"]
+        );
+    }
 }
