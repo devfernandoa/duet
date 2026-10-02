@@ -2576,6 +2576,16 @@ fn materialize_node(
                     }
                 },
             );
+            // `NoteNode::new`'s own initial render happens before this
+            // widget has a parent at all, so a thematic break in `markdown`
+            // renders at its width fallback (see `markdown::render_to_buffer`'s
+            // doc comment) rather than the card's real size. Schedules a
+            // second render for once this node has actually been added to
+            // the canvas and allocated a real width (`canvas.add_node`, a
+            // few lines below where this record finishes materializing) —
+            // without this, a restored note with a divider shows it at the
+            // wrong width until the user happens to edit or resize that note.
+            node.refresh_preview_after_resize();
             node.edit_view.buffer().connect_changed({
                 let app = Rc::clone(app);
                 move |buffer| {

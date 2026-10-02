@@ -5,6 +5,8 @@
 //! `model.rs` types beyond the plain strings/bools `app.rs` passes in.
 
 use gtk4::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
 use vte4::TerminalExt;
 
 /// Minimum size (pixels, pre-zoom) any card can be resized down to via
@@ -434,9 +436,13 @@ pub struct NoteNode {
     pub container: gtk4::Box,
     pub edit_view: gtk4::TextView,
     /// Kept as a field (not just a closure-captured local) so
-    /// `refresh_preview` can re-render into it after a resize, not only
-    /// after an edit.
+    /// `refresh_preview_after_resize` can re-render into it after a resize,
+    /// not only after an edit.
     preview_view: gtk4::TextView,
+    /// `true` while a `refresh_preview_after_resize`-queued idle callback is
+    /// still pending — see that method's doc comment for why this debounces
+    /// multiple calls (one per resize-drag tick) into at most one callback.
+    preview_refresh_scheduled: Rc<Cell<bool>>,
     edit_scroller: gtk4::ScrolledWindow,
     preview_scroller: gtk4::ScrolledWindow,
     pub mode_button: gtk4::Button,
@@ -561,6 +567,7 @@ impl NoteNode {
             container,
             edit_view,
             preview_view,
+            preview_refresh_scheduled: Rc::new(Cell::new(false)),
             edit_scroller,
             preview_scroller,
             mode_button,
@@ -574,22 +581,35 @@ impl NoteNode {
     }
 
     /// Schedules a re-render of the Preview pane from the current Edit
-    /// source for once GTK has finished processing the resize that's
-    /// presumably the reason `App::apply_resize`'s `Note` branch is calling
-    /// this — a thematic break's width is computed from `preview_view`'s
-    /// *current* allocation at render time (see `markdown::render_to_buffer`),
-    /// which during an active resize drag is still the *previous*
+    /// source for once GTK has finished processing a resize or the card's
+    /// initial placement on the canvas — a thematic break's width is
+    /// computed from `preview_view`'s *current* allocation at render time
+    /// (see `markdown::render_to_buffer`), which immediately after either of
+    /// those is still the *previous* (or, for a brand-new card, nonexistent)
     /// allocation: GTK only recomputes it on the next main-loop pass, not
-    /// synchronously inside `set_size_request`. A regular (default-priority)
-    /// idle callback is guaranteed to run after GTK's own (higher-priority)
-    /// resize/relayout processing, so by the time this fires, the new
-    /// allocation is in. Edits don't need this: `edit_view`'s own
-    /// `connect_changed` handler re-renders immediately, since typing never
-    /// changes the view's width the way a resize does.
+    /// synchronously inside `set_size_request`/`add_node`. A regular
+    /// (default-priority) idle callback is guaranteed to run after GTK's own
+    /// (higher-priority) resize/relayout processing, so by the time this
+    /// fires, the new allocation is in. Edits don't need this: `edit_view`'s
+    /// own `connect_changed` handler re-renders immediately, since typing
+    /// never changes the view's width the way a resize does.
+    ///
+    /// Debounced via `preview_refresh_scheduled`: a live resize drag calls
+    /// this once per pointer-motion tick, and queuing one idle callback per
+    /// tick would mean dozens of redundant re-renders, each immediately
+    /// superseded by the next, by the time the drag ends. At most one
+    /// callback is ever in flight; since it reads `edit_view`/`preview_view`
+    /// at the time it actually runs (not at schedule time), it always picks
+    /// up the latest state regardless of how many ticks asked for it.
     pub fn refresh_preview_after_resize(&self) {
+        if self.preview_refresh_scheduled.replace(true) {
+            return;
+        }
         let edit_view = self.edit_view.clone();
         let preview_view = self.preview_view.clone();
+        let scheduled = self.preview_refresh_scheduled.clone();
         gtk4::glib::idle_add_local_once(move || {
+            scheduled.set(false);
             let source = buffer_text(&edit_view.buffer());
             crate::markdown::render_to_buffer(&preview_view, &crate::markdown::parse(&source));
         });
