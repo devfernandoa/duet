@@ -14,6 +14,12 @@
 //! widget to hand those to; a clean monospace-grid renderer is a reasonable
 //! future upgrade, not a Milestone 1 requirement.
 //!
+//! A thematic break renders as a real `GtkSeparator` widget anchored into
+//! the buffer (`render_to_buffer`), not as a run of literal characters — a
+//! fixed character count is either too long (overflowing a narrow note) or
+//! too short (not reaching the edge of a wide one), where a widget just
+//! always spans exactly the view's current width, at any note size.
+//!
 //! One CommonMark subtlety worth knowing before "`---` doesn't work" reads as
 //! a parser bug: a line of hyphens immediately after a paragraph with **no
 //! blank line between them** is a Setext heading underline, not a thematic
@@ -39,21 +45,21 @@ pub enum SpanStyle {
     CodeBlock,
     /// A thematic break (`Event::Rule`). Carried as a style on a span of
     /// filler characters, the same shape every other block uses, rather than
-    /// a `Line`-level flag — see `render_to_buffer` for why this needed no
-    /// new rendering mechanism (an anchored child widget, say) to look like
-    /// an actual divider rather than three literal hyphen characters.
+    /// a `Line`-level flag — `render_to_buffer` detects it the same way it
+    /// detects every other style, even though what it renders for this one
+    /// (a real `GtkSeparator` widget, not styled text) is different.
     Rule,
 }
 
-/// How many `RULE_CHAR`s a thematic break renders as. A plain character
-/// count rather than something that measures the view's actual pixel width:
-/// `render_to_buffer` only ever sees `Line`s, never a widget to measure, and
-/// a fixed run this long reads as a clear divider in every note size this
-/// app's cards are ever resized to.
+/// How many `RULE_CHAR`s [`parse`] puts on a thematic break's span. Only
+/// [`parse`]'s own tests read this text directly (to confirm a rule was
+/// found at all) — `render_to_buffer` ignores it and renders a real
+/// `GtkSeparator` widget instead, which is what's actually visible; see this
+/// module's doc comment for why a character run can't do that job on its
+/// own at every note width.
 const RULE_WIDTH: usize = 48;
-/// Unicode box-drawing light horizontal line (U+2500) — renders as a
-/// continuous rule in any font, unlike plain ASCII hyphens (which render
-/// with visible gaps and don't read as a single line).
+/// Unicode box-drawing light horizontal line (U+2500), used only as the
+/// placeholder text described above.
 const RULE_CHAR: char = '─';
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,12 +268,17 @@ pub fn parse(source: &str) -> Vec<Line> {
     lines
 }
 
-/// Applies `lines` (from [`parse`]) to a GTK `TextBuffer`, replacing its
-/// entire content. The only GTK-touching half of this module — kept this
-/// thin specifically so [`parse`] stays testable without a display.
-pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
+/// Applies `lines` (from [`parse`]) to `view`'s buffer, replacing its entire
+/// content. The only GTK-touching half of this module — kept this thin
+/// specifically so [`parse`] stays testable without a display. Takes the
+/// `TextView` itself, not just its `TextBuffer`, because a thematic break
+/// needs `TextView::add_child_at_anchor` (a real `GtkSeparator` widget,
+/// which a bare buffer has no way to host) to always span the view's exact
+/// current width.
+pub fn render_to_buffer(view: &gtk4::TextView, lines: &[Line]) {
     use gtk4::prelude::*;
 
+    let buffer = view.buffer();
     buffer.set_text("");
     let table = buffer.tag_table();
     for name in [
@@ -283,7 +294,6 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
         "md-link",
         "md-quote",
         "md-codeblock",
-        "md-rule",
     ] {
         if table.lookup(name).is_none() {
             let tag = gtk4::TextTag::new(Some(name));
@@ -323,11 +333,6 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
                     tag.set_family(Some("monospace"));
                     tag.set_background(Some("#00000012"));
                 }
-                "md-rule" => {
-                    // Muted rather than body-text color, so a run of
-                    // RULE_CHAR reads as a divider rule, not as more text.
-                    tag.set_foreground(Some("#8a8a8a"));
-                }
                 _ => {}
             }
             table.add(&tag);
@@ -361,6 +366,39 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
             end = buffer.end_iter();
         }
         for span in &line.spans {
+            if span.styles.contains(&SpanStyle::Rule) {
+                // A real widget, not text, so it always exactly fits the
+                // note's current size instead of either overflowing a
+                // narrow one or falling short of a wide one — see this
+                // module's doc comment. `span.text` (a run of `RULE_CHAR`)
+                // is never actually inserted here; it only exists for
+                // `parse`'s own tests to detect a rule was found.
+                //
+                // `hexpand` does nothing for a `TextView` child anchor —
+                // unlike a normal container, the text layout engine sizes an
+                // anchored widget at its own measured size and never
+                // distributes leftover space to it — so the width has to be
+                // set explicitly from the view's own current allocation.
+                // `render_to_buffer` runs again on every edit (immediately)
+                // and, via `NoteNode::refresh_preview_after_resize`, after
+                // every resize (once GTK has reallocated), so this stays
+                // correct as the note's size changes; before the view is
+                // ever allocated (the very first render), a fallback keeps
+                // the rule from collapsing to zero width.
+                let content_width = view.width() - view.left_margin() - view.right_margin();
+                let width = if content_width > 0 {
+                    content_width
+                } else {
+                    150
+                };
+                let anchor = buffer.create_child_anchor(&mut end);
+                let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+                separator.set_size_request(width, -1);
+                separator.add_css_class("md-rule");
+                view.add_child_at_anchor(&separator, &anchor);
+                end = buffer.end_iter();
+                continue;
+            }
             let start_offset = end.offset();
             buffer.insert(&mut end, &span.text);
             end = buffer.end_iter();
@@ -379,7 +417,7 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
                     SpanStyle::Link(_) => "md-link",
                     SpanStyle::BlockQuote => "md-quote",
                     SpanStyle::CodeBlock => "md-codeblock",
-                    SpanStyle::Rule => "md-rule",
+                    SpanStyle::Rule => unreachable!("handled above"),
                 };
                 buffer.apply_tag_by_name(tag_name, &start, &end);
             }

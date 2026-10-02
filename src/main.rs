@@ -467,16 +467,6 @@ fn wire_canvas_edit_actions(
         ("align-right", "Align Right", Box::new(App::align_right)),
         ("align-top", "Align Top", Box::new(App::align_top)),
         ("align-bottom", "Align Bottom", Box::new(App::align_bottom)),
-        (
-            "distribute-horizontal",
-            "Distribute Horizontally",
-            Box::new(App::distribute_horizontal),
-        ),
-        (
-            "distribute-vertical",
-            "Distribute Vertically",
-            Box::new(App::distribute_vertical),
-        ),
         ("copy-selected", "Copy", Box::new(App::copy_selected)),
     ];
 
@@ -507,12 +497,7 @@ fn wire_canvas_edit_actions(
             | "raise-selected"
             | "lower-selected"
             | "terminate-selected-terminals" => &selection_section,
-            "align-left"
-            | "align-right"
-            | "align-top"
-            | "align-bottom"
-            | "distribute-horizontal"
-            | "distribute-vertical" => &layout_section,
+            "align-left" | "align-right" | "align-top" | "align-bottom" => &layout_section,
             "copy-selected" => &clipboard_section,
             _ => &selection_section,
         };
@@ -533,6 +518,33 @@ fn wire_canvas_edit_actions(
     selection_section.append_item(&gtk4::gio::MenuItem::new(
         Some("Restart Terminal"),
         Some("app.restart-selected-terminals"),
+    ));
+
+    // Distribute needs `toast_overlay` too: below 3 selected nodes it's a
+    // documented no-op (nothing "in between" two fixed ends to
+    // redistribute), and a silent no-op otherwise reads as a broken command.
+    let distribute_h_action = gtk4::gio::SimpleAction::new("distribute-horizontal", None);
+    distribute_h_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::distribute_horizontal(&app, &toast_overlay)
+    });
+    application.add_action(&distribute_h_action);
+    layout_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Distribute Horizontally"),
+        Some("app.distribute-horizontal"),
+    ));
+
+    let distribute_v_action = gtk4::gio::SimpleAction::new("distribute-vertical", None);
+    distribute_v_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::distribute_vertical(&app, &toast_overlay)
+    });
+    application.add_action(&distribute_v_action);
+    layout_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Distribute Vertically"),
+        Some("app.distribute-vertical"),
     ));
 
     // Duplicate and Paste need `toast_overlay` (a failed terminal respawn

@@ -5,6 +5,8 @@
 //! `model.rs` types beyond the plain strings/bools `app.rs` passes in.
 
 use gtk4::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
 use vte4::TerminalExt;
 
 /// Minimum size (pixels, pre-zoom) any card can be resized down to via
@@ -433,6 +435,14 @@ impl SessionNode {
 pub struct NoteNode {
     pub container: gtk4::Box,
     pub edit_view: gtk4::TextView,
+    /// Kept as a field (not just a closure-captured local) so
+    /// `refresh_preview_after_resize` can re-render into it after a resize,
+    /// not only after an edit.
+    preview_view: gtk4::TextView,
+    /// `true` while a `refresh_preview_after_resize`-queued idle callback is
+    /// still pending — see that method's doc comment for why this debounces
+    /// multiple calls (one per resize-drag tick) into at most one callback.
+    preview_refresh_scheduled: Rc<Cell<bool>>,
     edit_scroller: gtk4::ScrolledWindow,
     preview_scroller: gtk4::ScrolledWindow,
     pub mode_button: gtk4::Button,
@@ -503,10 +513,7 @@ impl NoteNode {
         preview_view.set_left_margin(8);
         preview_view.set_right_margin(8);
         preview_view.add_css_class("note-text");
-        crate::markdown::render_to_buffer(
-            &preview_view.buffer(),
-            &crate::markdown::parse(initial_markdown),
-        );
+        crate::markdown::render_to_buffer(&preview_view, &crate::markdown::parse(initial_markdown));
 
         // Keeps Preview (and the visible half of Split) live as the user
         // types in Edit, rather than only re-rendering on a mode switch.
@@ -514,19 +521,26 @@ impl NoteNode {
             let preview_view = preview_view.clone();
             move |buffer| {
                 let source = buffer_text(buffer);
-                crate::markdown::render_to_buffer(
-                    &preview_view.buffer(),
-                    &crate::markdown::parse(&source),
-                );
+                crate::markdown::render_to_buffer(&preview_view, &crate::markdown::parse(&source));
             }
         });
 
+        // `vexpand` (to match the `hexpand` already set below) is what makes
+        // the card's vertical Box give `body` its full remaining height
+        // rather than just `paned`'s minimum — a GTK widget's computed
+        // expand propagates up through its ancestors, so without it here
+        // nothing in this card's tree ever requests more than its natural
+        // size and a resized note just leaves blank space below its content
+        // instead of actually filling the card (see `PlaceholderNode::new`,
+        // which already relies on the same propagation via `content`).
         let edit_scroller = gtk4::ScrolledWindow::new();
         edit_scroller.set_child(Some(&edit_view));
         edit_scroller.set_hexpand(true);
+        edit_scroller.set_vexpand(true);
         let preview_scroller = gtk4::ScrolledWindow::new();
         preview_scroller.set_child(Some(&preview_view));
         preview_scroller.set_hexpand(true);
+        preview_scroller.set_vexpand(true);
 
         let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
         paned.set_start_child(Some(&edit_scroller));
@@ -552,6 +566,8 @@ impl NoteNode {
         let node = NoteNode {
             container,
             edit_view,
+            preview_view,
+            preview_refresh_scheduled: Rc::new(Cell::new(false)),
             edit_scroller,
             preview_scroller,
             mode_button,
@@ -562,6 +578,41 @@ impl NoteNode {
         };
         node.set_view_mode(initial_mode);
         node
+    }
+
+    /// Schedules a re-render of the Preview pane from the current Edit
+    /// source for once GTK has finished processing a resize or the card's
+    /// initial placement on the canvas — a thematic break's width is
+    /// computed from `preview_view`'s *current* allocation at render time
+    /// (see `markdown::render_to_buffer`), which immediately after either of
+    /// those is still the *previous* (or, for a brand-new card, nonexistent)
+    /// allocation: GTK only recomputes it on the next main-loop pass, not
+    /// synchronously inside `set_size_request`/`add_node`. A regular
+    /// (default-priority) idle callback is guaranteed to run after GTK's own
+    /// (higher-priority) resize/relayout processing, so by the time this
+    /// fires, the new allocation is in. Edits don't need this: `edit_view`'s
+    /// own `connect_changed` handler re-renders immediately, since typing
+    /// never changes the view's width the way a resize does.
+    ///
+    /// Debounced via `preview_refresh_scheduled`: a live resize drag calls
+    /// this once per pointer-motion tick, and queuing one idle callback per
+    /// tick would mean dozens of redundant re-renders, each immediately
+    /// superseded by the next, by the time the drag ends. At most one
+    /// callback is ever in flight; since it reads `edit_view`/`preview_view`
+    /// at the time it actually runs (not at schedule time), it always picks
+    /// up the latest state regardless of how many ticks asked for it.
+    pub fn refresh_preview_after_resize(&self) {
+        if self.preview_refresh_scheduled.replace(true) {
+            return;
+        }
+        let edit_view = self.edit_view.clone();
+        let preview_view = self.preview_view.clone();
+        let scheduled = self.preview_refresh_scheduled.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            scheduled.set(false);
+            let source = buffer_text(&edit_view.buffer());
+            crate::markdown::render_to_buffer(&preview_view, &crate::markdown::parse(&source));
+        });
     }
 
     pub fn set_view_mode(&self, mode: crate::model::NoteViewMode) {
@@ -615,6 +666,11 @@ impl TextNode {
         text_view.buffer().set_text(initial_text);
         text_view.set_wrap_mode(gtk4::WrapMode::Word);
         text_view.set_size_request(220, 160);
+        // Same fix as `NoteNode`'s scrollers: without an explicit expand
+        // request somewhere in this card's tree, resizing it just leaves
+        // blank space below the text instead of actually filling the card.
+        text_view.set_vexpand(true);
+        text_view.set_hexpand(true);
         text_view.set_top_margin(8);
         text_view.set_bottom_margin(8);
         text_view.set_left_margin(8);
