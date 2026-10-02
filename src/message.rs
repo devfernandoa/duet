@@ -28,6 +28,13 @@ pub struct AgentMessage {
     pub status: DeliveryStatus,
 }
 
+/// Formats a message as terminal input. A single trailing carriage return is
+/// the terminal representation of the Return key, which submits the message
+/// in interactive agent UIs.
+pub fn message_envelope(source_label: &str, content: &str) -> String {
+    format!("[duet message from {source_label}]: {content}")
+}
+
 /// Seconds since the Unix epoch, for `AgentMessage::timestamp`. Falls back
 /// to 0 only if the system clock is somehow set before 1970 — never fails.
 pub fn now_epoch_secs() -> u64 {
@@ -64,5 +71,16 @@ mod tests {
         // Any time after this commit was written; catches an accidental
         // `unwrap_or(0)` fallback firing on a normal clock.
         assert!(now_epoch_secs() > 1_700_000_000);
+    }
+
+    /// No trailing `\r` here — the submitting keystroke is written as its
+    /// own, separately-timed `write_input` call (see `app::MESSAGE_SUBMIT_DELAY`),
+    /// not appended to the envelope text itself.
+    #[test]
+    fn message_envelope_has_no_trailing_submit_byte() {
+        assert_eq!(
+            message_envelope("sender (Codex)", "Please review this."),
+            "[duet message from sender (Codex)]: Please review this."
+        );
     }
 }
