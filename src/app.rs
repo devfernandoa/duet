@@ -642,10 +642,10 @@ impl App {
     /// failing that an exact (case-sensitive) session name — names are
     /// already enforced unique by `create_session`, so this is unambiguous.
     fn find_session_id(&self, target: &str) -> Option<Uuid> {
-        if let Ok(id) = Uuid::parse_str(target) {
-            if self.sessions.contains_key(&id) {
-                return Some(id);
-            }
+        if let Ok(id) = Uuid::parse_str(target)
+            && self.sessions.contains_key(&id)
+        {
+            return Some(id);
         }
         self.sessions
             .iter()

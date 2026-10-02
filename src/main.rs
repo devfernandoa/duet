@@ -531,10 +531,10 @@ fn open_new_session_dialog(
             }
             let cwd_row = cwd_row.clone();
             file_dialog.select_folder(Some(&dialog), gtk4::gio::Cancellable::NONE, move |result| {
-                if let Ok(folder) = result {
-                    if let Some(path) = folder.path() {
-                        cwd_row.set_text(&path.display().to_string());
-                    }
+                if let Ok(folder) = result
+                    && let Some(path) = folder.path()
+                {
+                    cwd_row.set_text(&path.display().to_string());
                 }
             });
         }
