@@ -1,10 +1,13 @@
 use crate::account::AccountStore;
-use crate::agent::{Agent, Launch, LaunchRequest};
-use crate::canvas::Canvas;
+use crate::agent::{Agent, Launch, LaunchRequest, with_session_env};
+use crate::canvas::{
+    Canvas, TITLE_BAR_HEIGHT, allocated_size, canvas_point, card_center, card_edge,
+    card_intersection, card_rect, card_vertical_edge, world_drag_delta,
+};
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary};
 use crate::node::{NoteNode, SessionNode};
-use crate::role::Role;
+use crate::role::{Role, with_role_instructions};
 use crate::runtime::SessionRuntime;
 use crate::store::{
     CanvasRecord, LinkRecord, SessionRecord, StickyNoteRecord, Store, WorkspaceRecord,
@@ -29,13 +32,6 @@ const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Caps `App::messages` so a long-running duet with chatty agents doesn't
 /// grow the log unboundedly in memory.
 const MESSAGE_LOG_LIMIT: usize = 200;
-
-/// Formats a message as terminal input. A single trailing carriage return is
-/// the terminal representation of the Return key, which submits the message
-/// in interactive agent UIs.
-fn message_envelope(source_label: &str, content: &str) -> String {
-    format!("[duet message from {source_label}]: {content}")
-}
 
 /// How long to wait after writing a message's text before writing the
 /// trailing `\r` that submits it. Needed because Claude/Codex's own input
@@ -685,7 +681,7 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "an external sender".to_string());
-        let envelope = message_envelope(&source_label, &content);
+        let envelope = crate::message::message_envelope(&source_label, &content);
         let delivered = app_mut.runtime.write_input(target_id, envelope.as_bytes());
         let status = if delivered {
             DeliveryStatus::Delivered
@@ -1248,62 +1244,6 @@ impl App {
     }
 }
 
-/// Roughly the height a card's title bar adds above its body. Only used to
-/// put a link line's endpoint near the vertical middle of a card rather than
-/// its top edge; a few pixels either way is invisible on a link.
-const TITLE_BAR_HEIGHT: f64 = 28.0;
-
-/// A card's left or right edge at its vertical middle, in world space.
-/// `record.position` is the card's top-left and `record.size` is its *body*
-/// size, hence the title-bar correction.
-fn card_edge(record: &SessionRecord, right: bool) -> (f64, f64) {
-    (
-        if right {
-            record.position.0 + record.size.0
-        } else {
-            record.position.0
-        },
-        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
-    )
-}
-
-fn card_vertical_edge(record: &SessionRecord, bottom: bool) -> (f64, f64) {
-    (
-        record.position.0 + record.size.0 / 2.0,
-        if bottom {
-            record.position.1 + record.size.1 + TITLE_BAR_HEIGHT
-        } else {
-            record.position.1
-        },
-    )
-}
-
-fn card_center(record: &SessionRecord) -> (f64, f64) {
-    (
-        record.position.0 + record.size.0 / 2.0,
-        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
-    )
-}
-
-fn card_intersection(a: &SessionRecord, b: &SessionRecord) -> Option<(f64, f64, f64, f64)> {
-    let (a_x, a_y, a_width, a_height) = card_rect(a);
-    let (b_x, b_y, b_width, b_height) = card_rect(b);
-    let (a_right, a_bottom) = (a_x + a_width, a_y + a_height);
-    let (b_right, b_bottom) = (b_x + b_width, b_y + b_height);
-    let (left, top) = (a_x.max(b_x), a_y.max(b_y));
-    let (right, bottom) = (a_right.min(b_right), a_bottom.min(b_bottom));
-    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
-}
-
-fn card_rect(record: &SessionRecord) -> (f64, f64, f64, f64) {
-    (
-        record.position.0,
-        record.position.1,
-        record.size.0,
-        record.size.1 + TITLE_BAR_HEIGHT,
-    )
-}
-
 /// Click-to-rename: the title label swaps for an entry pre-filled with the
 /// current name, Enter commits (through `App::rename_session`, which enforces
 /// the same uniqueness rule as creating a session), Escape reverts without
@@ -1366,84 +1306,6 @@ fn wire_rename(
         }
     });
     node.title_entry.add_controller(keys);
-}
-
-/// A node body's real current size in pre-zoom pixels (GTK allocations are in
-/// the widget's own untransformed space, so this is directly comparable to the
-/// `size` stored in a record), or `None` if it isn't allocated yet.
-///
-/// Resize drags use this rather than `record.size` as their starting point,
-/// which is the fix for the "card shrank and can't be dragged back up" state.
-/// The two quantities drift apart, because a card's rendered width is
-/// `max(record.size.0, title-bar minimum)`: a 28-character session name
-/// measured 348px of title bar, so a card whose record said 220 actually drew
-/// 348 wide. Starting a resize from the stale 220 meant the first 128px of
-/// rightward drag changed nothing visible at all, and every fresh drag
-/// restarted from the same stale number — the card read as un-growable. The
-/// title label is now ellipsized (see `SessionNode::new`) so the title bar
-/// stops forcing a minimum, but anchoring the drag to the real size is what
-/// makes the gesture self-correcting regardless of where a mismatch comes
-/// from (grid rounding, a future wider title bar, a restored record).
-fn allocated_size(widget: &impl IsA<gtk4::Widget>) -> Option<(f64, f64)> {
-    let widget = widget.as_ref();
-    let (width, height) = (widget.width(), widget.height());
-    (width > 0 && height > 0).then_some((width as f64, height as f64))
-}
-
-/// Expresses `local` — a point in the coordinate space of the widget
-/// `gesture` is attached to — in the canvas `Fixed`'s coordinate space.
-fn canvas_point(
-    gesture: &gtk4::GestureDrag,
-    fixed: &gtk4::Fixed,
-    local: (f64, f64),
-) -> Option<(f64, f64)> {
-    let widget = gesture.widget()?;
-    widget
-        .compute_point(
-            fixed,
-            &gtk4::graphene::Point::new(local.0 as f32, local.1 as f32),
-        )
-        .map(|point| (point.x() as f64, point.y() as f64))
-}
-
-/// How far the pointer has moved, in world units, since the drag began.
-/// `start_pointer` is `canvas_point` of the gesture's start point, captured
-/// once in the `drag-begin` handler.
-///
-/// Why this isn't just `offset / zoom`: a `GestureDrag`'s `offset_x`/
-/// `offset_y` are expressed in the coordinate space of the widget the
-/// gesture is attached to, and GTK re-translates the pointer through that
-/// widget's *current* transform on every event. Every gesture here is
-/// attached to chrome inside a card whose transform the handler changes on
-/// every tick, so the card's own displacement feeds straight back into the
-/// reported offset: with displacement `d` applied and the pointer `m` from
-/// where it started, GTK reports `offset = m - d`, so assigning `d = offset`
-/// settles at `d = m / 2` — the card tracks at half the cursor's speed. The
-/// same recurrence `d_n = m_n - d_(n-1)` has gain -1, so it never damps:
-/// every pointer-sampling irregularity adds a non-decaying alternating
-/// wobble, which is the jitter that grew the further a card was dragged.
-///
-/// Mapping both the start point and the current point into the canvas
-/// `Fixed`'s space cancels the card's displacement exactly and leaves the
-/// true pointer movement. `Fixed` is the right reference because it never
-/// moves — pan and zoom only change its *children's* transforms, which is
-/// why `Canvas`'s own pan gesture (attached to `fixed` itself) never had
-/// this problem. It also makes the `/ zoom` correct: `Fixed`-space units are
-/// screen pixels, whereas the raw gesture offsets were already in the card's
-/// own zoom-scaled space and so were being divided by zoom a second time.
-fn world_drag_delta(
-    gesture: &gtk4::GestureDrag,
-    fixed: &gtk4::Fixed,
-    start_pointer: (f64, f64),
-    zoom: f64,
-) -> Option<(f64, f64)> {
-    let (start_x, start_y) = gesture.start_point()?;
-    let (offset_x, offset_y) = gesture.offset()?;
-    let now = canvas_point(gesture, fixed, (start_x + offset_x, start_y + offset_y))?;
-    Some((
-        (now.0 - start_pointer.0) / zoom,
-        (now.1 - start_pointer.1) / zoom,
-    ))
 }
 
 /// Milestone-1 seam for generic canvas nodes: the part of `SessionEntry`/
@@ -1924,33 +1786,6 @@ fn resolve_claude_account(
     Ok(Some((account, dir)))
 }
 
-/// Combines a role's instructions with whatever prompt text a launch already
-/// has (a handoff summary, or nothing for a brand-new session) into one
-/// `initial_prompt` — the single place role injection happens, reused by
-/// every launch site instead of each one re-deciding how to fold a role in.
-/// Goes through the same provider-agnostic `LaunchRequest::initial_prompt`
-/// field `handoff.rs` already uses, so it needs no Claude-specific code.
-fn with_role_instructions(role_instructions: Option<String>, base: Option<&str>) -> Option<String> {
-    match (role_instructions, base) {
-        (None, None) => None,
-        (Some(role), None) => Some(role),
-        (None, Some(base)) => Some(base.to_string()),
-        (Some(role), Some(base)) => Some(format!("{role}\n\n{base}")),
-    }
-}
-
-/// Appends `DUET_SESSION_ID` so a session's own shell can tell `duet agent
-/// send`/`duet agent list` (`control.rs`) which live session issued the
-/// command. Applied uniformly to every `Launch` after `Agent::launch`
-/// builds the rest of its envs, so no provider in `agent.rs` needs to know
-/// anything about messaging.
-fn with_session_env(mut launch: Launch, session_id: Uuid) -> Launch {
-    launch
-        .envs
-        .push(("DUET_SESSION_ID".to_string(), session_id.to_string()));
-    launch
-}
-
 /// Looks up `role_id` and updates `node`'s title-bar badge to match —
 /// shared by `create_session` and `spawn_workspace_contents` so a session's
 /// assigned role is shown the same way whether it was just created or
@@ -2003,20 +1838,4 @@ fn build_launch_and_record(
         size: (720.0, 504.0),
     };
     Ok((launch, record))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// No trailing `\r` here — the submitting keystroke is written as its
-    /// own, separately-timed `write_input` call (see `MESSAGE_SUBMIT_DELAY`),
-    /// not appended to the envelope text itself.
-    #[test]
-    fn message_envelope_has_no_trailing_submit_byte() {
-        assert_eq!(
-            message_envelope("sender (Codex)", "Please review this."),
-            "[duet message from sender (Codex)]: Please review this."
-        );
-    }
 }

@@ -101,6 +101,24 @@ pub fn is_builtin(id: Uuid) -> bool {
     BUILTIN_IDS.contains(&id)
 }
 
+/// Combines a role's instructions with whatever prompt text a launch already
+/// has (a handoff summary, or nothing for a brand-new session) into one
+/// `initial_prompt` — the single place role injection happens, reused by
+/// every launch site instead of each one re-deciding how to fold a role in.
+/// Goes through the same provider-agnostic `agent::LaunchRequest::initial_prompt`
+/// field `handoff.rs` already uses, so it needs no Claude-specific code.
+pub fn with_role_instructions(
+    role_instructions: Option<String>,
+    base: Option<&str>,
+) -> Option<String> {
+    match (role_instructions, base) {
+        (None, None) => None,
+        (Some(role), None) => Some(role),
+        (None, Some(base)) => Some(base.to_string()),
+        (Some(role), Some(base)) => Some(format!("{role}\n\n{base}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +137,22 @@ mod tests {
     fn is_builtin_recognizes_builtins_and_rejects_others() {
         assert!(is_builtin(Uuid::from_u128(1)));
         assert!(!is_builtin(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn with_role_instructions_combines_role_and_base_when_both_present() {
+        assert_eq!(with_role_instructions(None, None), None);
+        assert_eq!(
+            with_role_instructions(Some("Be terse.".to_string()), None),
+            Some("Be terse.".to_string())
+        );
+        assert_eq!(
+            with_role_instructions(None, Some("Summarize this.")),
+            Some("Summarize this.".to_string())
+        );
+        assert_eq!(
+            with_role_instructions(Some("Be terse.".to_string()), Some("Summarize this.")),
+            Some("Be terse.\n\nSummarize this.".to_string())
+        );
     }
 }

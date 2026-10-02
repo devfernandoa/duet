@@ -25,6 +25,7 @@ impl CanvasState {
     }
 }
 
+use crate::store::SessionRecord;
 use gtk4::prelude::*;
 use gtk4::{glib, graphene, gsk};
 use std::cell::RefCell;
@@ -340,6 +341,62 @@ fn distance_to_segment(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
     ((p.0 - cx).hypot(p.1 - cy)).abs()
 }
 
+/// Roughly the height a card's title bar adds above its body. Only used to
+/// put a link line's endpoint near the vertical middle of a card rather than
+/// its top edge; a few pixels either way is invisible on a link.
+pub const TITLE_BAR_HEIGHT: f64 = 28.0;
+
+/// A card's left or right edge at its vertical middle, in world space.
+/// `record.position` is the card's top-left and `record.size` is its *body*
+/// size, hence the title-bar correction.
+pub fn card_edge(record: &SessionRecord, right: bool) -> (f64, f64) {
+    (
+        if right {
+            record.position.0 + record.size.0
+        } else {
+            record.position.0
+        },
+        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+    )
+}
+
+pub fn card_vertical_edge(record: &SessionRecord, bottom: bool) -> (f64, f64) {
+    (
+        record.position.0 + record.size.0 / 2.0,
+        if bottom {
+            record.position.1 + record.size.1 + TITLE_BAR_HEIGHT
+        } else {
+            record.position.1
+        },
+    )
+}
+
+pub fn card_center(record: &SessionRecord) -> (f64, f64) {
+    (
+        record.position.0 + record.size.0 / 2.0,
+        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+    )
+}
+
+pub fn card_intersection(a: &SessionRecord, b: &SessionRecord) -> Option<(f64, f64, f64, f64)> {
+    let (a_x, a_y, a_width, a_height) = card_rect(a);
+    let (b_x, b_y, b_width, b_height) = card_rect(b);
+    let (a_right, a_bottom) = (a_x + a_width, a_y + a_height);
+    let (b_right, b_bottom) = (b_x + b_width, b_y + b_height);
+    let (left, top) = (a_x.max(b_x), a_y.max(b_y));
+    let (right, bottom) = (a_right.min(b_right), a_bottom.min(b_bottom));
+    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
+}
+
+pub fn card_rect(record: &SessionRecord) -> (f64, f64, f64, f64) {
+    (
+        record.position.0,
+        record.position.1,
+        record.size.0,
+        record.size.1 + TITLE_BAR_HEIGHT,
+    )
+}
+
 /// Graph-paper backdrop, drawn in world space so it pans and scales with the
 /// canvas. A flat mid-gray at low alpha reads as a faint tint over both a
 /// light and a dark theme background, which avoids needing to detect which
@@ -541,6 +598,84 @@ fn apply_view(
         apply_transform(fixed, child, *world_pos, state);
     }
     grid_area.queue_draw();
+}
+
+/// A node body's real current size in pre-zoom pixels (GTK allocations are in
+/// the widget's own untransformed space, so this is directly comparable to the
+/// `size` stored in a record), or `None` if it isn't allocated yet.
+///
+/// Resize drags use this rather than `record.size` as their starting point,
+/// which is the fix for the "card shrank and can't be dragged back up" state.
+/// The two quantities drift apart, because a card's rendered width is
+/// `max(record.size.0, title-bar minimum)`: a 28-character session name
+/// measured 348px of title bar, so a card whose record said 220 actually drew
+/// 348 wide. Starting a resize from the stale 220 meant the first 128px of
+/// rightward drag changed nothing visible at all, and every fresh drag
+/// restarted from the same stale number — the card read as un-growable. The
+/// title label is now ellipsized (see `SessionNode::new`) so the title bar
+/// stops forcing a minimum, but anchoring the drag to the real size is what
+/// makes the gesture self-correcting regardless of where a mismatch comes
+/// from (grid rounding, a future wider title bar, a restored record).
+pub fn allocated_size(widget: &impl IsA<gtk4::Widget>) -> Option<(f64, f64)> {
+    let widget = widget.as_ref();
+    let (width, height) = (widget.width(), widget.height());
+    (width > 0 && height > 0).then_some((width as f64, height as f64))
+}
+
+/// Expresses `local` — a point in the coordinate space of the widget
+/// `gesture` is attached to — in the canvas `Fixed`'s coordinate space.
+pub fn canvas_point(
+    gesture: &gtk4::GestureDrag,
+    fixed: &gtk4::Fixed,
+    local: (f64, f64),
+) -> Option<(f64, f64)> {
+    let widget = gesture.widget()?;
+    widget
+        .compute_point(
+            fixed,
+            &gtk4::graphene::Point::new(local.0 as f32, local.1 as f32),
+        )
+        .map(|point| (point.x() as f64, point.y() as f64))
+}
+
+/// How far the pointer has moved, in world units, since the drag began.
+/// `start_pointer` is `canvas_point` of the gesture's start point, captured
+/// once in the `drag-begin` handler.
+///
+/// Why this isn't just `offset / zoom`: a `GestureDrag`'s `offset_x`/
+/// `offset_y` are expressed in the coordinate space of the widget the
+/// gesture is attached to, and GTK re-translates the pointer through that
+/// widget's *current* transform on every event. Every gesture here is
+/// attached to chrome inside a card whose transform the handler changes on
+/// every tick, so the card's own displacement feeds straight back into the
+/// reported offset: with displacement `d` applied and the pointer `m` from
+/// where it started, GTK reports `offset = m - d`, so assigning `d = offset`
+/// settles at `d = m / 2` — the card tracks at half the cursor's speed. The
+/// same recurrence `d_n = m_n - d_(n-1)` has gain -1, so it never damps:
+/// every pointer-sampling irregularity adds a non-decaying alternating
+/// wobble, which is the jitter that grew the further a card was dragged.
+///
+/// Mapping both the start point and the current point into the canvas
+/// `Fixed`'s space cancels the card's displacement exactly and leaves the
+/// true pointer movement. `Fixed` is the right reference because it never
+/// moves — pan and zoom only change its *children's* transforms, which is
+/// why `Canvas`'s own pan gesture (attached to `fixed` itself) never had
+/// this problem. It also makes the `/ zoom` correct: `Fixed`-space units are
+/// screen pixels, whereas the raw gesture offsets were already in the card's
+/// own zoom-scaled space and so were being divided by zoom a second time.
+pub fn world_drag_delta(
+    gesture: &gtk4::GestureDrag,
+    fixed: &gtk4::Fixed,
+    start_pointer: (f64, f64),
+    zoom: f64,
+) -> Option<(f64, f64)> {
+    let (start_x, start_y) = gesture.start_point()?;
+    let (offset_x, offset_y) = gesture.offset()?;
+    let now = canvas_point(gesture, fixed, (start_x + offset_x, start_y + offset_y))?;
+    Some((
+        (now.0 - start_pointer.0) / zoom,
+        (now.1 - start_pointer.1) / zoom,
+    ))
 }
 
 #[cfg(test)]
