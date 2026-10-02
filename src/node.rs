@@ -1,15 +1,16 @@
-//! A GTK widget that displays a terminal. Has zero PTY/process-management
-//! knowledge (that's `session.rs`'s job) and zero knowledge of canvas
-//! positioning (that's `canvas.rs`'s job) — it only knows how to display
-//! bytes (`feed`) and report what the user typed (`connect_commit`).
+//! GTK widgets that display one canvas node each. These widgets know how to
+//! show bytes/text and report user input/edits; they have zero PTY/process
+//! knowledge (`session.rs`/`runtime.rs`'s job) and zero canvas positioning
+//! knowledge (`canvas.rs`'s job), and zero knowledge of `NodeRecord`/
+//! `model.rs` types beyond the plain strings/bools `app.rs` passes in.
 
 use gtk4::prelude::*;
 use vte4::TerminalExt;
 
-/// Minimum size (pixels, pre-zoom) either a session card's terminal or a
-/// note's text area can be resized down to via `resize_handle`. This floor is
-/// what keeps the resize grip reachable: at 220x140 the grip still sits on a
-/// body large enough to hold it clear of the title bar.
+/// Minimum size (pixels, pre-zoom) any card can be resized down to via
+/// `resize_handle`. This floor is what keeps the resize grip reachable: at
+/// 220x140 the grip still sits on a body large enough to hold it clear of
+/// the title bar.
 pub const MIN_NODE_WIDTH: f64 = 220.0;
 pub const MIN_NODE_HEIGHT: f64 = 140.0;
 
@@ -39,11 +40,11 @@ fn grid_size(width: f64, height: f64, char_width: i64, char_height: i64) -> Opti
     ))
 }
 
-/// Builds the small bottom-right resize grip shared by `SessionNode` and
-/// `NoteNode`: a plain `Box` overlaid on the node's content widget. Callers
-/// wire a `GestureDrag` onto it (in `app.rs`, which owns canvas/position
-/// knowledge) and apply `nwse-resize` cursor affordance here, since that's
-/// purely cosmetic widget setup.
+/// Builds the small bottom-right resize grip shared by every node kind: a
+/// plain `Box` overlaid on the node's content widget. Callers wire a
+/// `GestureDrag` onto it (in `app.rs`, which owns canvas/position knowledge)
+/// and apply `nwse-resize` cursor affordance here, since that's purely
+/// cosmetic widget setup.
 fn resize_handle() -> gtk4::Box {
     let handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     // 16px rather than 14: this is the only way to resize a card, and at the
@@ -75,10 +76,15 @@ pub fn set_renaming(label: &gtk4::Label, entry: &gtk4::Entry, renaming: bool) {
 
 /// Collapse/expand a node to just its title bar. Deliberately self-contained
 /// here rather than wired from `app.rs`: it is pure widget visibility with no
-/// bearing on the session, its PTY, or the store. Not persisted — a collapsed
-/// card comes back expanded, which `store.rs` would need a new field to
-/// change and nobody asked for that.
-fn wire_minimize(button: &gtk4::Button, body: &gtk4::Overlay) {
+/// bearing on the node's record, its runtime, or the store caller side —
+/// `app.rs` separately persists `NodeRecord::collapsed` so the state survives
+/// a restart; this function only ever flips what's already on screen.
+fn wire_minimize(
+    button: &gtk4::Button,
+    body: &gtk4::Overlay,
+    initially_collapsed: bool,
+    on_toggle: impl Fn(bool) + 'static,
+) {
     let sync = |button: &gtk4::Button, expanded: bool| {
         button.set_icon_name(if expanded {
             "go-up-symbolic"
@@ -91,13 +97,16 @@ fn wire_minimize(button: &gtk4::Button, body: &gtk4::Overlay) {
             "Expand"
         }));
     };
-    sync(button, true);
+    let expanded = !initially_collapsed;
+    body.set_visible(expanded);
+    sync(button, expanded);
     button.connect_clicked({
         let body = body.clone();
         move |button| {
             let expanded = !body.is_visible();
             body.set_visible(expanded);
             sync(button, expanded);
+            on_toggle(!expanded);
         }
     });
 }
@@ -119,6 +128,14 @@ fn role_badge_widgets() -> (gtk4::Box, gtk4::Image, gtk4::Label) {
     badge.append(&label);
     badge.set_visible(false);
     (badge, icon, label)
+}
+
+/// The full text of a `GtkTextBuffer`, for reading back whatever the user
+/// typed/edited — shared by every text-bearing node kind below.
+fn buffer_text(buffer: &gtk4::TextBuffer) -> String {
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
 }
 
 pub struct SessionNode {
@@ -150,7 +167,11 @@ pub struct SessionNode {
 }
 
 impl SessionNode {
-    pub fn new(name: &str) -> SessionNode {
+    pub fn new(
+        name: &str,
+        collapsed: bool,
+        on_collapse_toggle: impl Fn(bool) + 'static,
+    ) -> SessionNode {
         let title_label = gtk4::Label::new(Some(name));
         title_label.add_css_class("heading");
         title_label.add_css_class("node-title");
@@ -237,7 +258,7 @@ impl SessionNode {
         container.append(&body);
         container.add_css_class("card");
 
-        wire_minimize(&minimize_button, &body);
+        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
 
         let node = SessionNode {
             container,
@@ -356,11 +377,172 @@ impl SessionNode {
     }
 }
 
-/// A sticky note on the canvas: a plain text view in a color-tinted card, with
-/// no PTY/process knowledge (unlike `SessionNode`). Has the same title-bar
-/// chrome (drag handle, close button) and resize handle as `SessionNode`, so
-/// notes and session cards behave the same way on the canvas.
+/// A Markdown note on the canvas: Edit mode shows raw Markdown source in an
+/// editable `GtkTextView`; Preview renders it (via `markdown.rs`) into a
+/// second, read-only `GtkTextView`; Split shows both side by side in a
+/// `GtkPaned`. All three modes are implemented as one `GtkPaned` whose two
+/// children are simply shown/hidden (`set_view_mode`) rather than reparented
+/// between a `GtkStack`'s pages and the `GtkPaned` — reparenting a live GTK
+/// widget between containers on every mode switch would be the "large amount
+/// of special-case GTK code" the Split-mode requirement explicitly allows
+/// skipping; toggling visibility on two permanently-parented children avoids
+/// that entirely. Plain Markdown source editing (Edit mode) is always
+/// available, satisfying that same requirement.
 pub struct NoteNode {
+    pub container: gtk4::Box,
+    pub edit_view: gtk4::TextView,
+    edit_scroller: gtk4::ScrolledWindow,
+    preview_scroller: gtk4::ScrolledWindow,
+    pub mode_button: gtk4::Button,
+    pub drag_handle: gtk4::Box,
+    pub close_button: gtk4::Button,
+    pub resize_handle: gtk4::Box,
+}
+
+fn mode_label(mode: crate::model::NoteViewMode) -> &'static str {
+    use crate::model::NoteViewMode;
+    match mode {
+        NoteViewMode::Edit => "Edit",
+        NoteViewMode::Preview => "Preview",
+        NoteViewMode::Split => "Split",
+    }
+}
+
+impl NoteNode {
+    pub fn new(
+        initial_markdown: &str,
+        color: &str,
+        initial_mode: crate::model::NoteViewMode,
+        collapsed: bool,
+        on_collapse_toggle: impl Fn(bool) + 'static,
+    ) -> NoteNode {
+        let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        drag_handle.set_hexpand(true);
+        drag_handle.set_cursor_from_name(Some("grab"));
+
+        let mode_button = gtk4::Button::with_label(mode_label(initial_mode));
+        mode_button.add_css_class("flat");
+        mode_button.set_tooltip_text(Some("Cycle Edit / Preview / Split"));
+        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
+        minimize_button.add_css_class("flat");
+        let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_button.add_css_class("flat");
+        close_button.set_tooltip_text(Some("Delete note"));
+
+        let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        title_bar.add_css_class("note-title-bar");
+        title_bar.append(&drag_handle);
+        title_bar.append(&mode_button);
+        title_bar.append(&minimize_button);
+        title_bar.append(&close_button);
+
+        let edit_view = gtk4::TextView::new();
+        edit_view.buffer().set_text(initial_markdown);
+        edit_view.set_wrap_mode(gtk4::WrapMode::Word);
+        edit_view.set_top_margin(8);
+        edit_view.set_bottom_margin(8);
+        edit_view.set_left_margin(8);
+        edit_view.set_right_margin(8);
+        // Forces dark, legible text regardless of the system theme. See the
+        // `textview.note-text` rule in style.css for why the `color` has to
+        // sit on this node rather than on the text view's internal `text`
+        // node. The pastel background is set on both nodes, since a
+        // GtkTextView otherwise paints its own theme-default background over
+        // whatever color the card behind it sets.
+        edit_view.add_css_class("note-text");
+
+        let preview_view = gtk4::TextView::new();
+        preview_view.set_editable(false);
+        preview_view.set_cursor_visible(false);
+        preview_view.set_wrap_mode(gtk4::WrapMode::Word);
+        preview_view.set_top_margin(8);
+        preview_view.set_bottom_margin(8);
+        preview_view.set_left_margin(8);
+        preview_view.set_right_margin(8);
+        preview_view.add_css_class("note-text");
+        crate::markdown::render_to_buffer(
+            &preview_view.buffer(),
+            &crate::markdown::parse(initial_markdown),
+        );
+
+        // Keeps Preview (and the visible half of Split) live as the user
+        // types in Edit, rather than only re-rendering on a mode switch.
+        edit_view.buffer().connect_changed({
+            let preview_view = preview_view.clone();
+            move |buffer| {
+                let source = buffer_text(buffer);
+                crate::markdown::render_to_buffer(
+                    &preview_view.buffer(),
+                    &crate::markdown::parse(&source),
+                );
+            }
+        });
+
+        let edit_scroller = gtk4::ScrolledWindow::new();
+        edit_scroller.set_child(Some(&edit_view));
+        edit_scroller.set_hexpand(true);
+        let preview_scroller = gtk4::ScrolledWindow::new();
+        preview_scroller.set_child(Some(&preview_view));
+        preview_scroller.set_hexpand(true);
+
+        let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        paned.set_start_child(Some(&edit_scroller));
+        paned.set_end_child(Some(&preview_scroller));
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+        paned.set_size_request(220, 160);
+
+        let resize_handle = resize_handle();
+        let body = gtk4::Overlay::new();
+        body.set_child(Some(&paned));
+        body.add_overlay(&resize_handle);
+
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        container.append(&title_bar);
+        container.append(&body);
+        container.set_css_classes(&["card", &format!("note-{color}")]);
+
+        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+
+        let node = NoteNode {
+            container,
+            edit_view,
+            edit_scroller,
+            preview_scroller,
+            mode_button,
+            drag_handle,
+            close_button,
+            resize_handle,
+        };
+        node.set_view_mode(initial_mode);
+        node
+    }
+
+    /// The Markdown source — always available and always the single source
+    /// of truth; Preview is derived from this, never the other way round.
+    pub fn markdown(&self) -> String {
+        buffer_text(&self.edit_view.buffer())
+    }
+
+    pub fn set_view_mode(&self, mode: crate::model::NoteViewMode) {
+        use crate::model::NoteViewMode;
+        let (edit_visible, preview_visible) = match mode {
+            NoteViewMode::Edit => (true, false),
+            NoteViewMode::Preview => (false, true),
+            NoteViewMode::Split => (true, true),
+        };
+        self.edit_scroller.set_visible(edit_visible);
+        self.preview_scroller.set_visible(preview_visible);
+        self.mode_button.set_label(mode_label(mode));
+    }
+}
+
+/// A plain-text annotation node: no Markdown rendering, just a label of text
+/// — simpler than a `Note` for a quick caption. Same chrome shape as every
+/// other card.
+pub struct TextNode {
     pub container: gtk4::Box,
     pub text_view: gtk4::TextView,
     pub drag_handle: gtk4::Box,
@@ -368,8 +550,12 @@ pub struct NoteNode {
     pub resize_handle: gtk4::Box,
 }
 
-impl NoteNode {
-    pub fn new(initial_text: &str, color: &str) -> NoteNode {
+impl TextNode {
+    pub fn new(
+        initial_text: &str,
+        collapsed: bool,
+        on_collapse_toggle: impl Fn(bool) + 'static,
+    ) -> TextNode {
         let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         drag_handle.set_hexpand(true);
         drag_handle.set_cursor_from_name(Some("grab"));
@@ -378,7 +564,7 @@ impl NoteNode {
         minimize_button.add_css_class("flat");
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
-        close_button.set_tooltip_text(Some("Delete note"));
+        close_button.set_tooltip_text(Some("Delete text node"));
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("note-title-bar");
@@ -394,12 +580,6 @@ impl NoteNode {
         text_view.set_bottom_margin(8);
         text_view.set_left_margin(8);
         text_view.set_right_margin(8);
-        // Forces dark, legible text regardless of the system theme. See the
-        // `textview.note-text` rule in style.css for why the `color` has to
-        // sit on this node rather than on the text view's internal `text`
-        // node. The pastel background is set on both nodes, since a
-        // GtkTextView otherwise paints its own theme-default background over
-        // whatever color the card behind it sets.
         text_view.add_css_class("note-text");
 
         let resize_handle = resize_handle();
@@ -410,11 +590,11 @@ impl NoteNode {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.append(&title_bar);
         container.append(&body);
-        container.set_css_classes(&["card", &format!("note-{color}")]);
+        container.set_css_classes(&["card", "text-node"]);
 
-        wire_minimize(&minimize_button, &body);
+        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
 
-        NoteNode {
+        TextNode {
             container,
             text_view,
             drag_handle,
@@ -424,10 +604,81 @@ impl NoteNode {
     }
 
     pub fn text(&self) -> String {
-        let buffer = self.text_view.buffer();
-        buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .to_string()
+        buffer_text(&self.text_view.buffer())
+    }
+}
+
+/// A stand-in widget for a node kind whose real behavior doesn't exist yet
+/// (`FileTree`, `Portal`, `Drawing`, `Group` — see `model.rs`'s doc comment).
+/// Shows only a kind label and a short detail string so the node is visible,
+/// selectable, movable and persistable on the canvas without pretending to
+/// implement the feature it stands in for.
+pub struct PlaceholderNode {
+    pub container: gtk4::Box,
+    pub drag_handle: gtk4::Box,
+    pub close_button: gtk4::Button,
+    pub resize_handle: gtk4::Box,
+}
+
+impl PlaceholderNode {
+    pub fn new(
+        kind_label: &str,
+        detail: &str,
+        collapsed: bool,
+        on_collapse_toggle: impl Fn(bool) + 'static,
+    ) -> PlaceholderNode {
+        let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        drag_handle.set_hexpand(true);
+        drag_handle.set_cursor_from_name(Some("grab"));
+
+        let kind_title = gtk4::Label::new(Some(kind_label));
+        kind_title.add_css_class("heading");
+
+        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
+        minimize_button.add_css_class("flat");
+        let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_button.add_css_class("flat");
+        close_button.set_tooltip_text(Some("Remove node"));
+
+        let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        title_bar.add_css_class("node-title-bar");
+        title_bar.append(&kind_title);
+        title_bar.append(&drag_handle);
+        title_bar.append(&minimize_button);
+        title_bar.append(&close_button);
+
+        let detail_label = gtk4::Label::new(Some(detail));
+        detail_label.add_css_class("dim-label");
+        detail_label.set_wrap(true);
+        let placeholder_icon = gtk4::Image::from_icon_name("content-loading-symbolic");
+        placeholder_icon.set_pixel_size(32);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        content.set_valign(gtk4::Align::Center);
+        content.set_halign(gtk4::Align::Center);
+        content.set_vexpand(true);
+        content.set_hexpand(true);
+        content.append(&placeholder_icon);
+        content.append(&detail_label);
+        content.set_size_request(220, 160);
+
+        let resize_handle = resize_handle();
+        let body = gtk4::Overlay::new();
+        body.set_child(Some(&content));
+        body.add_overlay(&resize_handle);
+
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        container.append(&title_bar);
+        container.append(&body);
+        container.set_css_classes(&["card", "placeholder-node"]);
+
+        wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+
+        PlaceholderNode {
+            container,
+            drag_handle,
+            close_button,
+            resize_handle,
+        }
     }
 }
 
@@ -475,7 +726,7 @@ mod tests {
         if gtk4::init().is_err() {
             return;
         }
-        let node = super::SessionNode::new("probe");
+        let node = super::SessionNode::new("probe", false, |_| {});
         let fixed = gtk4::Fixed::new();
         fixed.put(&node.container, 0.0, 0.0);
         let window = gtk4::Window::new();

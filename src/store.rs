@@ -1,42 +1,9 @@
-use crate::agent::Agent;
+use crate::model::{EdgeRecord, NodeRecord};
 use crate::role::Role;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionRecord {
-    pub id: Uuid,
-    pub name: String,
-    pub cwd: PathBuf,
-    pub agent: Agent,
-    pub claude_session_id: Option<Uuid>,
-    pub claude_account: Option<String>,
-    /// The role (if any) this session was assigned — an id into
-    /// `role::builtin_roles()` or `Store::custom_roles`. `#[serde(default)]`
-    /// so a store saved before milestone 4 still loads with every existing
-    /// session simply unassigned.
-    #[serde(default)]
-    pub role_id: Option<Uuid>,
-    pub position: (f64, f64),
-    pub size: (f64, f64),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StickyNoteRecord {
-    pub id: Uuid,
-    pub text: String,
-    pub position: (f64, f64),
-    pub size: (f64, f64),
-    pub color: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct LinkRecord {
-    pub source: Uuid,
-    pub target: Uuid,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CanvasRecord {
@@ -53,10 +20,10 @@ impl Default for CanvasRecord {
     }
 }
 
-/// An independently persisted canvas/project context: its own sessions,
-/// notes, links, and pan/zoom, plus a `root_dir` used only as the default
-/// working directory suggested when creating a new session inside it (a
-/// session's own `cwd` can still be anything — this is a convenience, not a
+/// An independently persisted canvas/project context: its own nodes, edges,
+/// and pan/zoom, plus a `root_dir` used only as the default working
+/// directory suggested when creating a new terminal node inside it (a
+/// node's own `cwd` can still be anything — this is a convenience, not a
 /// constraint).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRecord {
@@ -64,11 +31,9 @@ pub struct WorkspaceRecord {
     pub name: String,
     pub root_dir: PathBuf,
     #[serde(default)]
-    pub sessions: Vec<SessionRecord>,
+    pub nodes: Vec<NodeRecord>,
     #[serde(default)]
-    pub notes: Vec<StickyNoteRecord>,
-    #[serde(default)]
-    pub links: Vec<LinkRecord>,
+    pub edges: Vec<EdgeRecord>,
     #[serde(default)]
     pub canvas: CanvasRecord,
 }
@@ -206,39 +171,37 @@ pub fn default_control_socket_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Agent;
+    use crate::model::{FloorRef, NodeKind, NotePayload, NoteViewMode, TerminalPayload};
     use tempfile::tempdir;
 
-    fn sample_record() -> SessionRecord {
-        SessionRecord {
+    fn sample_terminal_node() -> NodeRecord {
+        NodeRecord {
             id: Uuid::nil(),
-            name: "web".to_string(),
-            cwd: PathBuf::from("/home/fernando/web"),
-            agent: Agent::Claude,
-            claude_session_id: Some(Uuid::nil()),
-            claude_account: Some("work".to_string()),
-            role_id: None,
+            floor: FloorRef::Ground,
             position: (10.0, 20.0),
             size: (480.0, 320.0),
+            z_order: 0,
+            collapsed: false,
+            locked: false,
+            kind: NodeKind::Terminal(TerminalPayload {
+                name: "web".to_string(),
+                cwd: PathBuf::from("/home/fernando/web"),
+                agent: Agent::Claude,
+                claude_session_id: Some(Uuid::nil()),
+                claude_account: Some("work".to_string()),
+                role_id: None,
+            }),
         }
     }
 
-    fn sample_workspace(sessions: Vec<SessionRecord>) -> WorkspaceRecord {
+    fn sample_workspace(nodes: Vec<NodeRecord>) -> WorkspaceRecord {
         WorkspaceRecord {
             id: Uuid::nil(),
             name: "web".to_string(),
             root_dir: PathBuf::from("/home/fernando"),
-            sessions,
-            notes: vec![StickyNoteRecord {
-                id: Uuid::nil(),
-                text: "hello".to_string(),
-                position: (1.0, 2.0),
-                size: (200.0, 150.0),
-                color: "yellow".to_string(),
-            }],
-            links: vec![LinkRecord {
-                source: Uuid::nil(),
-                target: Uuid::nil(),
-            }],
+            nodes,
+            edges: vec![EdgeRecord::visual(Uuid::nil(), Uuid::nil(), Uuid::nil())],
             canvas: CanvasRecord {
                 zoom: 1.5,
                 pan: (3.0, 4.0),
@@ -250,7 +213,14 @@ mod tests {
     fn save_then_load_round_trips() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("store.json");
-        let workspace = sample_workspace(vec![sample_record()]);
+        let mut note = sample_terminal_node();
+        note.id = Uuid::new_v4();
+        note.kind = NodeKind::Note(NotePayload {
+            markdown: "# hello".to_string(),
+            color: "yellow".to_string(),
+            view_mode: NoteViewMode::Edit,
+        });
+        let workspace = sample_workspace(vec![sample_terminal_node(), note]);
         let role = Role {
             id: Uuid::nil(),
             name: "Custom".to_string(),
@@ -279,7 +249,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nested").join("dir").join("store.json");
         let store = Store::new(
-            vec![sample_workspace(vec![sample_record()])],
+            vec![sample_workspace(vec![sample_terminal_node()])],
             None,
             Vec::new(),
         );
@@ -295,21 +265,20 @@ mod tests {
         assert!(Store::load(&path).workspaces.is_empty());
     }
 
+    #[test]
+    fn resolve_active_workspace_is_none_when_nothing_was_saved() {
+        assert!(Store::default().resolve_active_workspace().is_none());
+    }
+
     fn named_workspace(name: &str) -> WorkspaceRecord {
         WorkspaceRecord {
             id: Uuid::new_v4(),
             name: name.to_string(),
             root_dir: PathBuf::from("/home/fernando"),
-            sessions: Vec::new(),
-            notes: Vec::new(),
-            links: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
             canvas: CanvasRecord::default(),
         }
-    }
-
-    #[test]
-    fn resolve_active_workspace_is_none_when_nothing_was_saved() {
-        assert!(Store::default().resolve_active_workspace().is_none());
     }
 
     #[test]
@@ -321,11 +290,6 @@ mod tests {
         assert_eq!(inactive, vec![a]);
     }
 
-    /// A stale or absent `active_workspace` (an id that no longer names any
-    /// saved workspace, or `None` at all — an older file, or one hand-edited
-    /// after the referenced workspace was deleted) must not be treated as
-    /// "nothing to restore"; it falls back to the first workspace rather than
-    /// losing every workspace's data.
     #[test]
     fn resolve_active_workspace_falls_back_to_the_first_workspace_when_the_id_is_stale() {
         let (a, b) = (named_workspace("a"), named_workspace("b"));
@@ -348,15 +312,22 @@ mod tests {
     fn custom_agent_round_trips_through_save_and_load() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("store.json");
-        let mut record = sample_record();
-        record.agent = Agent::Custom {
-            program: "mytool".to_string(),
-            args: vec!["--flag".to_string()],
-        };
-        let workspace = sample_workspace(vec![record.clone()]);
+        let mut node = sample_terminal_node();
+        node.kind = NodeKind::Terminal(TerminalPayload {
+            name: "custom".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            agent: Agent::Custom {
+                program: "mytool".to_string(),
+                args: vec!["--flag".to_string()],
+            },
+            claude_session_id: None,
+            claude_account: None,
+            role_id: None,
+        });
+        let workspace = sample_workspace(vec![node.clone()]);
         let store = Store::new(vec![workspace.clone()], Some(workspace.id), Vec::new());
         store.save(&path).unwrap();
         let loaded = Store::load(&path);
-        assert_eq!(loaded.workspaces[0].sessions[0].agent, record.agent);
+        assert_eq!(loaded.workspaces[0].nodes[0], node);
     }
 }

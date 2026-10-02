@@ -4,8 +4,11 @@ mod app;
 mod canvas;
 mod control;
 mod handoff;
+mod layout;
+mod markdown;
 mod message;
 mod migration;
+mod model;
 mod node;
 mod role;
 mod runtime;
@@ -53,15 +56,15 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         move || {
             let app_ref = app.borrow();
-            let selected = app_ref.selected_link;
+            let selected = app_ref.selected_edge;
             app_ref
-                .link_lines()
+                .edge_lines()
                 .into_iter()
-                .map(|(link, from, to)| canvas::LinkLine {
+                .map(|(edge, from, to)| canvas::LinkLine {
                     from,
                     to,
-                    selected: selected == Some(link),
-                    overlap: app_ref.link_overlap(link),
+                    selected: selected == Some(edge.id),
+                    overlap: app_ref.edge_overlap(edge.id),
                 })
                 .collect()
         }
@@ -101,6 +104,18 @@ fn build_ui(application: &adw::Application) {
     let roles_button = gtk4::Button::from_icon_name("preferences-system-symbolic");
     roles_button.set_tooltip_text(Some("Manage agent roles"));
     header.pack_start(&roles_button);
+    // Every selection/layout/undo command lives behind clicks in this menu,
+    // deliberately with no keyboard accelerators of its own: a card's
+    // terminal takes the keyboard (same reasoning as the link
+    // click-to-select/click-again-to-delete pattern), and several of the
+    // obvious shortcuts a tool palette would normally claim — Ctrl+Z
+    // (suspend), Ctrl+C (interrupt), Ctrl+A (readline line-start), Delete —
+    // are exactly the keys a running shell or agent most needs to receive
+    // untouched. A mouse-driven menu has no such conflict.
+    let edit_menu_button = gtk4::MenuButton::new();
+    edit_menu_button.set_icon_name("applications-utilities-symbolic");
+    edit_menu_button.set_tooltip_text(Some("Selection, layout, and undo/redo"));
+    header.pack_start(&edit_menu_button);
     let zoom_out_button = gtk4::Button::from_icon_name("zoom-out-symbolic");
     zoom_out_button.set_tooltip_text(Some("Zoom out (Ctrl+-)"));
     header.pack_end(&zoom_out_button);
@@ -151,8 +166,22 @@ fn build_ui(application: &adw::Application) {
         move |world| {
             if let Some(message) = App::click_link_at(&app, world) {
                 toast_overlay.add_toast(adw::Toast::new(&message));
+            } else {
+                // A plain click that hit neither a node nor a link: the usual
+                // "click empty space to clear the selection" canvas
+                // convention. Only reached when `click_link_at` found nothing
+                // to toast about, so this doesn't fire mid-marquee (that's a
+                // drag, not a click) or when a link was just selected/deleted.
+                App::deselect_all(&app);
             }
         }
+    });
+
+    // Shift-drag on empty canvas (see `canvas.rs`'s pan gesture) marks out a
+    // marquee; releasing it selects every node the rectangle touches.
+    app.borrow().canvas.connect_marquee_end({
+        let app = app.clone();
+        move |start, current| App::apply_marquee_selection(&app, start, current)
     });
 
     // Restore after the toast overlay exists: restored sessions' handoff
@@ -332,11 +361,284 @@ fn build_ui(application: &adw::Application) {
         );
     }
 
+    wire_canvas_edit_actions(
+        application,
+        &app,
+        &window,
+        &toast_overlay,
+        &edit_menu_button,
+    );
+
     window.present();
 
     for error in errors {
         toast_overlay.add_toast(adw::Toast::new(&error));
     }
+}
+
+/// The `(width, height)` of the window's current allocation, in screen
+/// pixels — what `App::zoom_to_selection`/`zoom_to_fit` fit the canvas into.
+fn viewport_size(window: &adw::ApplicationWindow) -> (f64, f64) {
+    let (width, height) = (window.width(), window.height());
+    if width > 0 && height > 0 {
+        (width as f64, height as f64)
+    } else {
+        (1200.0, 800.0)
+    }
+}
+
+/// The world-space point under the center of the window — where a new node
+/// created from a menu (rather than dropped at a specific spot) appears.
+fn viewport_center_world(app: &Rc<RefCell<App>>, window: &adw::ApplicationWindow) -> (f64, f64) {
+    let (width, height) = viewport_size(window);
+    let app_ref = app.borrow();
+    let state = app_ref.canvas.state.borrow();
+    canvas::screen_to_world((width / 2.0, height / 2.0), state.pan, state.zoom)
+}
+
+/// Registers every selection/multi-node/layout/undo-redo/canvas-navigation
+/// command as a `gio::SimpleAction` on `application`, and lists them all in
+/// `edit_menu_button`'s popover menu. None of these carry a keyboard
+/// accelerator — see `edit_menu_button`'s doc comment in `build_ui` for why.
+/// (action name, menu label, handler) for a command that takes no extra UI
+/// input beyond `app` itself.
+type SimpleEditAction<'a> = (&'a str, &'a str, Box<dyn Fn(&Rc<RefCell<App>>)>);
+
+fn wire_canvas_edit_actions(
+    application: &adw::Application,
+    app: &Rc<RefCell<App>>,
+    window: &adw::ApplicationWindow,
+    toast_overlay: &adw::ToastOverlay,
+    edit_menu_button: &gtk4::MenuButton,
+) {
+    // `new-text-node` and the four placeholder-kind creators, which need a
+    // spawn position, and `toggle-snap-to-grid`, which needs a toast
+    // describing its new state, are registered separately below instead of
+    // forced into this shape.
+    let simple_actions: Vec<SimpleEditAction> = vec![
+        ("select-all", "Select All", Box::new(App::select_all)),
+        ("deselect-all", "Deselect All", Box::new(App::deselect_all)),
+        (
+            "delete-selected",
+            "Delete Selected",
+            Box::new(App::delete_selected),
+        ),
+        (
+            "lock-selected",
+            "Lock Selected",
+            Box::new(|app| App::set_selected_locked(app, true)),
+        ),
+        (
+            "unlock-selected",
+            "Unlock Selected",
+            Box::new(|app| App::set_selected_locked(app, false)),
+        ),
+        (
+            "collapse-selected",
+            "Collapse Selected",
+            Box::new(|app| App::set_selected_collapsed(app, true)),
+        ),
+        (
+            "expand-selected",
+            "Expand Selected",
+            Box::new(|app| App::set_selected_collapsed(app, false)),
+        ),
+        (
+            "raise-selected",
+            "Bring to Front",
+            Box::new(App::raise_selected),
+        ),
+        (
+            "lower-selected",
+            "Send to Back",
+            Box::new(App::lower_selected),
+        ),
+        ("align-left", "Align Left", Box::new(App::align_left)),
+        ("align-right", "Align Right", Box::new(App::align_right)),
+        ("align-top", "Align Top", Box::new(App::align_top)),
+        ("align-bottom", "Align Bottom", Box::new(App::align_bottom)),
+        (
+            "distribute-horizontal",
+            "Distribute Horizontally",
+            Box::new(App::distribute_horizontal),
+        ),
+        (
+            "distribute-vertical",
+            "Distribute Vertically",
+            Box::new(App::distribute_vertical),
+        ),
+        ("copy-selected", "Copy", Box::new(App::copy_selected)),
+    ];
+
+    let menu = gtk4::gio::Menu::new();
+    let selection_section = gtk4::gio::Menu::new();
+    let layout_section = gtk4::gio::Menu::new();
+    let clipboard_section = gtk4::gio::Menu::new();
+    let history_section = gtk4::gio::Menu::new();
+    let view_section = gtk4::gio::Menu::new();
+    let create_section = gtk4::gio::Menu::new();
+
+    for (name, label, handler) in simple_actions {
+        let action = gtk4::gio::SimpleAction::new(name, None);
+        action.connect_activate({
+            let app = app.clone();
+            move |_, _| handler(&app)
+        });
+        application.add_action(&action);
+        let item = gtk4::gio::MenuItem::new(Some(label), Some(&format!("app.{name}")));
+        let section = match name {
+            "select-all" | "deselect-all" | "delete-selected" | "lock-selected"
+            | "unlock-selected" | "collapse-selected" | "expand-selected" | "raise-selected"
+            | "lower-selected" => &selection_section,
+            "align-left"
+            | "align-right"
+            | "align-top"
+            | "align-bottom"
+            | "distribute-horizontal"
+            | "distribute-vertical" => &layout_section,
+            "copy-selected" => &clipboard_section,
+            _ => &selection_section,
+        };
+        section.append_item(&item);
+    }
+
+    // Duplicate and Paste need `toast_overlay` (a failed terminal respawn
+    // surfaces a toast the same way creating one fresh does).
+    let duplicate_action = gtk4::gio::SimpleAction::new("duplicate-selected", None);
+    duplicate_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::duplicate_selected(&app, &toast_overlay)
+    });
+    application.add_action(&duplicate_action);
+    clipboard_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Duplicate"),
+        Some("app.duplicate-selected"),
+    ));
+
+    let paste_action = gtk4::gio::SimpleAction::new("paste-clipboard", None);
+    paste_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::paste_clipboard(&app, &toast_overlay)
+    });
+    application.add_action(&paste_action);
+    clipboard_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Paste"),
+        Some("app.paste-clipboard"),
+    ));
+
+    // Undo/redo need `toast_overlay` too (a future variant might report
+    // "nothing to undo"; today they're silent no-ops on an empty stack).
+    let undo_action = gtk4::gio::SimpleAction::new("undo", None);
+    undo_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::undo(&app, &toast_overlay)
+    });
+    application.add_action(&undo_action);
+    history_section.append_item(&gtk4::gio::MenuItem::new(Some("Undo"), Some("app.undo")));
+
+    let redo_action = gtk4::gio::SimpleAction::new("redo", None);
+    redo_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::redo(&app, &toast_overlay)
+    });
+    application.add_action(&redo_action);
+    history_section.append_item(&gtk4::gio::MenuItem::new(Some("Redo"), Some("app.redo")));
+
+    // Zoom-to-selection/fit need the window's current size.
+    let zoom_selection_action = gtk4::gio::SimpleAction::new("zoom-to-selection", None);
+    zoom_selection_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        move |_, _| App::zoom_to_selection(&app, viewport_size(&window))
+    });
+    application.add_action(&zoom_selection_action);
+    view_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Zoom to Selection"),
+        Some("app.zoom-to-selection"),
+    ));
+
+    let zoom_fit_action = gtk4::gio::SimpleAction::new("zoom-to-fit", None);
+    zoom_fit_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        move |_, _| App::zoom_to_fit(&app, viewport_size(&window))
+    });
+    application.add_action(&zoom_fit_action);
+    view_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Zoom to Fit"),
+        Some("app.zoom-to-fit"),
+    ));
+
+    let snap_action = gtk4::gio::SimpleAction::new("toggle-snap-to-grid", None);
+    snap_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| {
+            let enabled = {
+                let mut app_mut = app.borrow_mut();
+                app_mut.snap_to_grid = !app_mut.snap_to_grid;
+                app_mut.snap_to_grid
+            };
+            toast_overlay.add_toast(adw::Toast::new(if enabled {
+                "Snap to grid on"
+            } else {
+                "Snap to grid off"
+            }));
+        }
+    });
+    application.add_action(&snap_action);
+    view_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Toggle Snap to Grid"),
+        Some("app.toggle-snap-to-grid"),
+    ));
+
+    // New Text/placeholder nodes need a spawn position (screen center).
+    let text_action = gtk4::gio::SimpleAction::new("new-text-node", None);
+    text_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        move |_, _| App::create_text_node(&app, viewport_center_world(&app, &window))
+    });
+    application.add_action(&text_action);
+    create_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("New Text Node"),
+        Some("app.new-text-node"),
+    ));
+
+    for kind_label in ["File Tree", "Portal", "Drawing", "Group"] {
+        let action_name = format!(
+            "new-placeholder-{}",
+            kind_label.to_lowercase().replace(' ', "-")
+        );
+        let action = gtk4::gio::SimpleAction::new(&action_name, None);
+        action.connect_activate({
+            let app = app.clone();
+            let window = window.clone();
+            let kind_label = kind_label.to_string();
+            move |_, _| {
+                if let Some(kind) = crate::app::placeholder_kind(&kind_label) {
+                    App::create_placeholder_node(&app, kind, viewport_center_world(&app, &window));
+                }
+            }
+        });
+        application.add_action(&action);
+        create_section.append_item(&gtk4::gio::MenuItem::new(
+            Some(&format!("New {kind_label} (placeholder)")),
+            Some(&format!("app.{action_name}")),
+        ));
+    }
+
+    menu.append_section(Some("Selection"), &selection_section);
+    menu.append_section(Some("Layout"), &layout_section);
+    menu.append_section(Some("Clipboard"), &clipboard_section);
+    menu.append_section(Some("History"), &history_section);
+    menu.append_section(Some("View"), &view_section);
+    menu.append_section(Some("New Node"), &create_section);
+    edit_menu_button.set_menu_model(Some(&menu));
 }
 
 fn open_new_session_dialog(
@@ -496,9 +798,9 @@ fn open_new_session_dialog(
             let name_taken = !name.is_empty()
                 && app
                     .borrow()
-                    .sessions
+                    .nodes
                     .values()
-                    .any(|entry| entry.record.name == name);
+                    .any(|entry| entry.record.as_terminal().is_some_and(|t| t.name == name));
             name_row.set_css_classes(if name_taken { &["error"] } else { &[] });
             name_warning.set_visible(name_taken);
             name_warning
@@ -826,9 +1128,14 @@ fn confirm_delete_account(
 ) {
     let session_count = app
         .borrow()
-        .sessions
+        .nodes
         .values()
-        .filter(|entry| entry.record.claude_account.as_deref() == Some(name))
+        .filter(|entry| {
+            entry
+                .record
+                .as_terminal()
+                .is_some_and(|t| t.claude_account.as_deref() == Some(name))
+        })
         .count();
     let body = if session_count == 0 {
         "No active sessions use this account.".to_string()
@@ -1038,9 +1345,14 @@ fn confirm_delete_role(
 ) {
     let session_count = app
         .borrow()
-        .sessions
+        .nodes
         .values()
-        .filter(|entry| entry.record.role_id == Some(id))
+        .filter(|entry| {
+            entry
+                .record
+                .as_terminal()
+                .is_some_and(|t| t.role_id == Some(id))
+        })
         .count();
     let body = match session_count {
         0 => "No sessions use this role.".to_string(),
@@ -1520,16 +1832,23 @@ fn confirm_delete_workspace(
     dialog_parent: &adw::Window,
     workspace_label: &gtk4::Label,
 ) {
+    let count_terminals = |nodes: &[crate::model::NodeRecord]| {
+        nodes.iter().filter(|n| n.as_terminal().is_some()).count()
+    };
     let session_count = {
         let app_ref = app.borrow();
         if app_ref.workspace_id == id {
-            app_ref.sessions.len()
+            app_ref
+                .nodes
+                .values()
+                .filter(|entry| entry.record.as_terminal().is_some())
+                .count()
         } else {
             app_ref
                 .inactive_workspaces
                 .iter()
                 .find(|w| w.id == id)
-                .map(|w| w.sessions.len())
+                .map(|w| count_terminals(&w.nodes))
                 .unwrap_or(0)
         }
     };
