@@ -17,6 +17,23 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// Which runtime a terminal node's process runs under. Persisted on
+/// [`TerminalPayload`] (per-terminal) and as a default on
+/// `store::WorkspaceRecord` (new terminals in that workspace start with the
+/// workspace's own default unless the new-session dialog is given a reason
+/// to override it — no such override UI exists yet, so today every new
+/// terminal simply inherits its workspace's default). A pure data enum
+/// deliberately kept here rather than in `environment.rs`: that module is
+/// the runtime/process-spawning layer (it shells out to `tmux`), and this
+/// crate's dependency direction keeps the domain model independent of it —
+/// `environment.rs` depends on this type, not the other way around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EnvironmentKind {
+    #[default]
+    LocalPty,
+    LocalTmux,
+}
+
 /// Which floor a node lives on. `Ground` is the default and, until Milestone
 /// 9 introduces git-isolated floors, the only value that ever occurs.
 /// Present on every `NodeRecord` from the start specifically so Milestone 9
@@ -40,6 +57,12 @@ pub struct TerminalPayload {
     pub claude_account: Option<String>,
     #[serde(default)]
     pub role_id: Option<Uuid>,
+    /// Which runtime this terminal's process runs under. `#[serde(default)]`
+    /// so an older-schema terminal (every one saved before Milestone 2)
+    /// loads as `LocalPty` — the only backend that existed then, and still
+    /// the default for a newly created terminal.
+    #[serde(default)]
+    pub environment: EnvironmentKind,
 }
 
 /// A note's content: Markdown source (plain text is valid Markdown, so a
@@ -264,6 +287,7 @@ mod tests {
                 claude_session_id: None,
                 claude_account: None,
                 role_id: None,
+                environment: EnvironmentKind::LocalPty,
             })
             .label(),
             "Terminal"

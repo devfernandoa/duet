@@ -21,7 +21,7 @@ The canvas is a persistent graph of nodes and edges; GTK widgets only draw it. E
 **Adjustments to settle before PR 1**
 
 - [x] Put `FloorRef` (Ground or Floor) on `NodeRecord` in schema v4, so Milestone 9 needs no node migration — done in Milestone 1 (`model::FloorRef`, every `NodeRecord` carries one, defaulting to `Ground`); `AgentIdentity` doesn't exist as a separate type yet, so it has nothing to carry a `FloorRef` on until Milestone 3
-- [ ] Define `AgentActivity` with an `Unknown` default in Milestone 2; detection arrives in Milestone 3
+- [x] Define `AgentActivity` with an `Unknown` default in Milestone 2; detection arrives in Milestone 3 — done (`runtime::AgentActivity`); only `Unknown`/`Finished`/`Failed` are ever actually produced this milestone, derived from a real exit status, matching "only expose states that are actually knowable"
 - [x] Make edges carry a set of capabilities from the start (`Visual` = empty set) — done in Milestone 1 (`model::EdgeRecord::capabilities: BTreeSet<EdgeCapability>`, empty = visual-only); no separate `EdgeKind`/`ConnectionCapability` types existed to merge, so this is the one type that was ever introduced
 - [ ] Introduce the `ProjectFilesystem` trait with the Milestone 7 file tree, not Milestone 13
 - [ ] Confirm WebKitGTK 6.0 (GTK4) and GtkSourceView 5 are packaged on the target distros
@@ -55,14 +55,14 @@ Phase A makes Duet structurally ready for expansion without changing what users 
 
 ### Milestone 2: Persistent workspaces and runtime survival
 
-- [ ] `RuntimeRegistry` keyed by session id; workspace switch detaches widgets and keeps the process alive
-- [ ] `EnvironmentBackend` trait; Local PTY and Local tmux backends; no direct `portable_pty` use outside it
-- [ ] Workspace metadata: name, root directory, color/icon, environment, created\_at, last\_opened, viewport, nodes, edges
-- [ ] `WorkspaceRuntimeState`: Active, Background, Unloaded
-- [ ] Background workspaces show idle / working / awaiting input / completed / failed
-- [ ] Explicit actions: unload workspace, restart terminals, terminate one terminal, delete workspace
-- [ ] Killing a workspace cannot kill another workspace's processes
-- [ ] Acceptance: an agent keeps working in Workspace A while you view B; returning to A shows the same live terminal
+- [x] `RuntimeRegistry` keyed by session id; workspace switch detaches widgets and keeps the process alive — `runtime::SessionRuntime` is now that registry: `App::detach_active_workspace` (switching/creating a workspace) removes GTK widgets and clears `App::nodes` without calling `runtime.terminate`, so a session keeps running in the background keyed only by its id, independent of which workspace (if any) currently shows it. `App::teardown_active_workspace` (genuine deletion) is the only path that still terminates.
+- [x] `EnvironmentBackend` trait; Local PTY and Local tmux backends; no direct `portable_pty` use outside it — built as the lighter "or equivalent runtime abstraction" the milestone brief explicitly allows, not a `dyn` trait: `environment::EnvironmentKind` (LocalPty/LocalTmux) + `environment::prepare_launch` decide *what command* `SessionRuntime::spawn` runs (a plain `Launch` for LocalPty, `tmux new-session -A -s duet-<id> -- ...` for LocalTmux — `-A` gives attach-or-create and the duplicate-session guarantee for free, keyed by a pure function of the terminal's own id). A trait with spawn/attach/detach/terminate methods would have had both variants forward identically to `SessionRuntime`/`Session` — the only axis of variation is the command, which is what this abstraction actually isolates. `portable_pty` itself remains confined to `session.rs`, unchanged.
+- [x] Workspace metadata: name, root directory, color/icon, environment, created\_at, last\_opened, viewport, nodes, edges — `store::WorkspaceRecord` gained `environment: EnvironmentKind`, `color: Option<String>`, `icon: Option<String>`, `created_at: u64`, `last_opened: u64` (all `#[serde(default)]`, schema bumped 4 -> 5); `viewport` was already `CanvasRecord`'s zoom/pan. `color`/`icon` have no picker UI yet — the fields exist so a later pass doesn't need another migration.
+- [x] `WorkspaceRuntimeState`: Active, Background, Unloaded — `app::WorkspaceRuntimeState`, computed on demand by `App::workspace_runtime_state` (Active = the live workspace; Background = dormant with at least one id the runtime still reports alive; Unloaded = dormant with none). Surfaced in the workspace switcher as a "Running in background" subtitle plus an Unload button.
+- [ ] Background workspaces show idle / working / awaiting input / completed / failed — not implemented. Only `Unknown`/`Finished`/`Failed` are knowable from a real exit status this milestone (see the `AgentActivity` entry above); a live idle/working/awaiting-input distinction needs provider-aware detection, which is explicitly Milestone 3's job, not this one's.
+- [x] Explicit actions: unload workspace, restart terminals, terminate one terminal, delete workspace — `App::unload_workspace` (kills a *dormant* workspace's sessions, refuses on the active one), `App::terminate_selected_terminals` / `App::restart_selected_terminals` (new Edit-menu commands, operate on the current selection), `App::delete_workspace` (already existed; now also unloads a dormant target's sessions first so deleting one never leaks a process nothing references again).
+- [x] Killing a workspace cannot kill another workspace's processes — guaranteed structurally (every operation above acts only on the ids a workspace's own `NodeRecord`s name, and ids are globally unique `Uuid`s so they can't collide across workspaces); verified by `app::tests::unload_workspace_only_terminates_that_workspaces_own_sessions` and by the manual acceptance run below.
+- [x] Acceptance: an agent keeps working in Workspace A while you view B; returning to A shows the same live terminal — verified interactively end-to-end (see Manual verification in the Milestone 2 report); not just by code reading.
 
 ## Phase B: Multi-agent core (Milestones 3-5)
 

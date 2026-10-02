@@ -1,19 +1,20 @@
 use crate::account::AccountStore;
-use crate::agent::{Agent, LaunchRequest, with_session_env};
+use crate::agent::{Agent, Launch, LaunchRequest, with_session_env};
 use crate::canvas::{
     Canvas, NodeGeometry, TITLE_BAR_HEIGHT, allocated_size, canvas_point, card_center, card_edge,
     card_intersection, card_rect, card_vertical_edge, world_drag_delta,
 };
+use crate::environment;
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::layout;
-use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary};
+use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary, now_epoch_secs};
 use crate::model::{
-    EdgeRecord, FloorRef, GroupPayload, NodeKind, NodeRecord, NotePayload, NoteViewMode,
-    TerminalPayload, TextPayload,
+    EdgeRecord, EnvironmentKind, FloorRef, GroupPayload, NodeKind, NodeRecord, NotePayload,
+    NoteViewMode, TerminalPayload, TextPayload,
 };
 use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
 use crate::role::{Role, with_role_instructions};
-use crate::runtime::SessionRuntime;
+use crate::runtime::{AgentActivity, SessionRuntime};
 use crate::store::{CanvasRecord, Store, WorkspaceRecord};
 use anyhow::Context;
 use gtk4::glib;
@@ -216,6 +217,17 @@ pub enum CanvasCommand {
     },
 }
 
+/// Whether a workspace's widgets are on screen, its processes are merely
+/// running in the background, or nothing about it is live at all. Computed
+/// on demand (`App::workspace_runtime_state`), never persisted — this is
+/// exactly the kind of fact that's only true of the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRuntimeState {
+    Active,
+    Background,
+    Unloaded,
+}
+
 pub struct App {
     pub accounts: AccountStore,
     pub store_path: PathBuf,
@@ -226,6 +238,14 @@ pub struct App {
     pub workspace_id: Uuid,
     pub workspace_name: String,
     pub workspace_root: PathBuf,
+    /// The rest of the active workspace's metadata, mirrored from its
+    /// `WorkspaceRecord` the same way `workspace_id`/`name`/`root` already
+    /// are — see `activate_workspace`/`snapshot_active_workspace`.
+    pub workspace_environment: EnvironmentKind,
+    pub workspace_color: Option<String>,
+    pub workspace_icon: Option<String>,
+    pub workspace_created_at: u64,
+    pub workspace_last_opened: u64,
     /// Every OTHER workspace's full persisted state: not live (no widgets, no
     /// PTYs), just the records needed to spawn it back in if the user
     /// switches to it. `switch_workspace`/`create_workspace`/
@@ -280,6 +300,11 @@ impl App {
             workspace_id: Uuid::new_v4(),
             workspace_name: "Default".to_string(),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            workspace_environment: EnvironmentKind::default(),
+            workspace_color: None,
+            workspace_icon: None,
+            workspace_created_at: now_epoch_secs(),
+            workspace_last_opened: now_epoch_secs(),
             inactive_workspaces: Vec::new(),
             custom_roles: Vec::new(),
             nodes: HashMap::new(),
@@ -478,6 +503,11 @@ impl App {
                 zoom: state.zoom,
                 pan: state.pan,
             },
+            environment: self.workspace_environment,
+            color: self.workspace_color.clone(),
+            icon: self.workspace_icon.clone(),
+            created_at: self.workspace_created_at,
+            last_opened: self.workspace_last_opened,
         }
     }
 
@@ -496,20 +526,21 @@ impl App {
         list
     }
 
-    /// Kills every live `Terminal`'s process and clears the canvas of the
-    /// active workspace's nodes, without saving its state anywhere — callers
-    /// are responsible for snapshotting first if the workspace should come
-    /// back later.
-    fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
+    /// Removes the active workspace's GTK widgets from the canvas and clears
+    /// its live node/edge/selection/undo state, WITHOUT touching the
+    /// runtime — the outgoing workspace's terminal processes keep running in
+    /// the background. This is "switching away", not "destroying": callers
+    /// are responsible for snapshotting the workspace first if it should
+    /// come back later (every caller does, via `stash_workspace`).
+    /// `switch_workspace` and `create_workspace` both use this, since
+    /// starting to view a different workspace must never stop another one's
+    /// agents from working. Compare `teardown_active_workspace`, which
+    /// additionally terminates every session — reserved for genuinely
+    /// destroying the active workspace (`delete_workspace`).
+    fn detach_active_workspace(app: &Rc<RefCell<App>>) {
         let (canvas, node_entries) = {
             let mut app_mut = app.borrow_mut();
             let node_entries: Vec<_> = app_mut.nodes.drain().collect();
-            // Milestone 2 (background workspaces) changes exactly this line:
-            // detaching a workspace's widgets must stop terminating its
-            // sessions. See `runtime.rs`'s module doc.
-            for (id, _) in &node_entries {
-                app_mut.runtime.terminate(*id);
-            }
             (app_mut.canvas.clone(), node_entries)
         };
         for (_, entry) in node_entries {
@@ -524,6 +555,28 @@ impl App {
             app_mut.undo_stack.clear();
             app_mut.redo_stack.clear();
         }
+    }
+
+    /// Kills every live `Terminal`'s process (and, for a `LocalTmux`
+    /// terminal, its underlying tmux session too — see
+    /// `environment::kill_tmux_session`; a plain `terminate` only ends
+    /// `duet`'s own client process, which for tmux would just detach,
+    /// leaving the real work running) and then detaches the active
+    /// workspace's widgets same as `detach_active_workspace`. Reserved for
+    /// genuinely destroying the active workspace (`delete_workspace`) — see
+    /// `detach_active_workspace` for the far more common "just switching
+    /// away" case.
+    fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
+        let terminals: Vec<(Uuid, EnvironmentKind)> = app
+            .borrow()
+            .nodes
+            .iter()
+            .filter_map(|(id, entry)| entry.record.as_terminal().map(|t| (*id, t.environment)))
+            .collect();
+        for (id, env) in terminals {
+            environment::terminate(&mut app.borrow_mut().runtime, id, env);
+        }
+        App::detach_active_workspace(app);
     }
 
     /// Replaces or inserts `record` into `inactive_workspaces` by id.
@@ -548,6 +601,13 @@ impl App {
         app_mut.workspace_id = record.id;
         app_mut.workspace_name = record.name.clone();
         app_mut.workspace_root = record.root_dir.clone();
+        app_mut.workspace_environment = record.environment;
+        app_mut.workspace_color = record.color.clone();
+        app_mut.workspace_icon = record.icon.clone();
+        app_mut.workspace_created_at = record.created_at;
+        // Bumped to now, not copied from `record.last_opened` — this call is
+        // itself the moment the workspace is being opened.
+        app_mut.workspace_last_opened = now_epoch_secs();
         let mut state = app_mut.canvas.state.borrow_mut();
         state.zoom = record.canvas.zoom;
         state.pan = record.canvas.pan;
@@ -577,7 +637,7 @@ impl App {
         };
 
         let outgoing = app.borrow().snapshot_active_workspace();
-        App::teardown_active_workspace(app);
+        App::detach_active_workspace(app);
         App::stash_workspace(app, outgoing);
 
         App::activate_workspace(app, &target);
@@ -606,7 +666,7 @@ impl App {
         }
 
         let outgoing = app.borrow().snapshot_active_workspace();
-        App::teardown_active_workspace(app);
+        App::detach_active_workspace(app);
         App::stash_workspace(app, outgoing);
 
         let new_id = Uuid::new_v4();
@@ -615,6 +675,11 @@ impl App {
             app_mut.workspace_id = new_id;
             app_mut.workspace_name = name;
             app_mut.workspace_root = root_dir;
+            app_mut.workspace_environment = EnvironmentKind::default();
+            app_mut.workspace_color = None;
+            app_mut.workspace_icon = None;
+            app_mut.workspace_created_at = now_epoch_secs();
+            app_mut.workspace_last_opened = now_epoch_secs();
         }
         {
             let app_ref = app.borrow();
@@ -687,15 +752,93 @@ impl App {
             App::activate_workspace(app, &next);
             spawn_workspace_contents(app, next.nodes, next.edges, toast_overlay);
         } else {
+            // A dormant (Background or Unloaded) workspace can still own
+            // live runtime sessions since Milestone 2 — deleting its record
+            // without terminating those first would leak them: nothing
+            // would reference that id again. `unload_workspace`'s own
+            // termination loop does exactly this; reuse it rather than
+            // duplicating it here.
+            let _ = App::unload_workspace(app, id);
             app.borrow_mut().inactive_workspaces.retain(|w| w.id != id);
         }
         app.borrow().persist()?;
         Ok(())
     }
 
+    /// Kills every live process belonging to a *dormant* (non-active)
+    /// workspace, without touching its persisted record — the workspace
+    /// moves from Background (processes alive, not shown) to Unloaded (no
+    /// processes). Switching back to it afterwards spawns fresh processes,
+    /// exactly like opening it for the first time. Refuses to operate on the
+    /// active workspace, which has no sense of "unload" distinct from
+    /// `teardown_active_workspace`/switching away — there's no dormant
+    /// record to look up its nodes from until it's been switched out of.
+    /// Cross-workspace isolation falls out of this only ever touching the
+    /// named workspace's own node ids, which (being globally unique UUIDs)
+    /// can never collide with another workspace's.
+    pub fn unload_workspace(app: &Rc<RefCell<App>>, id: Uuid) -> anyhow::Result<()> {
+        if app.borrow().workspace_id == id {
+            anyhow::bail!("switch away from a workspace before unloading it");
+        }
+        let terminals: Vec<(Uuid, EnvironmentKind)> = {
+            let app_ref = app.borrow();
+            let workspace = app_ref
+                .inactive_workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .context("workspace not found")?;
+            workspace
+                .nodes
+                .iter()
+                .filter_map(|node| node.as_terminal().map(|t| (node.id, t.environment)))
+                .collect()
+        };
+        for (node_id, env) in terminals {
+            environment::terminate(&mut app.borrow_mut().runtime, node_id, env);
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is the visible workspace, a dormant one with live
+    /// background processes, or a dormant one with none. Purely a runtime
+    /// read — not persisted, and not knowable at all for the active
+    /// workspace's own terminals beyond "Active" (its nodes are always live
+    /// while it's active, by construction).
+    pub fn workspace_runtime_state(&self, id: Uuid) -> WorkspaceRuntimeState {
+        if id == self.workspace_id {
+            return WorkspaceRuntimeState::Active;
+        }
+        let Some(workspace) = self.inactive_workspaces.iter().find(|w| w.id == id) else {
+            return WorkspaceRuntimeState::Unloaded;
+        };
+        let any_alive = workspace
+            .nodes
+            .iter()
+            .any(|node| self.runtime.is_alive(node.id));
+        if any_alive {
+            WorkspaceRuntimeState::Background
+        } else {
+            WorkspaceRuntimeState::Unloaded
+        }
+    }
+
     /// Drains every `Terminal` node's PTY output into its own widget. Called
     /// on a timer from `main.rs`.
     pub fn pump_output(&mut self) {
+        // Every session this registry tracks, not just the active
+        // workspace's visible ones — a backgrounded workspace's terminals
+        // keep producing output on an unbounded channel (`runtime.rs`'s
+        // `try_recv_output`), so they still need draining or that channel
+        // grows without bound while nobody's watching. The drained bytes are
+        // discarded, not buffered for replay: reattaching a background
+        // workspace shows only output from that point on, not historical
+        // scrollback — a deliberate, documented gap (see `runtime.rs`'s
+        // module doc), not full crash-recovery machinery.
+        for id in self.runtime.live_ids() {
+            if !self.nodes.contains_key(&id) {
+                let _ = self.runtime.try_recv_output(id);
+            }
+        }
         for (&id, entry) in self.nodes.iter_mut() {
             let NodeWidget::Terminal(node) = &entry.widget else {
                 continue;
@@ -714,7 +857,15 @@ impl App {
                 node.feed(chunk);
             }
             if !entry.exit_shown && self.runtime.has_exited(id) {
-                node.status_label.set_text("exited");
+                // `activity` only ever distinguishes Finished/Failed from a
+                // real exit status this milestone (see `AgentActivity`'s doc
+                // comment) — safe to surface directly as the badge text.
+                let label = if self.runtime.activity(id) == AgentActivity::Failed {
+                    "failed"
+                } else {
+                    "exited"
+                };
+                node.status_label.set_text(label);
                 entry.exit_shown = true;
             }
         }
@@ -1180,7 +1331,7 @@ impl App {
                 record.agent.display_name()
             );
         }
-        app.borrow_mut().runtime.terminate(id);
+        environment::terminate(&mut app.borrow_mut().runtime, id, record.environment);
 
         let is_claude = matches!(record.agent, Agent::Claude);
         let summary_result = if is_claude {
@@ -1242,9 +1393,10 @@ impl App {
                 (launch, updated)
             }
         };
+        let prepared = environment::prepare_launch(updated.environment, id, launch);
         app.borrow_mut()
             .runtime
-            .spawn(id, updated.cwd.clone(), launch)?;
+            .spawn(id, updated.cwd.clone(), prepared)?;
         if let Some(entry) = app.borrow_mut().nodes.get_mut(&id)
             && let Some(terminal) = entry.record.as_terminal_mut()
         {
@@ -1289,7 +1441,12 @@ impl App {
             let mut app_mut = app.borrow_mut();
             let canvas = app_mut.canvas.clone();
             let removed = app_mut.nodes.remove(&id);
-            app_mut.runtime.terminate(id);
+            let env = removed
+                .as_ref()
+                .and_then(|entry| entry.record.as_terminal())
+                .map(|t| t.environment)
+                .unwrap_or_default();
+            environment::terminate(&mut app_mut.runtime, id, env);
             app_mut.edges.retain(|e| e.source != id && e.target != id);
             if app_mut.pending_edge_source == Some(id) {
                 app_mut.pending_edge_source = None;
@@ -1311,6 +1468,105 @@ impl App {
             canvas.remove_node(entry.widget.container());
         }
         let _ = app.borrow().persist();
+    }
+
+    /// Kills the process for every selected `Terminal` node without removing
+    /// the node itself — the card stays on the canvas, now showing "exited"
+    /// (the same badge a process that dies on its own gets via
+    /// `pump_output`), restartable later via `restart_selected_terminals`.
+    /// Distinct from `delete_selected`/`close_node`, which removes the card
+    /// too — "terminate" and "delete" are different operations.
+    pub fn terminate_selected_terminals(app: &Rc<RefCell<App>>) {
+        let targets: Vec<(Uuid, EnvironmentKind)> = {
+            let app_ref = app.borrow();
+            app_ref
+                .selected
+                .iter()
+                .filter_map(|id| {
+                    app_ref
+                        .nodes
+                        .get(id)
+                        .and_then(|entry| entry.record.as_terminal())
+                        .map(|terminal| (*id, terminal.environment))
+                })
+                .collect()
+        };
+        for (id, env) in targets {
+            environment::terminate(&mut app.borrow_mut().runtime, id, env);
+            let mut app_mut = app.borrow_mut();
+            if let Some(entry) = app_mut.nodes.get_mut(&id) {
+                if let NodeWidget::Terminal(node) = &entry.widget {
+                    node.status_label.set_text("exited");
+                }
+                entry.exit_shown = true;
+            }
+        }
+    }
+
+    /// Respawns a fresh process for every selected `Terminal` node,
+    /// replacing whatever it had (running or already exited) — the
+    /// complement of `terminate_selected_terminals`. For a `LocalTmux`
+    /// terminal this is a genuine restart, not a reconnect: the tmux session
+    /// itself is killed (via `environment::terminate`) before a new one is
+    /// created under the same name, so "Restart Terminal" means what it
+    /// says — a clean process, not a resumed one. (Returning to a workspace
+    /// that was merely backgrounded, not explicitly restarted, is the
+    /// `materialize_node`/`-A` reconnect path; this function never takes
+    /// that path.)
+    pub fn restart_selected_terminals(app: &Rc<RefCell<App>>, toast_overlay: &adw::ToastOverlay) {
+        let ids: Vec<Uuid> = {
+            let app_ref = app.borrow();
+            app_ref
+                .selected
+                .iter()
+                .copied()
+                .filter(|id| {
+                    app_ref
+                        .nodes
+                        .get(id)
+                        .is_some_and(|entry| entry.record.as_terminal().is_some())
+                })
+                .collect()
+        };
+        for id in ids {
+            let Some(terminal) = app
+                .borrow()
+                .nodes
+                .get(&id)
+                .and_then(|entry| entry.record.as_terminal())
+                .cloned()
+            else {
+                continue;
+            };
+            environment::terminate(&mut app.borrow_mut().runtime, id, terminal.environment);
+            let spawn_result = {
+                let app_ref = app.borrow();
+                build_terminal_launch(&app_ref, id, &terminal)
+            }
+            .and_then(|launch| {
+                let prepared = environment::prepare_launch(terminal.environment, id, launch);
+                app.borrow_mut()
+                    .runtime
+                    .spawn(id, terminal.cwd.clone(), prepared)
+            });
+            match spawn_result {
+                Ok(()) => {
+                    let mut app_mut = app.borrow_mut();
+                    if let Some(entry) = app_mut.nodes.get_mut(&id) {
+                        entry.exit_shown = false;
+                        if let NodeWidget::Terminal(node) = &entry.widget {
+                            node.status_label.set_text("");
+                        }
+                    }
+                }
+                Err(error) => {
+                    toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "couldn't restart {}: {error}",
+                        terminal.name
+                    )));
+                }
+            }
+        }
     }
 
     // ---- Selection -----------------------------------------------------
@@ -2240,32 +2496,24 @@ fn materialize_node(
 
     let widget = match &record.kind {
         NodeKind::Terminal(terminal) => {
-            let launch = {
-                let app_ref = app.borrow();
-                let claude = resolve_claude_account(
-                    &app_ref,
-                    &terminal.agent,
-                    terminal.claude_account.clone(),
-                )
-                .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?;
-                let resume = match &terminal.agent {
-                    Agent::Claude => terminal.claude_session_id.is_some(),
-                    _ => true,
+            // If this id is already running (the workspace was backgrounded,
+            // not terminated, by `detach_active_workspace`, or a restart's
+            // tmux reconnect already happened for it earlier in this same
+            // restore pass), reattach to it instead of spawning a second
+            // process under the same id — the core of switching workspaces
+            // without killing or duplicating anything.
+            if !app.borrow().runtime.is_alive(id) {
+                let launch = {
+                    let app_ref = app.borrow();
+                    build_terminal_launch(&app_ref, id, terminal)
+                        .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?
                 };
-                with_session_env(
-                    terminal.agent.launch(LaunchRequest {
-                        resume,
-                        claude_session_id: terminal.claude_session_id,
-                        claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
-                        ..Default::default()
-                    }),
-                    id,
-                )
-            };
-            app.borrow_mut()
-                .runtime
-                .spawn(id, terminal.cwd.clone(), launch)
-                .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?;
+                let prepared = environment::prepare_launch(terminal.environment, id, launch);
+                app.borrow_mut()
+                    .runtime
+                    .spawn(id, terminal.cwd.clone(), prepared)
+                    .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?;
+            }
             let node = SessionNode::new(&terminal.name, record.collapsed, {
                 let app = Rc::clone(app);
                 move |collapsed| {
@@ -2452,6 +2700,35 @@ fn resolve_claude_account(
     Ok(Some((account, dir)))
 }
 
+/// Builds the `Launch` for (re)starting a `Terminal` node's process from its
+/// persisted payload — account resolution and the resume flag, shared by
+/// `materialize_node` (first spawn, restore, and background reattach) and
+/// `restart_selected_terminals` (explicit respawn) so that logic lives in
+/// exactly one place. Does NOT apply `environment::prepare_launch` — callers
+/// do that themselves, since which environment applies differs by caller
+/// (always `terminal.environment` today, but keeping it a separate step
+/// keeps this function usable for a future override).
+fn build_terminal_launch(
+    app: &App,
+    id: Uuid,
+    terminal: &TerminalPayload,
+) -> anyhow::Result<Launch> {
+    let claude = resolve_claude_account(app, &terminal.agent, terminal.claude_account.clone())?;
+    let resume = match &terminal.agent {
+        Agent::Claude => terminal.claude_session_id.is_some(),
+        _ => true,
+    };
+    Ok(with_session_env(
+        terminal.agent.launch(LaunchRequest {
+            resume,
+            claude_session_id: terminal.claude_session_id,
+            claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+            ..Default::default()
+        }),
+        id,
+    ))
+}
+
 /// Looks up `role_id` and updates `node`'s title-bar badge to match.
 fn apply_role_badge(app: &App, node: &SessionNode, role_id: Option<Uuid>) {
     let role = role_id.and_then(|id| app.find_role(id));
@@ -2487,6 +2764,7 @@ fn build_terminal_record(
         claude_session_id,
         agent,
         role_id,
+        environment: app.workspace_environment,
     };
     Ok(NodeRecord {
         id: session_id,
@@ -2632,6 +2910,170 @@ mod tests {
                 .unwrap()
                 .markdown,
             "hello"
+        );
+    }
+
+    fn terminal_node(environment: EnvironmentKind) -> NodeRecord {
+        NodeRecord {
+            id: Uuid::new_v4(),
+            floor: FloorRef::Ground,
+            position: (0.0, 0.0),
+            size: (480.0, 320.0),
+            z_order: 0,
+            collapsed: false,
+            locked: false,
+            kind: NodeKind::Terminal(TerminalPayload {
+                name: "t".to_string(),
+                cwd: std::env::temp_dir(),
+                agent: Agent::Shell,
+                claude_session_id: None,
+                claude_account: None,
+                role_id: None,
+                environment,
+            }),
+        }
+    }
+
+    fn sleeper_launch() -> Launch {
+        Launch {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 5".to_string()],
+            envs: vec![],
+        }
+    }
+
+    fn dormant_workspace(name: &str, nodes: Vec<NodeRecord>) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            root_dir: std::env::temp_dir(),
+            nodes,
+            edges: Vec::new(),
+            canvas: CanvasRecord::default(),
+            environment: EnvironmentKind::LocalPty,
+            color: None,
+            icon: None,
+            created_at: 0,
+            last_opened: 0,
+        }
+    }
+
+    /// Registry-level (no GTK canvas interaction) exercise of the exact
+    /// scenario Milestone 2 exists for: a dormant workspace's terminal is
+    /// genuinely running (`runtime.spawn` directly, standing in for what
+    /// `switch_workspace` would have done through `materialize_node`), is
+    /// reported as `Background`, and `unload_workspace` kills only that
+    /// workspace's own sessions — a sibling dormant workspace's session, and
+    /// anything in the active workspace, must survive untouched. This is the
+    /// cross-workspace process isolation guarantee requirement #7 in
+    /// `steps.md` requires.
+    #[test]
+    #[ignore = "needs a display"]
+    fn unload_workspace_only_terminates_that_workspaces_own_sessions() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+
+        let node_a = terminal_node(EnvironmentKind::LocalPty);
+        let node_b = terminal_node(EnvironmentKind::LocalPty);
+        let active_node = terminal_node(EnvironmentKind::LocalPty);
+        {
+            let mut app_mut = app.borrow_mut();
+            app_mut
+                .runtime
+                .spawn(node_a.id, std::env::temp_dir(), sleeper_launch())
+                .unwrap();
+            app_mut
+                .runtime
+                .spawn(node_b.id, std::env::temp_dir(), sleeper_launch())
+                .unwrap();
+            app_mut
+                .runtime
+                .spawn(active_node.id, std::env::temp_dir(), sleeper_launch())
+                .unwrap();
+            app_mut
+                .inactive_workspaces
+                .push(dormant_workspace("workspace-a", vec![node_a.clone()]));
+            app_mut
+                .inactive_workspaces
+                .push(dormant_workspace("workspace-b", vec![node_b.clone()]));
+        }
+
+        assert_eq!(
+            app.borrow()
+                .workspace_runtime_state(app.borrow().inactive_workspaces[0].id),
+            WorkspaceRuntimeState::Background
+        );
+
+        let workspace_a_id = app.borrow().inactive_workspaces[0].id;
+        App::unload_workspace(&app, workspace_a_id).unwrap();
+
+        assert!(!app.borrow().runtime.is_alive(node_a.id));
+        assert!(app.borrow().runtime.is_alive(node_b.id));
+        assert!(app.borrow().runtime.is_alive(active_node.id));
+        assert_eq!(
+            app.borrow().workspace_runtime_state(workspace_a_id),
+            WorkspaceRuntimeState::Unloaded
+        );
+
+        app.borrow_mut().runtime.terminate(node_b.id);
+        app.borrow_mut().runtime.terminate(active_node.id);
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn unload_workspace_refuses_on_the_active_workspace() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let active_id = app.borrow().workspace_id;
+        assert!(App::unload_workspace(&app, active_id).is_err());
+    }
+
+    /// `workspace_runtime_state` must report `Unloaded` for a dormant
+    /// workspace whose terminals were never spawned (e.g. right after
+    /// `unload_workspace`, or a workspace that's simply never been visited
+    /// since app start) and `Active` for whichever workspace `App` currently
+    /// considers live, independent of the runtime registry.
+    #[test]
+    #[ignore = "needs a display"]
+    fn workspace_runtime_state_distinguishes_active_background_and_unloaded() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let active_id = app.borrow().workspace_id;
+        assert_eq!(
+            app.borrow().workspace_runtime_state(active_id),
+            WorkspaceRuntimeState::Active
+        );
+
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let dormant = dormant_workspace("idle", vec![node]);
+        let dormant_id = dormant.id;
+        app.borrow_mut().inactive_workspaces.push(dormant);
+        assert_eq!(
+            app.borrow().workspace_runtime_state(dormant_id),
+            WorkspaceRuntimeState::Unloaded
+        );
+
+        assert_eq!(
+            app.borrow().workspace_runtime_state(Uuid::new_v4()),
+            WorkspaceRuntimeState::Unloaded
         );
     }
 }

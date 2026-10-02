@@ -1,4 +1,4 @@
-use crate::model::{EdgeRecord, NodeRecord};
+use crate::model::{EdgeRecord, EnvironmentKind, NodeRecord};
 use crate::role::Role;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -36,6 +36,27 @@ pub struct WorkspaceRecord {
     pub edges: Vec<EdgeRecord>,
     #[serde(default)]
     pub canvas: CanvasRecord,
+    /// The default runtime a new terminal in this workspace gets, unless
+    /// something overrides it. `#[serde(default)]` so every workspace saved
+    /// before Milestone 2 loads as `LocalPty`.
+    #[serde(default)]
+    pub environment: EnvironmentKind,
+    /// Cosmetic workspace metadata, both `#[serde(default)]`'d to `None` for
+    /// a workspace saved before this field existed. No UI sets these to
+    /// `Some` yet — they exist so the persisted shape already has room for
+    /// the color/icon picker a later pass can add without another schema
+    /// migration.
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Unix-epoch seconds. `0` for a workspace migrated from a schema that
+    /// never recorded this — an honest "unknown", not a fabricated creation
+    /// time.
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_opened: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -191,6 +212,7 @@ mod tests {
                 claude_session_id: Some(Uuid::nil()),
                 claude_account: Some("work".to_string()),
                 role_id: None,
+                environment: EnvironmentKind::LocalPty,
             }),
         }
     }
@@ -206,6 +228,11 @@ mod tests {
                 zoom: 1.5,
                 pan: (3.0, 4.0),
             },
+            environment: EnvironmentKind::LocalPty,
+            color: None,
+            icon: None,
+            created_at: 1_700_000_000,
+            last_opened: 1_700_000_100,
         }
     }
 
@@ -278,6 +305,11 @@ mod tests {
             nodes: Vec::new(),
             edges: Vec::new(),
             canvas: CanvasRecord::default(),
+            environment: EnvironmentKind::LocalPty,
+            color: None,
+            icon: None,
+            created_at: 0,
+            last_opened: 0,
         }
     }
 
@@ -323,6 +355,7 @@ mod tests {
             claude_session_id: None,
             claude_account: None,
             role_id: None,
+            environment: EnvironmentKind::LocalPty,
         });
         let workspace = sample_workspace(vec![node.clone()]);
         let store = Store::new(vec![workspace.clone()], Some(workspace.id), Vec::new());

@@ -3,6 +3,7 @@ mod agent;
 mod app;
 mod canvas;
 mod control;
+mod environment;
 mod handoff;
 mod layout;
 mod markdown;
@@ -17,7 +18,7 @@ mod store;
 
 use account::AccountStore;
 use adw::prelude::*;
-use app::App;
+use app::{App, WorkspaceRuntimeState};
 use gtk4::glib;
 use libadwaita as adw;
 use std::cell::RefCell;
@@ -457,6 +458,11 @@ fn wire_canvas_edit_actions(
             "Send to Back",
             Box::new(App::lower_selected),
         ),
+        (
+            "terminate-selected-terminals",
+            "Terminate Terminal",
+            Box::new(App::terminate_selected_terminals),
+        ),
         ("align-left", "Align Left", Box::new(App::align_left)),
         ("align-right", "Align Right", Box::new(App::align_right)),
         ("align-top", "Align Top", Box::new(App::align_top)),
@@ -491,9 +497,16 @@ fn wire_canvas_edit_actions(
         application.add_action(&action);
         let item = gtk4::gio::MenuItem::new(Some(label), Some(&format!("app.{name}")));
         let section = match name {
-            "select-all" | "deselect-all" | "delete-selected" | "lock-selected"
-            | "unlock-selected" | "collapse-selected" | "expand-selected" | "raise-selected"
-            | "lower-selected" => &selection_section,
+            "select-all"
+            | "deselect-all"
+            | "delete-selected"
+            | "lock-selected"
+            | "unlock-selected"
+            | "collapse-selected"
+            | "expand-selected"
+            | "raise-selected"
+            | "lower-selected"
+            | "terminate-selected-terminals" => &selection_section,
             "align-left"
             | "align-right"
             | "align-top"
@@ -505,6 +518,22 @@ fn wire_canvas_edit_actions(
         };
         section.append_item(&item);
     }
+
+    // Restarting a terminal needs `toast_overlay` the same way Duplicate and
+    // Paste do: a failed respawn surfaces a toast rather than failing
+    // silently. Lives in the selection section despite being registered
+    // here, since it (like terminate, above) operates on the selection.
+    let restart_action = gtk4::gio::SimpleAction::new("restart-selected-terminals", None);
+    restart_action.connect_activate({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| App::restart_selected_terminals(&app, &toast_overlay)
+    });
+    application.add_action(&restart_action);
+    selection_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("Restart Terminal"),
+        Some("app.restart-selected-terminals"),
+    ));
 
     // Duplicate and Paste need `toast_overlay` (a failed terminal respawn
     // surfaces a toast the same way creating one fresh does).
@@ -1653,11 +1682,15 @@ fn populate_workspaces(
     let can_delete = workspaces.len() > 1;
 
     for (id, name) in workspaces {
+        let runtime_state = app.borrow().workspace_runtime_state(id);
         let row = adw::ActionRow::new();
         row.set_title(&name);
         if id == active_id {
             row.set_subtitle("Current workspace");
         } else {
+            if runtime_state == WorkspaceRuntimeState::Background {
+                row.set_subtitle("Running in background");
+            }
             row.set_activatable(true);
             row.connect_activated({
                 let app = app.clone();
@@ -1681,6 +1714,35 @@ fn populate_workspaces(
                     );
                 }
             });
+        }
+
+        if runtime_state == WorkspaceRuntimeState::Background {
+            let unload_button = gtk4::Button::from_icon_name("media-playback-stop-symbolic");
+            unload_button.add_css_class("flat");
+            unload_button.set_valign(gtk4::Align::Center);
+            unload_button.set_tooltip_text(Some("Unload (stop its background processes)"));
+            unload_button.connect_clicked({
+                let app = app.clone();
+                let group = group.clone();
+                let workspace_rows = workspace_rows.clone();
+                let toast_overlay = toast_overlay.clone();
+                let dialog_parent = dialog_parent.clone();
+                let workspace_label = workspace_label.clone();
+                move |_| {
+                    if let Err(error) = App::unload_workspace(&app, id) {
+                        toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+                    }
+                    populate_workspaces(
+                        &group,
+                        &workspace_rows,
+                        &app,
+                        &toast_overlay,
+                        &dialog_parent,
+                        &workspace_label,
+                    );
+                }
+            });
+            row.add_suffix(&unload_button);
         }
 
         let rename_button = gtk4::Button::from_icon_name("document-edit-symbolic");
