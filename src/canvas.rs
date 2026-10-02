@@ -25,7 +25,6 @@ impl CanvasState {
     }
 }
 
-use crate::store::SessionRecord;
 use gtk4::prelude::*;
 use gtk4::{glib, graphene, gsk};
 use std::cell::RefCell;
@@ -35,6 +34,11 @@ use std::rc::Rc;
 /// `Canvas::nodes`'s doc comment for why the position is tracked
 /// independently of the widget's own GTK transform).
 type CanvasNode = (gtk4::Widget, (f64, f64));
+
+type MarqueeEndCallback = Box<dyn Fn((f64, f64), (f64, f64))>;
+/// The marquee rectangle's two world-space corners while a Shift-drag is in
+/// progress; `None` between drags.
+type MarqueeRect = Rc<RefCell<Option<((f64, f64), (f64, f64))>>>;
 
 #[derive(Clone)]
 pub struct Canvas {
@@ -51,37 +55,81 @@ pub struct Canvas {
     pub links_area: gtk4::DrawingArea,
     pub state: Rc<RefCell<CanvasState>>,
     nodes: Rc<RefCell<Vec<CanvasNode>>>,
+    /// Set only from `connect_marquee_end`, called after `Canvas::new()` once
+    /// `App` exists — see that method's doc comment. `marquee_area` and
+    /// `marquee` themselves (the draw target and transient rectangle state)
+    /// don't need to be struct fields: the closures set up in `new()` each
+    /// hold their own `Rc` clone, which is all they ever need after
+    /// construction.
+    marquee_end: Rc<RefCell<Option<MarqueeEndCallback>>>,
 }
 
 impl Canvas {
     pub fn new() -> Canvas {
         let fixed = gtk4::Fixed::new();
-        // Neither drawing area may target: both span the whole canvas, so a
-        // targetable one would swallow every click meant for a card.
+        // None of the three drawing areas may target: all three span the
+        // whole canvas, so a targetable one would swallow every click meant
+        // for a card.
         let grid_area = gtk4::DrawingArea::new();
         grid_area.set_can_target(false);
         let links_area = gtk4::DrawingArea::new();
         links_area.set_can_target(false);
+        let marquee_area = gtk4::DrawingArea::new();
+        marquee_area.set_can_target(false);
 
         let overlay = gtk4::Overlay::new();
         overlay.set_child(Some(&grid_area));
         overlay.add_overlay(&fixed);
         overlay.add_overlay(&links_area);
+        overlay.add_overlay(&marquee_area);
 
         let state = Rc::new(RefCell::new(CanvasState::new()));
         let nodes: Rc<RefCell<Vec<CanvasNode>>> = Rc::new(RefCell::new(Vec::new()));
+        let marquee: MarqueeRect = Rc::new(RefCell::new(None));
+        let marquee_end: Rc<RefCell<Option<MarqueeEndCallback>>> = Rc::new(RefCell::new(None));
+
+        {
+            let marquee = Rc::clone(&marquee);
+            let state = Rc::clone(&state);
+            marquee_area.set_draw_func(move |_area, cairo_ctx, _width, _height| {
+                if let Some((start, current)) = *marquee.borrow() {
+                    draw_marquee(cairo_ctx, start, current, &state.borrow());
+                }
+            });
+        }
 
         // GestureDrag's offsets are relative to the drag's start point (not
         // an incremental delta since the last event), so the pan at drag
         // start is captured here and each update sets pan = start + offset
         // rather than accumulating offsets.
         let drag_start_pan = Rc::new(RefCell::new((0.0, 0.0)));
+        // `Some` for the duration of a Shift-held drag (world-space start
+        // point); `None` means this drag is a plain pan, handled exactly as
+        // before. Keeping both behaviors on one gesture (rather than a
+        // second competing `GestureDrag` on the same widget) avoids any
+        // question of which of two gestures wins a claim on the same press.
+        let marquee_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
         let drag = gtk4::GestureDrag::new();
         {
             let state = Rc::clone(&state);
             let drag_start_pan = Rc::clone(&drag_start_pan);
-            drag.connect_drag_begin(move |_gesture, _start_x, _start_y| {
+            let marquee_start = Rc::clone(&marquee_start);
+            drag.connect_drag_begin(move |gesture, start_x, start_y| {
                 *drag_start_pan.borrow_mut() = state.borrow().pan;
+                let shift_held = gesture
+                    .current_event()
+                    .map(|event| {
+                        event
+                            .modifier_state()
+                            .contains(gtk4::gdk::ModifierType::SHIFT_MASK)
+                    })
+                    .unwrap_or(false);
+                *marquee_start.borrow_mut() = if shift_held {
+                    let state = state.borrow();
+                    Some(screen_to_world((start_x, start_y), state.pan, state.zoom))
+                } else {
+                    None
+                };
             });
         }
         {
@@ -90,7 +138,22 @@ impl Canvas {
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
             let drag_start_pan = Rc::clone(&drag_start_pan);
-            drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
+            let marquee_start = Rc::clone(&marquee_start);
+            let marquee = Rc::clone(&marquee);
+            let marquee_area = marquee_area.clone();
+            drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+                if let Some(start_world) = *marquee_start.borrow() {
+                    let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
+                    let state = state.borrow();
+                    let current_world = screen_to_world(
+                        (start_x + offset_x, start_y + offset_y),
+                        state.pan,
+                        state.zoom,
+                    );
+                    *marquee.borrow_mut() = Some((start_world, current_world));
+                    marquee_area.queue_draw();
+                    return;
+                }
                 let start_pan = *drag_start_pan.borrow();
                 let mut state = state.borrow_mut();
                 // `pan` is a world-space (pre-scale) quantity — world_to_screen
@@ -103,6 +166,23 @@ impl Canvas {
                     start_pan.1 + offset_y / state.zoom,
                 );
                 apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+            });
+        }
+        {
+            let marquee_start = Rc::clone(&marquee_start);
+            let marquee = Rc::clone(&marquee);
+            let marquee_area = marquee_area.clone();
+            let marquee_end = Rc::clone(&marquee_end);
+            drag.connect_drag_end(move |_gesture, _x, _y| {
+                if marquee_start.borrow_mut().take().is_none() {
+                    return;
+                }
+                if let Some((start, current)) = marquee.borrow_mut().take()
+                    && let Some(callback) = marquee_end.borrow().as_ref()
+                {
+                    callback(start, current);
+                }
+                marquee_area.queue_draw();
             });
         }
         fixed.add_controller(drag);
@@ -153,7 +233,16 @@ impl Canvas {
             links_area,
             state,
             nodes,
+            marquee_end,
         }
+    }
+
+    /// Registers the callback fired when a Shift-drag marquee selection
+    /// ends, with the marquee's two world-space corners (in no particular
+    /// order — the caller normalizes into a rect). Only one callback can be
+    /// registered at a time, matching `set_link_lines_source`'s shape.
+    pub fn connect_marquee_end(&self, f: impl Fn((f64, f64), (f64, f64)) + 'static) {
+        *self.marquee_end.borrow_mut() = Some(Box::new(f));
     }
 
     /// Multiplies the zoom by `ZOOM_STEP` (`steps` positive zooms in,
@@ -173,6 +262,15 @@ impl Canvas {
     pub fn reset_view(&self) {
         let mut state = self.state.borrow_mut();
         *state = CanvasState::new();
+        apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
+    }
+
+    /// Re-applies every tracked child's transform from `self.state` as it
+    /// currently stands. For callers (zoom-to-selection/zoom-to-fit) that
+    /// write `pan`/`zoom` directly rather than through a method here that
+    /// would otherwise call `apply_view` itself.
+    pub fn refresh_view(&self) {
+        let state = self.state.borrow();
         apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
     }
 
@@ -351,39 +449,46 @@ fn distance_to_segment(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
 /// its top edge; a few pixels either way is invisible on a link.
 pub const TITLE_BAR_HEIGHT: f64 = 28.0;
 
-/// A card's left or right edge at its vertical middle, in world space.
-/// `record.position` is the card's top-left and `record.size` is its *body*
-/// size, hence the title-bar correction.
-pub fn card_edge(record: &SessionRecord, right: bool) -> (f64, f64) {
+/// A node's position and size — the only two `NodeRecord` fields this
+/// module's geometry helpers need, taken as plain data so `canvas.rs` stays
+/// ignorant of `model::NodeRecord`/`NodeKind` and works for every node kind
+/// alike (previously these functions took `&SessionRecord` specifically,
+/// back when only sessions had canvas geometry).
+pub type NodeGeometry = ((f64, f64), (f64, f64));
+
+/// A node's left or right edge at its vertical middle, in world space.
+/// `position` is the node's top-left and `size` is its *body* size, hence
+/// the title-bar correction.
+pub fn card_edge((position, size): NodeGeometry, right: bool) -> (f64, f64) {
     (
         if right {
-            record.position.0 + record.size.0
+            position.0 + size.0
         } else {
-            record.position.0
+            position.0
         },
-        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+        position.1 + (size.1 + TITLE_BAR_HEIGHT) / 2.0,
     )
 }
 
-pub fn card_vertical_edge(record: &SessionRecord, bottom: bool) -> (f64, f64) {
+pub fn card_vertical_edge((position, size): NodeGeometry, bottom: bool) -> (f64, f64) {
     (
-        record.position.0 + record.size.0 / 2.0,
+        position.0 + size.0 / 2.0,
         if bottom {
-            record.position.1 + record.size.1 + TITLE_BAR_HEIGHT
+            position.1 + size.1 + TITLE_BAR_HEIGHT
         } else {
-            record.position.1
+            position.1
         },
     )
 }
 
-pub fn card_center(record: &SessionRecord) -> (f64, f64) {
+pub fn card_center((position, size): NodeGeometry) -> (f64, f64) {
     (
-        record.position.0 + record.size.0 / 2.0,
-        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
+        position.0 + size.0 / 2.0,
+        position.1 + (size.1 + TITLE_BAR_HEIGHT) / 2.0,
     )
 }
 
-pub fn card_intersection(a: &SessionRecord, b: &SessionRecord) -> Option<(f64, f64, f64, f64)> {
+pub fn card_intersection(a: NodeGeometry, b: NodeGeometry) -> Option<(f64, f64, f64, f64)> {
     let (a_x, a_y, a_width, a_height) = card_rect(a);
     let (b_x, b_y, b_width, b_height) = card_rect(b);
     let (a_right, a_bottom) = (a_x + a_width, a_y + a_height);
@@ -393,13 +498,8 @@ pub fn card_intersection(a: &SessionRecord, b: &SessionRecord) -> Option<(f64, f
     (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
 }
 
-pub fn card_rect(record: &SessionRecord) -> (f64, f64, f64, f64) {
-    (
-        record.position.0,
-        record.position.1,
-        record.size.0,
-        record.size.1 + TITLE_BAR_HEIGHT,
-    )
+pub fn card_rect((position, size): NodeGeometry) -> (f64, f64, f64, f64) {
+    (position.0, position.1, size.0, size.1 + TITLE_BAR_HEIGHT)
 }
 
 /// Graph-paper backdrop, drawn in world space so it pans and scales with the
@@ -570,6 +670,29 @@ fn draw_world_segment(
     let to = world_to_screen(to, state.pan, state.zoom);
     cairo_ctx.move_to(from.0, from.1);
     cairo_ctx.line_to(to.0, to.1);
+}
+
+/// A dashed selection rectangle between two world-space corners, in whatever
+/// order a Shift-drag happened to produce them (top-left/bottom-right is
+/// resolved here from screen-space min/max, not assumed from the order).
+fn draw_marquee(
+    cairo_ctx: &gtk4::cairo::Context,
+    start: (f64, f64),
+    current: (f64, f64),
+    state: &CanvasState,
+) {
+    let a = world_to_screen(start, state.pan, state.zoom);
+    let b = world_to_screen(current, state.pan, state.zoom);
+    let (x, y) = (a.0.min(b.0), a.1.min(b.1));
+    let (width, height) = ((a.0 - b.0).abs(), (a.1 - b.1).abs());
+
+    cairo_ctx.rectangle(x, y, width, height);
+    cairo_ctx.set_source_rgba(0.21, 0.52, 0.89, 0.12);
+    let _ = cairo_ctx.fill_preserve();
+    cairo_ctx.set_source_rgba(0.21, 0.52, 0.89, 0.9);
+    cairo_ctx.set_line_width(1.5);
+    cairo_ctx.set_dash(&[4.0, 3.0], 0.0);
+    let _ = cairo_ctx.stroke();
 }
 
 fn apply_transform(
