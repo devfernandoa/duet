@@ -65,9 +65,6 @@ const MESSAGE_LOG_LIMIT: usize = 200;
 /// distinct keystroke instead.
 const MESSAGE_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
-/// World-space grid size `App::snap_to_grid` rounds a drag-end position to.
-const SNAP_GRID: f64 = 20.0;
-
 /// Offset applied to a duplicated or pasted node so it doesn't land exactly
 /// on top of its source.
 const DUPLICATE_OFFSET: (f64, f64) = (32.0, 32.0);
@@ -144,6 +141,22 @@ impl NodeWidget {
                 self.container()
                     .set_size_request(size.0 as i32, size.1 as i32);
             }
+        }
+    }
+
+    /// Collapses/expands the node to just its title bar. The only way this
+    /// state ever changed used to be a direct click on the node's own
+    /// minimize button (`node::wire_minimize`'s closure) — `App`'s
+    /// "Collapse Selected"/"Expand Selected" menu commands, and undo/redo of
+    /// a collapse toggle, updated `NodeRecord::collapsed` without this call
+    /// and so silently left the widget showing the opposite of what was
+    /// persisted.
+    fn set_collapsed(&self, collapsed: bool) {
+        match self {
+            NodeWidget::Terminal(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::Note(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::Text(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::Placeholder(node) => node.collapse.set_collapsed(collapsed),
         }
     }
 }
@@ -247,7 +260,7 @@ pub struct App {
     pub clipboard: Vec<NodeRecord>,
     pub undo_stack: Vec<CanvasCommand>,
     pub redo_stack: Vec<CanvasCommand>,
-    /// Whether a node's position snaps to `SNAP_GRID` at drag-end.
+    /// Whether a node's position snaps to `canvas::GRID_MINOR` at drag-end.
     pub snap_to_grid: bool,
     /// The debounce timer for `schedule_persist`, if a save is currently
     /// pending. `None` when no save is scheduled.
@@ -1024,8 +1037,14 @@ impl App {
 
     /// Whether any node covers `world` (world-space). Used to keep a click
     /// that landed on a node from also being treated as a click on an edge
-    /// line, since the lines are painted behind the nodes.
-    fn covers_point(&self, world: (f64, f64)) -> bool {
+    /// line, since the lines are painted behind the nodes — and, in
+    /// `main.rs`'s background-click handler, to tell "truly empty canvas"
+    /// apart from "landed on a card" before clearing the selection (both
+    /// cases make `click_link_at` return `None`, since neither is a link
+    /// hit, but only the first should deselect — the second is a button
+    /// click, a drag-to-move, or a click into a note's text view, none of
+    /// which should discard whatever was selected).
+    pub fn covers_point(&self, world: (f64, f64)) -> bool {
         self.nodes.values().any(|entry| {
             let (position, size) = (entry.record.position, entry.record.size);
             world.0 >= position.0
@@ -1522,6 +1541,11 @@ impl App {
                 if let Some(entry) = app_mut.nodes.get_mut(id) {
                     before.push(entry.record.clone());
                     edit(&mut entry.record);
+                    // Keeps the widget's actual on-screen collapsed state in
+                    // sync with the record `edit` may have just changed — a
+                    // no-op (checked inside `set_collapsed`) for a property
+                    // edit (e.g. lock) that didn't touch `collapsed` at all.
+                    entry.widget.set_collapsed(entry.record.collapsed);
                     after.push(entry.record.clone());
                 }
             }
@@ -1552,9 +1576,23 @@ impl App {
         App::schedule_persist(app);
     }
 
-    /// Sends every selected node to the back (below every other node).
+    /// Sends every selected node to the back (below every other node) —
+    /// relative order among the selected nodes themselves is preserved, the
+    /// same guarantee `raise_selected` makes. Plain forward iteration is
+    /// what achieves that here, exactly as in `raise_selected`: each
+    /// `canvas.lower_node` call inserts its widget as the Fixed container's
+    /// new *first* (bottom-most) child, so processing the selection in its
+    /// original order pushes each already-lowered node up by one slot as the
+    /// next one is lowered beneath it — the first node processed ends up
+    /// closest to the rest of the canvas, the last one processed ends up the
+    /// very bottom, matching the ascending `z_order` values assigned in this
+    /// same forward pass. (An earlier version of this function reversed the
+    /// iteration to "compensate" for `lower_node` inserting at the opposite
+    /// end from `raise_node` — that reasoning was backwards and inverted the
+    /// group's relative order; see the code review that caught it.)
     pub fn lower_selected(app: &Rc<RefCell<App>>) {
         let mut app_mut = app.borrow_mut();
+        let canvas = app_mut.canvas.clone();
         let min_z = app_mut
             .nodes
             .values()
@@ -1565,6 +1603,7 @@ impl App {
         for (offset, id) in ids.iter().enumerate() {
             if let Some(entry) = app_mut.nodes.get_mut(id) {
                 entry.record.z_order = min_z - 1 - offset as i64;
+                canvas.lower_node(entry.widget.container());
             }
         }
         drop(app_mut);
@@ -1795,6 +1834,7 @@ impl App {
                 for record in records {
                     if let Some(entry) = app_mut.nodes.get_mut(&record.id) {
                         entry.record = record.clone();
+                        entry.widget.set_collapsed(entry.record.collapsed);
                     }
                 }
             }
@@ -2033,9 +2073,10 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
                 };
                 let mut new_position = entry.record.position;
                 if snap {
+                    use crate::canvas::GRID_MINOR;
                     new_position = (
-                        (new_position.0 / SNAP_GRID).round() * SNAP_GRID,
-                        (new_position.1 / SNAP_GRID).round() * SNAP_GRID,
+                        (new_position.0 / GRID_MINOR).round() * GRID_MINOR,
+                        (new_position.1 / GRID_MINOR).round() * GRID_MINOR,
                     );
                     entry.record.position = new_position;
                     canvas.reposition_node(entry.widget.container(), new_position);
@@ -2373,10 +2414,17 @@ fn materialize_node(
 /// of the workspace.
 fn spawn_workspace_contents(
     app: &Rc<RefCell<App>>,
-    nodes: Vec<NodeRecord>,
+    mut nodes: Vec<NodeRecord>,
     edges: Vec<EdgeRecord>,
     toast_overlay: &adw::ToastOverlay,
 ) -> Vec<String> {
+    // Materializing in persisted (insertion) order would silently forget
+    // whatever front/back stacking "raise_selected"/"lower_selected" left in
+    // place, since the canvas's paint order is simply each node's add_node
+    // call order — sorting by the same z_order those commands maintain is
+    // what makes "send to back" (etc.) survive a restart rather than only
+    // lasting until the app is closed.
+    nodes.sort_by_key(|record| record.z_order);
     let mut errors = Vec::new();
     for record in nodes {
         let label = record.kind.label().to_string();

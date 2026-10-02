@@ -7,11 +7,21 @@
 //! responses, not just `Note` nodes.
 //!
 //! Supports headings, paragraphs, ordered/unordered/task lists, links,
-//! fenced code blocks, inline code, and blockquotes. Tables render as plain
-//! pipe-separated rows rather than aligned cells — `pulldown-cmark`'s table
-//! extension gives cell boundaries, not column widths, and a `GtkTextView`
-//! has no native table widget to hand those to; a clean monospace-grid
-//! renderer is a reasonable future upgrade, not a Milestone 1 requirement.
+//! fenced code blocks, inline code, blockquotes, and thematic breaks
+//! (`---`/`***`/`___`). Tables render as plain pipe-separated rows rather
+//! than aligned cells — `pulldown-cmark`'s table extension gives cell
+//! boundaries, not column widths, and a `GtkTextView` has no native table
+//! widget to hand those to; a clean monospace-grid renderer is a reasonable
+//! future upgrade, not a Milestone 1 requirement.
+//!
+//! One CommonMark subtlety worth knowing before "`---` doesn't work" reads as
+//! a parser bug: a line of hyphens immediately after a paragraph with **no
+//! blank line between them** is a Setext heading underline, not a thematic
+//! break — `"Some text\n---"` becomes a level-2 heading "Some text", exactly
+//! as it would on GitHub or any other CommonMark-compliant renderer. A
+//! `---` only becomes an actual divider (`Event::Rule`) on its own, set off
+//! by blank lines. This module doesn't special-case that away, since doing
+//! so would break the far more common use of `---` as a heading underline.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -27,7 +37,24 @@ pub enum SpanStyle {
     Link(String),
     BlockQuote,
     CodeBlock,
+    /// A thematic break (`Event::Rule`). Carried as a style on a span of
+    /// filler characters, the same shape every other block uses, rather than
+    /// a `Line`-level flag — see `render_to_buffer` for why this needed no
+    /// new rendering mechanism (an anchored child widget, say) to look like
+    /// an actual divider rather than three literal hyphen characters.
+    Rule,
 }
+
+/// How many `RULE_CHAR`s a thematic break renders as. A plain character
+/// count rather than something that measures the view's actual pixel width:
+/// `render_to_buffer` only ever sees `Line`s, never a widget to measure, and
+/// a fixed run this long reads as a clear divider in every note size this
+/// app's cards are ever resized to.
+const RULE_WIDTH: usize = 48;
+/// Unicode box-drawing light horizontal line (U+2500) — renders as a
+/// continuous rule in any font, unlike plain ASCII hyphens (which render
+/// with visible gaps and don't read as a single line).
+const RULE_CHAR: char = '─';
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
@@ -210,7 +237,15 @@ pub fn parse(source: &str) -> Vec<Line> {
             }
             Event::Rule => {
                 new_line(&mut lines);
-                current_line(&mut lines).push_text("---", &style_stack);
+                // Deliberately NOT `style_stack` (a thematic break can't be
+                // nested inside emphasis/a link/etc. per CommonMark, so
+                // there's nothing on the stack to preserve) — just the one
+                // style that makes this render as a visible divider instead
+                // of a line of identical-looking body text.
+                current_line(&mut lines).push_text(
+                    &RULE_CHAR.to_string().repeat(RULE_WIDTH),
+                    &[SpanStyle::Rule],
+                );
                 new_line(&mut lines);
             }
             _ => {}
@@ -248,6 +283,7 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
         "md-link",
         "md-quote",
         "md-codeblock",
+        "md-rule",
     ] {
         if table.lookup(name).is_none() {
             let tag = gtk4::TextTag::new(Some(name));
@@ -287,6 +323,11 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
                     tag.set_family(Some("monospace"));
                     tag.set_background(Some("#00000012"));
                 }
+                "md-rule" => {
+                    // Muted rather than body-text color, so a run of
+                    // RULE_CHAR reads as a divider rule, not as more text.
+                    tag.set_foreground(Some("#8a8a8a"));
+                }
                 _ => {}
             }
             table.add(&tag);
@@ -323,7 +364,7 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
             let start_offset = end.offset();
             buffer.insert(&mut end, &span.text);
             end = buffer.end_iter();
-            let mut start = buffer.iter_at_offset(start_offset);
+            let start = buffer.iter_at_offset(start_offset);
             for style in &span.styles {
                 let tag_name = match style {
                     SpanStyle::Heading(1) => "md-h1",
@@ -338,11 +379,10 @@ pub fn render_to_buffer(buffer: &gtk4::TextBuffer, lines: &[Line]) {
                     SpanStyle::Link(_) => "md-link",
                     SpanStyle::BlockQuote => "md-quote",
                     SpanStyle::CodeBlock => "md-codeblock",
+                    SpanStyle::Rule => "md-rule",
                 };
                 buffer.apply_tag_by_name(tag_name, &start, &end);
             }
-            start = buffer.iter_at_offset(start_offset);
-            let _ = start;
         }
     }
 }
@@ -488,6 +528,44 @@ mod tests {
         let lines = parse("> quoted text");
         assert!(lines[0].spans[0].styles.contains(&SpanStyle::BlockQuote));
         assert_eq!(line_text(&lines[0]), "quoted text");
+    }
+
+    /// A thematic break isolated by blank lines (the only form that's
+    /// actually `Event::Rule` rather than a Setext heading underline — see
+    /// this module's doc comment) renders as a visible divider line, not as
+    /// three literal hyphen characters indistinguishable from body text.
+    #[test]
+    fn isolated_rule_renders_as_a_visible_divider() {
+        let lines = parse("above\n\n---\n\nbelow");
+        let rule_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.styles.contains(&SpanStyle::Rule))
+            })
+            .expect("expected one line carrying SpanStyle::Rule");
+        assert!(line_text(rule_line).chars().all(|c| c == RULE_CHAR));
+        assert!(line_text(rule_line).chars().count() >= 8);
+    }
+
+    /// Pins the documented CommonMark behavior this module deliberately does
+    /// not override: `---` immediately after a paragraph (no blank line) is
+    /// a Setext H2 heading underline, not a thematic break.
+    #[test]
+    fn dashes_immediately_after_text_become_a_setext_heading_not_a_rule() {
+        let lines = parse("Some content\n---\n\nMore text");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.styles.contains(&SpanStyle::Heading(2)))
+        );
+        assert!(!lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.styles.contains(&SpanStyle::Rule))
+        }));
     }
 
     #[test]
