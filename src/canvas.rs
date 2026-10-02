@@ -300,6 +300,16 @@ impl Canvas {
         child.insert_before(&self.fixed, None::<&gtk4::Widget>);
     }
 
+    /// Moves an existing card to the start of the `Fixed` child order, which
+    /// GTK paints first (so every other card then paints on top of it) — the
+    /// "send to back" counterpart of `raise_node`. `insert_after` with no
+    /// sibling means "insert as the first child", the mirror image of
+    /// `raise_node`'s `insert_before` with no sibling meaning "insert as the
+    /// last child".
+    pub fn lower_node(&self, child: &impl IsA<gtk4::Widget>) {
+        child.insert_after(&self.fixed, None::<&gtk4::Widget>);
+    }
+
     /// Removes a child from both the `Fixed` container and the internal
     /// tracking list used by `retransform_children`. Callers that remove a
     /// node from the canvas (e.g. deleting a session) must use this instead
@@ -371,7 +381,13 @@ pub struct LinkLine {
 /// World-space spacing of the faint canvas grid, and of its stronger every-
 /// fifth line. The grid exists so panning and zooming are visible at all —
 /// an empty canvas gives the eye nothing to measure movement against.
-const GRID_MINOR: f64 = 100.0;
+///
+/// `GRID_MINOR` is `pub` so `app.rs`'s snap-to-grid feature can snap to
+/// exactly this spacing — snapping to some other increment would land a
+/// dragged node off the drawn lines most of the time, reading as "snap to
+/// grid doesn't do anything" even though it was rounding to *a* grid, just
+/// not the one on screen.
+pub const GRID_MINOR: f64 = 100.0;
 const GRID_MAJOR: f64 = 500.0;
 
 /// Multiplicative zoom per step, shared by Ctrl+scroll and Ctrl+Plus/Minus
