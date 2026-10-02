@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
 use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
-use crate::role::{Role, with_role_instructions};
+use crate::role::Role;
 use crate::runtime::{AgentActivity, SessionRuntime};
 use crate::store::{CanvasRecord, Store, WorkspaceRecord};
 use anyhow::Context;
@@ -1635,13 +1635,16 @@ impl App {
         };
         let (launch, updated) = {
             let app_ref = app.borrow();
-            let initial_prompt = orchestration::env::with_discovery(with_role_instructions(
-                app_ref.role_instructions(record.role_id),
-                Some(&summary),
-            ));
             if matches!(to, Agent::Claude) {
                 let account = crate::account::DEFAULT_ACCOUNT.to_string();
                 let config_dir = app_ref.accounts.ensure(&account)?;
+                // Role instructions and discovery text are no longer resent
+                // as a prompt (see `build_terminal_launch`'s doc comment) —
+                // only the handoff summary, which is genuine continuation
+                // content, not boilerplate.
+                let skill_installed = orchestration::skill::install(&config_dir).is_ok();
+                let initial_prompt =
+                    orchestration::env::with_discovery(Some(summary.clone()), skill_installed);
                 let session_id = Uuid::new_v4();
                 let launch = with_session_env(
                     to.launch(LaunchRequest {
@@ -1656,11 +1659,20 @@ impl App {
                 updated.agent = Agent::Claude;
                 updated.claude_session_id = Some(session_id);
                 updated.claude_account = Some(account);
+                // Launched with `--session-id` (not `--resume`) just above,
+                // via `resume: false` from `LaunchRequest`'s `Default` — by
+                // the time `updated` is stored (after `spawn()?` succeeds
+                // below), this id already has a real conversation.
+                updated.claude_fresh = false;
                 (launch, updated)
             } else {
+                let codex_home = ensure_codex_home(&Agent::Codex, id)?;
+                let initial_prompt =
+                    orchestration::env::with_discovery(Some(summary.clone()), false);
                 let launch = with_session_env(
                     to.launch(LaunchRequest {
                         initial_prompt: Some(&initial_prompt),
+                        codex_home_dir: codex_home.as_deref(),
                         ..Default::default()
                     }),
                     id,
@@ -1669,6 +1681,7 @@ impl App {
                 updated.agent = Agent::Codex;
                 updated.claude_session_id = None;
                 updated.claude_account = None;
+                updated.claude_fresh = false;
                 (launch, updated)
             }
         };
@@ -2460,6 +2473,10 @@ fn duplicate_records(records: &[NodeRecord]) -> Vec<NodeRecord> {
                 && terminal.claude_session_id.is_some()
             {
                 terminal.claude_session_id = Some(Uuid::new_v4());
+                // This id has never been launched — see `claude_fresh`'s doc
+                // comment. Without this, the duplicate's first launch would
+                // wrongly `--resume` an id with no conversation behind it.
+                terminal.claude_fresh = true;
             }
             copy
         })
@@ -2803,11 +2820,18 @@ fn wire_link_controls(
 /// once instead of five times.
 fn materialize_node(
     app: &Rc<RefCell<App>>,
-    record: NodeRecord,
+    mut record: NodeRecord,
     toast_overlay: &adw::ToastOverlay,
 ) -> Result<(), String> {
     let id = record.id;
     let position = record.position;
+    // Set when this call actually performs a Claude agent's first-ever
+    // spawn (`claude_fresh` was true going in) — applied to `record` after
+    // the match below, once `terminal`'s borrow of `record.kind` has ended.
+    // See `model::TerminalPayload::claude_fresh`'s doc comment for why this
+    // matters: every launch *after* this one must `--resume`, not
+    // `--session-id` again.
+    let mut clear_claude_fresh = false;
 
     let widget = match &record.kind {
         NodeKind::Terminal(terminal) => {
@@ -2828,6 +2852,7 @@ fn materialize_node(
                     .runtime
                     .spawn(id, terminal.cwd.clone(), prepared)
                     .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?;
+                clear_claude_fresh = terminal.claude_fresh;
             }
             let node = SessionNode::new(&terminal.name, record.collapsed, {
                 let app = Rc::clone(app);
@@ -2959,6 +2984,10 @@ fn materialize_node(
         }
     };
 
+    if clear_claude_fresh && let NodeKind::Terminal(terminal) = &mut record.kind {
+        terminal.claude_fresh = false;
+    }
+
     {
         let app_ref = app.borrow();
         app_ref.canvas.add_node(widget.container(), position);
@@ -3010,6 +3039,20 @@ fn spawn_workspace_contents(
     errors
 }
 
+/// Whether a terminal's next launch should `--resume` its pinned Claude
+/// session id rather than create it fresh with `--session-id`. Pulled out
+/// of `build_terminal_launch` as its own pure function specifically so this
+/// decision — getting it wrong is exactly what used to fail with "No
+/// conversation found with ID ..." — has a direct unit test, not just
+/// coverage via a GTK-dependent integration path. See
+/// `model::TerminalPayload::claude_fresh`'s doc comment for the full story.
+fn claude_should_resume(terminal: &TerminalPayload) -> bool {
+    match &terminal.agent {
+        Agent::Claude => terminal.claude_session_id.is_some() && !terminal.claude_fresh,
+        _ => true,
+    }
+}
+
 /// Resolves a Claude account's isolated config directory for a Claude-kind
 /// agent, falling back to the default account when none was picked; `None`
 /// for every other agent.
@@ -3024,6 +3067,19 @@ fn resolve_claude_account(
     let account = claude_account.unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
     let dir = app.accounts.ensure(&account)?;
     Ok(Some((account, dir)))
+}
+
+/// Creates (if needed) and returns `id`'s isolated `CODEX_HOME`, for a
+/// Codex-kind agent; `None` for every other agent. See
+/// `store::default_codex_home_dir`'s doc comment for why Codex gets
+/// per-terminal isolation where Claude gets shared named accounts.
+fn ensure_codex_home(agent: &Agent, id: Uuid) -> anyhow::Result<Option<PathBuf>> {
+    if !matches!(agent, Agent::Codex) {
+        return Ok(None);
+    }
+    let dir = crate::store::default_codex_home_dir(id)?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(Some(dir))
 }
 
 /// Builds the `Launch` for (re)starting a `Terminal` node's process from its
@@ -3042,23 +3098,26 @@ fn build_terminal_launch(
     terminal: &TerminalPayload,
 ) -> anyhow::Result<Launch> {
     let claude = resolve_claude_account(app, &terminal.agent, terminal.claude_account.clone())?;
-    let resume = match &terminal.agent {
-        Agent::Claude => terminal.claude_session_id.is_some(),
-        _ => true,
-    };
-    // Every launch (fresh, resumed, or reattached) carries its role's
-    // instructions plus the orchestration discovery text — see
-    // `orchestration::env`'s doc comment. Providers that don't consult
-    // `initial_prompt` at all (OpenCode/Shell/Custom — see `agent.rs`'s own
-    // launch builders) simply ignore it.
-    let role_prompt = with_role_instructions(app.role_instructions(terminal.role_id), None);
-    let initial_prompt = orchestration::env::with_discovery(role_prompt);
+    let codex_home = ensure_codex_home(&terminal.agent, id)?;
+    let resume = claude_should_resume(terminal);
+    // A Claude launch gets the `duet` skill installed into its config dir
+    // (idempotent — see `skill::install`'s doc comment) instead of having
+    // role instructions and discovery text resent as a prompt on every
+    // launch; it looks both up on demand via `duetctl whoami`. Every other
+    // provider still gets the fuller `DISCOVERY_INSTRUCTION` text, and
+    // providers that don't consult `initial_prompt` at all (OpenCode/Shell/
+    // Custom — see `agent.rs`'s own launch builders) simply ignore it.
+    let skill_installed = claude
+        .as_ref()
+        .is_some_and(|(_, dir)| orchestration::skill::install(dir).is_ok());
+    let initial_prompt = orchestration::env::with_discovery(None, skill_installed);
     let launch = with_session_env(
         terminal.agent.launch(LaunchRequest {
             resume,
             initial_prompt: Some(&initial_prompt),
             claude_session_id: terminal.claude_session_id,
             claude_config_dir: claude.as_ref().map(|(_, dir)| dir.as_path()),
+            codex_home_dir: codex_home.as_deref(),
         }),
         id,
     );
@@ -3133,6 +3192,10 @@ fn build_terminal_record(
         cwd: cwd.to_path_buf(),
         claude_account: claude.map(|(account, _)| account),
         claude_session_id,
+        // This id has never been launched yet — see `claude_fresh`'s doc
+        // comment. `claude_session_id.is_some()` already tells us whether
+        // this is a Claude agent at all, so `claude_fresh` just mirrors it.
+        claude_fresh: claude_session_id.is_some(),
         agent,
         role_id,
         environment: app.workspace_environment,
@@ -3299,6 +3362,7 @@ mod tests {
                 agent: Agent::Shell,
                 claude_session_id: None,
                 claude_account: None,
+                claude_fresh: false,
                 role_id: None,
                 environment,
             }),
@@ -3311,6 +3375,77 @@ mod tests {
             args: vec!["-c".to_string(), "sleep 5".to_string()],
             envs: vec![],
         }
+    }
+
+    fn claude_terminal(claude_session_id: Option<Uuid>, claude_fresh: bool) -> TerminalPayload {
+        TerminalPayload {
+            name: "t".to_string(),
+            cwd: std::env::temp_dir(),
+            agent: Agent::Claude,
+            claude_session_id,
+            claude_account: Some("default".to_string()),
+            claude_fresh,
+            role_id: None,
+            environment: EnvironmentKind::LocalPty,
+        }
+    }
+
+    /// The regression test for "No conversation found with ID ...": a
+    /// pinned-but-never-launched session id must never be resumed.
+    #[test]
+    fn claude_should_resume_is_false_for_a_fresh_never_launched_session_id() {
+        assert!(!claude_should_resume(&claude_terminal(
+            Some(Uuid::new_v4()),
+            true
+        )));
+    }
+
+    #[test]
+    fn claude_should_resume_is_true_once_a_session_id_has_actually_launched() {
+        assert!(claude_should_resume(&claude_terminal(
+            Some(Uuid::new_v4()),
+            false
+        )));
+    }
+
+    #[test]
+    fn claude_should_resume_is_false_with_no_session_id_at_all() {
+        assert!(!claude_should_resume(&claude_terminal(None, false)));
+    }
+
+    #[test]
+    fn non_claude_agents_always_resume() {
+        let mut terminal = claude_terminal(None, false);
+        terminal.agent = Agent::Shell;
+        assert!(claude_should_resume(&terminal));
+    }
+
+    /// A duplicated Claude terminal gets a brand-new session id that has
+    /// never launched — `claude_fresh` must follow it, or the duplicate's
+    /// first launch would wrongly `--resume` an empty conversation.
+    #[test]
+    fn duplicating_a_claude_terminal_marks_its_new_session_id_fresh() {
+        let mut record = terminal_node(EnvironmentKind::LocalPty);
+        record.kind = NodeKind::Terminal(claude_terminal(Some(Uuid::new_v4()), false));
+        let duplicates = duplicate_records(std::slice::from_ref(&record));
+        let NodeKind::Terminal(duplicated) = &duplicates[0].kind else {
+            panic!("expected a Terminal node");
+        };
+        assert!(duplicated.claude_fresh);
+        assert_ne!(
+            duplicated.claude_session_id,
+            record.as_terminal().unwrap().claude_session_id
+        );
+    }
+
+    #[test]
+    fn duplicating_a_terminal_with_no_claude_session_leaves_claude_fresh_false() {
+        let record = terminal_node(EnvironmentKind::LocalPty); // Agent::Shell, no claude session
+        let duplicates = duplicate_records(std::slice::from_ref(&record));
+        let NodeKind::Terminal(duplicated) = &duplicates[0].kind else {
+            panic!("expected a Terminal node");
+        };
+        assert!(!duplicated.claude_fresh);
     }
 
     fn dormant_workspace(name: &str, nodes: Vec<NodeRecord>) -> WorkspaceRecord {

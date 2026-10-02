@@ -172,6 +172,8 @@ fn convert_session(session: V3SessionRecord) -> NodeRecord {
             agent: session.agent,
             claude_session_id: session.claude_session_id,
             claude_account: session.claude_account,
+            // A migrated session has necessarily run before.
+            claude_fresh: false,
             role_id: session.role_id,
             environment: EnvironmentKind::LocalPty,
         }),

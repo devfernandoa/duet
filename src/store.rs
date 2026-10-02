@@ -174,6 +174,23 @@ pub fn default_accounts_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where a Codex terminal's isolated `CODEX_HOME` lives — one directory per
+/// terminal id, never shared between terminals (unlike Claude's named
+/// `accounts/<name>`, which several concurrent terminals can safely share).
+/// Codex's local app-server daemon treats a `CODEX_HOME` as home to at most
+/// one live interactive session at a time; two Codex terminals sharing one
+/// fail with "already running in another app". The trade-off is that a
+/// brand-new Codex terminal needs its own `codex login` — see `agent.rs`'s
+/// `codex_launch` doc comment.
+pub fn default_codex_home_dir(terminal_id: Uuid) -> anyhow::Result<PathBuf> {
+    let dir = dirs::data_dir()
+        .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?
+        .join("duet")
+        .join("codex")
+        .join(terminal_id.to_string());
+    Ok(dir)
+}
+
 /// Where `control.rs`'s Unix-domain control socket listens — one per user,
 /// the same single-instance assumption `default_store_path` already makes.
 /// Prefers `XDG_RUNTIME_DIR` (short, tmpfs-backed, exactly what a runtime
@@ -211,6 +228,7 @@ mod tests {
                 agent: Agent::Claude,
                 claude_session_id: Some(Uuid::nil()),
                 claude_account: Some("work".to_string()),
+                claude_fresh: false,
                 role_id: None,
                 environment: EnvironmentKind::LocalPty,
             }),
@@ -355,6 +373,7 @@ mod tests {
             },
             claude_session_id: None,
             claude_account: None,
+            claude_fresh: false,
             role_id: None,
             environment: EnvironmentKind::LocalPty,
         });

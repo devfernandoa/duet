@@ -110,6 +110,17 @@ pub struct WorkspaceInfo {
     pub environment: String,
 }
 
+/// `duetctl whoami`'s answer: everything the `duet` skill (`orchestration::
+/// skill`) tells an agent to look up about itself in one call, instead of
+/// having its role instructions and connections resent as prompt text on
+/// every launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WhoamiInfo {
+    pub agent: AgentInfo,
+    pub role_instructions: Option<String>,
+    pub connected_agents: Vec<AgentInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
