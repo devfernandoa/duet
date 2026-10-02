@@ -67,7 +67,11 @@ impl Agent {
                 request.initial_prompt,
                 request.claude_config_dir,
             ),
-            Agent::Codex => codex_launch(request.resume, request.initial_prompt),
+            Agent::Codex => codex_launch(
+                request.resume,
+                request.initial_prompt,
+                request.codex_home_dir,
+            ),
             Agent::OpenCode => opencode_launch(),
             Agent::Shell => shell_launch(),
             Agent::Custom { program, args } => custom_launch(program, args),
@@ -76,14 +80,15 @@ impl Agent {
 }
 
 /// What's needed to build a `Launch` for any `Agent`. Fields only some
-/// providers consult (Claude's session id/config dir) are simply ignored by
-/// the providers that don't use them.
+/// providers consult (Claude's session id/config dir, Codex's home dir) are
+/// simply ignored by the providers that don't use them.
 #[derive(Debug, Default)]
 pub struct LaunchRequest<'a> {
     pub resume: bool,
     pub initial_prompt: Option<&'a str>,
     pub claude_session_id: Option<Uuid>,
     pub claude_config_dir: Option<&'a Path>,
+    pub codex_home_dir: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +143,22 @@ pub fn claude_launch(
     }
 }
 
-pub fn codex_launch(resume: bool, initial_prompt: Option<&str>) -> Launch {
+fn codex_home_env(home_dir: Option<&Path>) -> Vec<(String, String)> {
+    match home_dir {
+        Some(dir) => vec![("CODEX_HOME".to_string(), dir.to_string_lossy().to_string())],
+        None => Vec::new(),
+    }
+}
+
+/// `home_dir`, when given, isolates this launch's `CODEX_HOME` — Codex's
+/// local app-server daemon only tolerates one live interactive session per
+/// `CODEX_HOME`, so two concurrent Codex terminals sharing the real
+/// `~/.codex` fail with "already running in another app". Isolating by
+/// terminal (see `store::default_codex_home_dir`) fixes that at the cost of
+/// each new Codex terminal needing its own `codex login` — there is no
+/// `CLAUDE_CONFIG_DIR`-style "several concurrent sessions, one shared
+/// login" option for Codex today.
+pub fn codex_launch(resume: bool, initial_prompt: Option<&str>, home_dir: Option<&Path>) -> Launch {
     let mut args = Vec::new();
     if resume {
         args.push("resume".to_string());
@@ -151,7 +171,7 @@ pub fn codex_launch(resume: bool, initial_prompt: Option<&str>) -> Launch {
     Launch {
         program: "codex".to_string(),
         args,
-        envs: Vec::new(),
+        envs: codex_home_env(home_dir),
     }
 }
 
@@ -278,21 +298,35 @@ mod tests {
 
     #[test]
     fn codex_fresh_launch_has_no_resume_flags() {
-        let launch = codex_launch(false, Some("hi"));
+        let launch = codex_launch(false, Some("hi"), None);
         assert_eq!(launch.program, "codex");
         assert_eq!(launch.args, vec!["--", "hi"]);
+        assert!(launch.envs.is_empty());
     }
 
     #[test]
     fn codex_resume_launch_uses_resume_last() {
-        let launch = codex_launch(true, Some("hi"));
+        let launch = codex_launch(true, Some("hi"), None);
         assert_eq!(launch.args, vec!["resume", "--last", "--", "hi"]);
     }
 
     #[test]
     fn codex_resume_launch_without_prompt() {
-        let launch = codex_launch(true, None);
+        let launch = codex_launch(true, None, None);
         assert_eq!(launch.args, vec!["resume", "--last"]);
+    }
+
+    #[test]
+    fn codex_launch_injects_codex_home_env_when_given() {
+        let dir = Path::new("/tmp/duet-codex/some-terminal-id");
+        let launch = codex_launch(false, None, Some(dir));
+        assert_eq!(
+            launch.envs,
+            vec![(
+                "CODEX_HOME".to_string(),
+                "/tmp/duet-codex/some-terminal-id".to_string()
+            )]
+        );
     }
 
     #[test]

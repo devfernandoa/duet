@@ -9,12 +9,25 @@ use std::path::Path;
 
 /// One short paragraph telling a freshly-launched agent that `duetctl`
 /// exists and how to use it — section 8: "Keep injected context compact."
-/// Not a tutorial: just enough that the agent knows to look, the same way a
-/// `man` page's one-line summary is enough to know whether to read further.
+/// Used for every provider without an installed Duet skill (Codex,
+/// OpenCode, Shell, Custom — see `skill.rs`'s doc comment on why that's
+/// Claude-only today). Not a tutorial: just enough that the agent knows to
+/// look, the same way a `man` page's one-line summary is enough to know
+/// whether to read further.
 pub const DISCOVERY_INSTRUCTION: &str = "You are running inside Duet, a multi-agent workspace. \
-Run `duetctl agents list` to see every agent and whether you're connected to it, and \
-`duetctl send --from $DUET_AGENT_ID --to <agent> \"message\"` to message one you're connected \
-to. `duetctl workspace inspect` and `duetctl connections list` show the rest of the workspace.";
+Run `duetctl whoami` to see your own role and who you're connected to, `duetctl agents list` \
+to see every agent, and `duetctl send --to <agent> \"message\"` to message one you're connected \
+to (your id is already in $DUET_AGENT_ID).";
+
+/// What a Claude launch gets instead, once its `duet` skill (see
+/// `skill.rs`) has been installed — a pointer rather than the content
+/// itself, since the skill is already the content. This is the whole
+/// point of the skill: a few words resent every launch instead of the full
+/// `DISCOVERY_INSTRUCTION` (and, before this, the role's full instructions
+/// too — now looked up on demand via `duetctl whoami` instead of resent as
+/// a prompt).
+pub const SKILL_POINTER: &str = "You are running inside Duet. Before responding to anything else, use your `duet` skill \
+(run `duetctl whoami`) to learn your role and who you're connected to.";
 
 /// The `DUET_*` variables section 8 asks every launched agent to receive.
 /// `DUET_FLOOR_ID` is `"ground"` until Milestone 9 introduces real floors —
@@ -58,14 +71,21 @@ pub fn env_vars(
     ]
 }
 
-/// Prepends the discovery instruction to whatever prompt text a launch
-/// already carries (a role's instructions, a handoff summary, both, or
-/// neither) — always present, since an agent needs to learn about `duetctl`
-/// on its very first launch regardless of whether it also has a role.
-pub fn with_discovery(prompt: Option<String>) -> String {
+/// Prepends the discovery text to whatever prompt content a launch already
+/// carries (a handoff summary, or nothing for a brand-new session) —
+/// always present, since an agent needs to learn how to reach `duetctl` on
+/// its very first launch. `skill_installed` picks `SKILL_POINTER` (Claude,
+/// once `skill::install` has run) over the fuller `DISCOVERY_INSTRUCTION`
+/// (every other provider).
+pub fn with_discovery(prompt: Option<String>, skill_installed: bool) -> String {
+    let discovery = if skill_installed {
+        SKILL_POINTER
+    } else {
+        DISCOVERY_INSTRUCTION
+    };
     match prompt {
-        Some(existing) => format!("{DISCOVERY_INSTRUCTION}\n\n{existing}"),
-        None => DISCOVERY_INSTRUCTION.to_string(),
+        Some(existing) => format!("{discovery}\n\n{existing}"),
+        None => discovery.to_string(),
     }
 }
 
@@ -136,13 +156,22 @@ mod tests {
 
     #[test]
     fn discovery_instruction_is_prepended_not_replacing_existing_prompt() {
-        let combined = with_discovery(Some("You are the Developer.".to_string()));
+        let combined = with_discovery(Some("Continuing from before.".to_string()), false);
         assert!(combined.starts_with(DISCOVERY_INSTRUCTION));
-        assert!(combined.ends_with("You are the Developer."));
+        assert!(combined.ends_with("Continuing from before."));
     }
 
     #[test]
     fn discovery_instruction_stands_alone_with_no_existing_prompt() {
-        assert_eq!(with_discovery(None), DISCOVERY_INSTRUCTION);
+        assert_eq!(with_discovery(None, false), DISCOVERY_INSTRUCTION);
+    }
+
+    #[test]
+    fn skill_installed_uses_the_short_pointer_instead() {
+        let combined = with_discovery(Some("Continuing from before.".to_string()), true);
+        assert!(combined.starts_with(SKILL_POINTER));
+        assert!(combined.contains("duetctl whoami"));
+        assert!(combined.ends_with("Continuing from before."));
+        assert_eq!(with_discovery(None, true), SKILL_POINTER);
     }
 }

@@ -107,6 +107,7 @@ mod tests {
                 agent: Agent::Claude,
                 claude_session_id: None,
                 claude_account: None,
+                claude_fresh: false,
                 role_id,
                 environment: EnvironmentKind::LocalPty,
             }),

@@ -19,7 +19,7 @@
 use crate::agent::Agent;
 use crate::app::App;
 use crate::message::{
-    AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, WorkspaceInfo,
+    AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, WhoamiInfo, WorkspaceInfo,
 };
 use crate::store::default_control_socket_path;
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,14 @@ pub enum ControlRequest {
         #[serde(default)]
         requested_by: Option<Uuid>,
     },
+    /// `duetctl whoami`: what the `duet` skill tells an agent to run first
+    /// in every session, instead of having its role and connections resent
+    /// as prompt text — see `orchestration::skill`. `agent_id` is resolved
+    /// from `DUET_AGENT_ID`/`DUET_SESSION_ID` at CLI-parse time, not by the
+    /// GTK side, the same pattern every other acting-agent field uses.
+    Whoami {
+        agent_id: Option<Uuid>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +119,9 @@ pub enum ControlResponse {
     },
     Removed,
     RoleAssigned,
+    Whoami {
+        info: WhoamiInfo,
+    },
     Error {
         error: String,
     },
@@ -356,6 +367,40 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 },
             }
         }
+        ControlRequest::Whoami { agent_id } => {
+            let Some(agent_id) = agent_id else {
+                return ControlResponse::Error {
+                    error: "whoami needs DUET_AGENT_ID in the environment — run this from \
+                            inside a duet-launched agent"
+                        .to_string(),
+                };
+            };
+            let app_ref = app.borrow();
+            let registry = app_ref.agent_registry();
+            let Some(identity) = registry.get_agent(agent_id).cloned() else {
+                return ControlResponse::Error {
+                    error: format!("no agent with id {agent_id}"),
+                };
+            };
+            let infos = app_ref.agent_infos();
+            let Some(agent) = infos.iter().find(|info| info.id == agent_id).cloned() else {
+                return ControlResponse::Error {
+                    error: format!("no agent with id {agent_id}"),
+                };
+            };
+            let connected_agents = registry
+                .connected_agents(agent_id)
+                .into_iter()
+                .filter_map(|other| infos.iter().find(|info| info.id == other.id).cloned())
+                .collect();
+            ControlResponse::Whoami {
+                info: WhoamiInfo {
+                    agent,
+                    role_instructions: identity.role.map(|role| role.instructions),
+                    connected_agents,
+                },
+            }
+        }
     }
 }
 
@@ -365,7 +410,7 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
 pub fn is_cli_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "agent" | "agents" | "send" | "connections" | "workspace"
+        "agent" | "agents" | "send" | "connections" | "workspace" | "whoami"
     )
 }
 
@@ -433,6 +478,9 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, only] if cmd == "workspace" && only == "inspect" => {
             Ok(ControlRequest::WorkspaceInspect)
         }
+        [only] if only == "whoami" => Ok(ControlRequest::Whoami {
+            agent_id: acting_agent_id(),
+        }),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -445,7 +493,8 @@ const USAGE: &str = r#"usage:
   duetctl agents assign-role <id-or-name> <role-or-none>
   duetctl send --from <id> --to <id-or-name> "<message>"
   duetctl connections list
-  duetctl workspace inspect"#;
+  duetctl workspace inspect
+  duetctl whoami"#;
 
 fn parse_legacy_agent(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
@@ -596,6 +645,25 @@ fn print_response(response: &ControlResponse) {
         ControlResponse::Created { id } => println!("created agent {id}"),
         ControlResponse::Removed => println!("removed"),
         ControlResponse::RoleAssigned => println!("role assigned"),
+        ControlResponse::Whoami { info } => {
+            println!("id:       {}", info.agent.id);
+            println!("name:     {}", info.agent.name);
+            println!("provider: {}", info.agent.provider);
+            println!("role:     {}", info.agent.role.as_deref().unwrap_or("-"));
+            println!("manager:  {}", info.agent.manager);
+            println!("activity: {}", info.agent.activity);
+            if let Some(instructions) = &info.role_instructions {
+                println!("\nrole instructions:\n{instructions}");
+            }
+            if info.connected_agents.is_empty() {
+                println!("\nconnected to: none");
+            } else {
+                println!("\nconnected to:");
+                for agent in &info.connected_agents {
+                    println!("  {}\t{}\t{}", agent.id, agent.name, agent.provider);
+                }
+            }
+        }
         ControlResponse::Error { error } => {
             eprintln!("duetctl: {error}");
         }
@@ -776,6 +844,15 @@ mod tests {
         assert!(matches!(
             parse_cli_request(&["workspace".to_string(), "inspect".to_string()]).unwrap(),
             ControlRequest::WorkspaceInspect
+        ));
+    }
+
+    #[test]
+    fn whoami_parses_with_no_arguments_and_is_a_recognized_verb() {
+        assert!(is_cli_verb("whoami"));
+        assert!(matches!(
+            parse_cli_request(&["whoami".to_string()]).unwrap(),
+            ControlRequest::Whoami { .. }
         ));
     }
 

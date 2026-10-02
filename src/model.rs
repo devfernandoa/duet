@@ -55,6 +55,18 @@ pub struct TerminalPayload {
     pub agent: Agent,
     pub claude_session_id: Option<Uuid>,
     pub claude_account: Option<String>,
+    /// `true` exactly while `claude_session_id` is pinned to an id that has
+    /// never actually been used to launch Claude yet (freshly created,
+    /// duplicated, or handed off to) — the signal `build_terminal_launch`
+    /// uses to pick `--session-id` (create) over `--resume` (continue).
+    /// Without this, a brand-new id with `claude_session_id.is_some()` but
+    /// no real conversation behind it would launch with `--resume` and fail
+    /// with "No conversation found with ID ...". `#[serde(default)]` so
+    /// every terminal saved before this field existed loads as `false` —
+    /// the safe assumption for a session that, by virtue of already being
+    /// persisted, has necessarily been launched at least once before.
+    #[serde(default)]
+    pub claude_fresh: bool,
     #[serde(default)]
     pub role_id: Option<Uuid>,
     /// Which runtime this terminal's process runs under. `#[serde(default)]`
@@ -286,6 +298,7 @@ mod tests {
                 agent: Agent::Shell,
                 claude_session_id: None,
                 claude_account: None,
+                claude_fresh: false,
                 role_id: None,
                 environment: EnvironmentKind::LocalPty,
             })
