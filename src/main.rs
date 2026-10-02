@@ -5,8 +5,10 @@ mod canvas;
 mod control;
 mod handoff;
 mod message;
+mod migration;
 mod node;
 mod role;
+mod runtime;
 mod session;
 mod store;
 

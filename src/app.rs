@@ -1,11 +1,14 @@
 use crate::account::AccountStore;
-use crate::agent::{Agent, Launch, LaunchRequest};
-use crate::canvas::Canvas;
+use crate::agent::{Agent, Launch, LaunchRequest, with_session_env};
+use crate::canvas::{
+    Canvas, TITLE_BAR_HEIGHT, allocated_size, canvas_point, card_center, card_edge,
+    card_intersection, card_rect, card_vertical_edge, world_drag_delta,
+};
 use crate::handoff::{summarize_claude, summarize_codex};
 use crate::message::{AgentMessage, AgentSummary, DeliveryStatus, LinkSummary};
 use crate::node::{NoteNode, SessionNode};
-use crate::role::Role;
-use crate::session::Session;
+use crate::role::{Role, with_role_instructions};
+use crate::runtime::SessionRuntime;
 use crate::store::{
     CanvasRecord, LinkRecord, SessionRecord, StickyNoteRecord, Store, WorkspaceRecord,
 };
@@ -30,13 +33,6 @@ const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 /// grow the log unboundedly in memory.
 const MESSAGE_LOG_LIMIT: usize = 200;
 
-/// Formats a message as terminal input. A single trailing carriage return is
-/// the terminal representation of the Return key, which submits the message
-/// in interactive agent UIs.
-fn message_envelope(source_label: &str, content: &str) -> String {
-    format!("[duet message from {source_label}]: {content}")
-}
-
 /// How long to wait after writing a message's text before writing the
 /// trailing `\r` that submits it. Needed because Claude/Codex's own input
 /// box (unlike a plain shell's line discipline) distinguishes a human
@@ -50,7 +46,6 @@ const MESSAGE_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
 pub struct SessionEntry {
     pub record: SessionRecord,
-    pub session: Session,
     pub node: SessionNode,
     /// The character grid last pushed to this session's PTY, so
     /// `pump_output`'s sync only sends a `SIGWINCH` when the grid actually
@@ -58,8 +53,9 @@ pub struct SessionEntry {
     /// `Session::spawn`'s 80x24).
     pub pty_grid: Option<(u16, u16)>,
     /// Whether the "exited" status badge has already been shown for this
-    /// session. Set once by `pump_output` the first time `exit_status()`
-    /// becomes `Some`, so the label is set once rather than every tick.
+    /// session. Set once by `pump_output` the first time the runtime
+    /// reports the process has exited, so the label is set once rather than
+    /// every tick.
     pub exit_shown: bool,
 }
 
@@ -90,6 +86,10 @@ pub struct App {
     /// `role::builtin_roles` and are never stored here.
     pub custom_roles: Vec<Role>,
     pub sessions: HashMap<Uuid, SessionEntry>,
+    /// Every live session's PTY/process, keyed by the same id as `sessions`.
+    /// See `runtime.rs`'s module doc for why this is a separate map rather
+    /// than a field on `SessionEntry`.
+    pub runtime: SessionRuntime,
     pub notes: HashMap<Uuid, NoteEntry>,
     pub links: Vec<LinkRecord>,
     /// A capped, in-memory log of agent-to-agent messages sent via
@@ -123,6 +123,7 @@ impl App {
             inactive_workspaces: Vec::new(),
             custom_roles: Vec::new(),
             sessions: HashMap::new(),
+            runtime: SessionRuntime::new(),
             notes: HashMap::new(),
             links: Vec::new(),
             messages: Vec::new(),
@@ -167,20 +168,13 @@ impl App {
             Store::load_with_warning(&app_ref.store_path)
         };
         let mut errors: Vec<String> = load_warning.into_iter().collect();
-        app.borrow_mut().custom_roles = saved.custom_roles;
+        app.borrow_mut().custom_roles = saved.custom_roles.clone();
 
-        if saved.workspaces.is_empty() {
+        let Some((active, inactive)) = saved.resolve_active_workspace() else {
             return errors;
-        }
+        };
 
-        let mut workspaces = saved.workspaces;
-        let active_index = saved
-            .active_workspace
-            .and_then(|id| workspaces.iter().position(|w| w.id == id))
-            .unwrap_or(0);
-        let active = workspaces.remove(active_index);
-
-        app.borrow_mut().inactive_workspaces = workspaces;
+        app.borrow_mut().inactive_workspaces = inactive;
         App::activate_workspace(app, &active);
 
         errors.extend(spawn_workspace_contents(
@@ -196,11 +190,11 @@ impl App {
     pub fn persist(&self) -> std::io::Result<()> {
         let mut workspaces = self.inactive_workspaces.clone();
         workspaces.push(self.snapshot_active_workspace());
-        let store = Store {
+        let store = Store::new(
             workspaces,
-            active_workspace: Some(self.workspace_id),
-            custom_roles: self.custom_roles.clone(),
-        };
+            Some(self.workspace_id),
+            self.custom_roles.clone(),
+        );
         store.save(&self.store_path)
     }
 
@@ -359,14 +353,20 @@ impl App {
     fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
         let (canvas, session_entries, note_entries) = {
             let mut app_mut = app.borrow_mut();
+            let session_entries: Vec<_> = app_mut.sessions.drain().collect();
+            // Milestone 2 (background workspaces) changes exactly this line:
+            // detaching a workspace's widgets must stop terminating its
+            // sessions. See `runtime.rs`'s module doc.
+            for (id, _) in &session_entries {
+                app_mut.runtime.terminate(*id);
+            }
             (
                 app_mut.canvas.clone(),
-                app_mut.sessions.drain().collect::<Vec<_>>(),
+                session_entries,
                 app_mut.notes.drain().collect::<Vec<_>>(),
             )
         };
-        for (_, mut entry) in session_entries {
-            entry.session.kill();
+        for (_, entry) in session_entries {
             canvas.remove_node(&entry.node.container);
         }
         for (_, entry) in note_entries {
@@ -584,7 +584,7 @@ impl App {
     /// would require a second mutable borrow of the same `HashMap` while the
     /// first is still live, which the borrow checker rejects.
     pub fn pump_output(&mut self) {
-        for entry in self.sessions.values_mut() {
+        for (&id, entry) in self.sessions.iter_mut() {
             // The one authoritative place the PTY is sized, from VTE's real
             // post-allocation grid. Every other path (resize drag, restore,
             // create, collapse/expand, a font change) only ever asks the
@@ -594,15 +594,15 @@ impl App {
             // card narrower than its own title bar.
             if let Some(grid) = entry.node.actual_grid() {
                 if entry.pty_grid != Some(grid) {
-                    let _ = entry.session.resize(grid.1, grid.0);
+                    let _ = self.runtime.resize(id, grid.1, grid.0);
                     entry.pty_grid = Some(grid);
                 }
             }
-            let chunks = entry.session.try_recv_output();
+            let chunks = self.runtime.try_recv_output(id);
             for chunk in &chunks {
                 entry.node.feed(chunk);
             }
-            if !entry.exit_shown && entry.session.exit_status().is_some() {
+            if !entry.exit_shown && self.runtime.has_exited(id) {
                 entry.node.status_label.set_text("exited");
                 entry.exit_shown = true;
             }
@@ -681,11 +681,8 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "an external sender".to_string());
-        let envelope = message_envelope(&source_label, &content);
-        let delivered = app_mut
-            .sessions
-            .get_mut(&target_id)
-            .is_some_and(|entry| entry.session.write_input(envelope.as_bytes()).is_ok());
+        let envelope = crate::message::message_envelope(&source_label, &content);
+        let delivered = app_mut.runtime.write_input(target_id, envelope.as_bytes());
         let status = if delivered {
             DeliveryStatus::Delivered
         } else {
@@ -695,9 +692,7 @@ impl App {
             // Submit on a delay, as its own write — see `MESSAGE_SUBMIT_DELAY`.
             let app = Rc::clone(app);
             glib::timeout_add_local_once(MESSAGE_SUBMIT_DELAY, move || {
-                if let Some(entry) = app.borrow_mut().sessions.get_mut(&target_id) {
-                    let _ = entry.session.write_input(b"\r");
-                }
+                let _ = app.borrow_mut().runtime.write_input(target_id, b"\r");
             });
         }
         let message = AgentMessage {
@@ -759,11 +754,11 @@ impl App {
                 viewport_center_world,
             )?
         };
-        let session = Session::spawn(cwd, launch)?;
+        let id = record.id;
+        app.borrow_mut().runtime.spawn(id, cwd, launch)?;
         let node = SessionNode::new(&name);
         node.request_grid(record.size.0, record.size.1);
         apply_role_badge(&app.borrow(), &node, role_id);
-        let id = record.id;
         {
             let app_ref = app.borrow();
             app_ref
@@ -773,9 +768,7 @@ impl App {
         node.connect_commit({
             let app = Rc::clone(app);
             move |bytes| {
-                if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
-                    let _ = entry.session.write_input(bytes);
-                }
+                let _ = app.borrow_mut().runtime.write_input(id, bytes);
             }
         });
         wire_link_controls(app, &node, id, toast_overlay);
@@ -785,7 +778,6 @@ impl App {
             id,
             SessionEntry {
                 record,
-                session,
                 node,
                 pty_grid: None,
                 exit_shown: false,
@@ -1097,9 +1089,7 @@ impl App {
                 record.agent.display_name()
             );
         }
-        if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
-            entry.session.kill();
-        }
+        app.borrow_mut().runtime.terminate(id);
 
         let is_claude = matches!(record.agent, Agent::Claude);
         let summary_result = if is_claude {
@@ -1161,13 +1151,11 @@ impl App {
                 (launch, updated)
             }
         };
-        let new_session = Session::spawn(updated_record.cwd.clone(), launch)?;
-        {
-            let mut app_mut = app.borrow_mut();
-            if let Some(entry) = app_mut.sessions.get_mut(&id) {
-                entry.session = new_session;
-                entry.record = updated_record;
-            }
+        app.borrow_mut()
+            .runtime
+            .spawn(id, updated_record.cwd.clone(), launch)?;
+        if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
+            entry.record = updated_record;
         }
         app.borrow().persist()?;
         Ok(())
@@ -1196,10 +1184,12 @@ impl App {
                 .iter()
                 .filter_map(|id| app_mut.sessions.remove(id))
                 .collect::<Vec<_>>();
+            for id in &to_remove {
+                app_mut.runtime.terminate(*id);
+            }
             (canvas, removed)
         };
-        for mut entry in removed {
-            entry.session.kill();
+        for entry in removed {
             canvas.remove_node(&entry.node.container);
         }
         app.borrow().accounts.remove(name)?;
@@ -1220,6 +1210,7 @@ impl App {
             let mut app_mut = app.borrow_mut();
             let canvas = app_mut.canvas.clone();
             let removed = app_mut.sessions.remove(&id);
+            app_mut.runtime.terminate(id);
             app_mut.links.retain(|l| l.source != id && l.target != id);
             if app_mut.pending_link_source == Some(id) {
                 app_mut.pending_link_source = None;
@@ -1233,8 +1224,7 @@ impl App {
             app_mut.refresh_link_highlight();
             (canvas, removed)
         };
-        if let Some(mut entry) = removed {
-            entry.session.kill();
+        if let Some(entry) = removed {
             canvas.remove_node(&entry.node.container);
         }
         let _ = app.borrow().persist();
@@ -1252,62 +1242,6 @@ impl App {
         }
         let _ = app.borrow().persist();
     }
-}
-
-/// Roughly the height a card's title bar adds above its body. Only used to
-/// put a link line's endpoint near the vertical middle of a card rather than
-/// its top edge; a few pixels either way is invisible on a link.
-const TITLE_BAR_HEIGHT: f64 = 28.0;
-
-/// A card's left or right edge at its vertical middle, in world space.
-/// `record.position` is the card's top-left and `record.size` is its *body*
-/// size, hence the title-bar correction.
-fn card_edge(record: &SessionRecord, right: bool) -> (f64, f64) {
-    (
-        if right {
-            record.position.0 + record.size.0
-        } else {
-            record.position.0
-        },
-        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
-    )
-}
-
-fn card_vertical_edge(record: &SessionRecord, bottom: bool) -> (f64, f64) {
-    (
-        record.position.0 + record.size.0 / 2.0,
-        if bottom {
-            record.position.1 + record.size.1 + TITLE_BAR_HEIGHT
-        } else {
-            record.position.1
-        },
-    )
-}
-
-fn card_center(record: &SessionRecord) -> (f64, f64) {
-    (
-        record.position.0 + record.size.0 / 2.0,
-        record.position.1 + (record.size.1 + TITLE_BAR_HEIGHT) / 2.0,
-    )
-}
-
-fn card_intersection(a: &SessionRecord, b: &SessionRecord) -> Option<(f64, f64, f64, f64)> {
-    let (a_x, a_y, a_width, a_height) = card_rect(a);
-    let (b_x, b_y, b_width, b_height) = card_rect(b);
-    let (a_right, a_bottom) = (a_x + a_width, a_y + a_height);
-    let (b_right, b_bottom) = (b_x + b_width, b_y + b_height);
-    let (left, top) = (a_x.max(b_x), a_y.max(b_y));
-    let (right, bottom) = (a_right.min(b_right), a_bottom.min(b_bottom));
-    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
-}
-
-fn card_rect(record: &SessionRecord) -> (f64, f64, f64, f64) {
-    (
-        record.position.0,
-        record.position.1,
-        record.size.0,
-        record.size.1 + TITLE_BAR_HEIGHT,
-    )
 }
 
 /// Click-to-rename: the title label swaps for an entry pre-filled with the
@@ -1372,84 +1306,6 @@ fn wire_rename(
         }
     });
     node.title_entry.add_controller(keys);
-}
-
-/// A node body's real current size in pre-zoom pixels (GTK allocations are in
-/// the widget's own untransformed space, so this is directly comparable to the
-/// `size` stored in a record), or `None` if it isn't allocated yet.
-///
-/// Resize drags use this rather than `record.size` as their starting point,
-/// which is the fix for the "card shrank and can't be dragged back up" state.
-/// The two quantities drift apart, because a card's rendered width is
-/// `max(record.size.0, title-bar minimum)`: a 28-character session name
-/// measured 348px of title bar, so a card whose record said 220 actually drew
-/// 348 wide. Starting a resize from the stale 220 meant the first 128px of
-/// rightward drag changed nothing visible at all, and every fresh drag
-/// restarted from the same stale number — the card read as un-growable. The
-/// title label is now ellipsized (see `SessionNode::new`) so the title bar
-/// stops forcing a minimum, but anchoring the drag to the real size is what
-/// makes the gesture self-correcting regardless of where a mismatch comes
-/// from (grid rounding, a future wider title bar, a restored record).
-fn allocated_size(widget: &impl IsA<gtk4::Widget>) -> Option<(f64, f64)> {
-    let widget = widget.as_ref();
-    let (width, height) = (widget.width(), widget.height());
-    (width > 0 && height > 0).then_some((width as f64, height as f64))
-}
-
-/// Expresses `local` — a point in the coordinate space of the widget
-/// `gesture` is attached to — in the canvas `Fixed`'s coordinate space.
-fn canvas_point(
-    gesture: &gtk4::GestureDrag,
-    fixed: &gtk4::Fixed,
-    local: (f64, f64),
-) -> Option<(f64, f64)> {
-    let widget = gesture.widget()?;
-    widget
-        .compute_point(
-            fixed,
-            &gtk4::graphene::Point::new(local.0 as f32, local.1 as f32),
-        )
-        .map(|point| (point.x() as f64, point.y() as f64))
-}
-
-/// How far the pointer has moved, in world units, since the drag began.
-/// `start_pointer` is `canvas_point` of the gesture's start point, captured
-/// once in the `drag-begin` handler.
-///
-/// Why this isn't just `offset / zoom`: a `GestureDrag`'s `offset_x`/
-/// `offset_y` are expressed in the coordinate space of the widget the
-/// gesture is attached to, and GTK re-translates the pointer through that
-/// widget's *current* transform on every event. Every gesture here is
-/// attached to chrome inside a card whose transform the handler changes on
-/// every tick, so the card's own displacement feeds straight back into the
-/// reported offset: with displacement `d` applied and the pointer `m` from
-/// where it started, GTK reports `offset = m - d`, so assigning `d = offset`
-/// settles at `d = m / 2` — the card tracks at half the cursor's speed. The
-/// same recurrence `d_n = m_n - d_(n-1)` has gain -1, so it never damps:
-/// every pointer-sampling irregularity adds a non-decaying alternating
-/// wobble, which is the jitter that grew the further a card was dragged.
-///
-/// Mapping both the start point and the current point into the canvas
-/// `Fixed`'s space cancels the card's displacement exactly and leaves the
-/// true pointer movement. `Fixed` is the right reference because it never
-/// moves — pan and zoom only change its *children's* transforms, which is
-/// why `Canvas`'s own pan gesture (attached to `fixed` itself) never had
-/// this problem. It also makes the `/ zoom` correct: `Fixed`-space units are
-/// screen pixels, whereas the raw gesture offsets were already in the card's
-/// own zoom-scaled space and so were being divided by zoom a second time.
-fn world_drag_delta(
-    gesture: &gtk4::GestureDrag,
-    fixed: &gtk4::Fixed,
-    start_pointer: (f64, f64),
-    zoom: f64,
-) -> Option<(f64, f64)> {
-    let (start_x, start_y) = gesture.start_point()?;
-    let (offset_x, offset_y) = gesture.offset()?;
-    let now = canvas_point(gesture, fixed, (start_x + offset_x, start_y + offset_y))?;
-    Some((
-        (now.0 - start_pointer.0) / zoom,
-        (now.1 - start_pointer.1) / zoom,
-    ))
 }
 
 /// Milestone-1 seam for generic canvas nodes: the part of `SessionEntry`/
@@ -1838,14 +1694,18 @@ fn spawn_workspace_contents(
                 record.id,
             )
         };
-        match Session::spawn(record.cwd.clone(), launch) {
-            Ok(session) => {
+        let id = record.id;
+        match app
+            .borrow_mut()
+            .runtime
+            .spawn(id, record.cwd.clone(), launch)
+        {
+            Ok(()) => {
                 let node = SessionNode::new(&record.name);
                 // Ask for the saved size; `pump_output` syncs the PTY to
                 // whatever grid VTE actually ends up rendering.
                 node.request_grid(record.size.0, record.size.1);
                 apply_role_badge(&app.borrow(), &node, record.role_id);
-                let id = record.id;
                 {
                     let app_ref = app.borrow();
                     app_ref.canvas.add_node(&node.container, record.position);
@@ -1853,9 +1713,7 @@ fn spawn_workspace_contents(
                 node.connect_commit({
                     let app = Rc::clone(app);
                     move |bytes| {
-                        if let Some(entry) = app.borrow_mut().sessions.get_mut(&id) {
-                            let _ = entry.session.write_input(bytes);
-                        }
+                        let _ = app.borrow_mut().runtime.write_input(id, bytes);
                     }
                 });
                 wire_link_controls(app, &node, id, toast_overlay);
@@ -1865,7 +1723,6 @@ fn spawn_workspace_contents(
                     id,
                     SessionEntry {
                         record,
-                        session,
                         node,
                         pty_grid: None,
                         exit_shown: false,
@@ -1929,33 +1786,6 @@ fn resolve_claude_account(
     Ok(Some((account, dir)))
 }
 
-/// Combines a role's instructions with whatever prompt text a launch already
-/// has (a handoff summary, or nothing for a brand-new session) into one
-/// `initial_prompt` — the single place role injection happens, reused by
-/// every launch site instead of each one re-deciding how to fold a role in.
-/// Goes through the same provider-agnostic `LaunchRequest::initial_prompt`
-/// field `handoff.rs` already uses, so it needs no Claude-specific code.
-fn with_role_instructions(role_instructions: Option<String>, base: Option<&str>) -> Option<String> {
-    match (role_instructions, base) {
-        (None, None) => None,
-        (Some(role), None) => Some(role),
-        (None, Some(base)) => Some(base.to_string()),
-        (Some(role), Some(base)) => Some(format!("{role}\n\n{base}")),
-    }
-}
-
-/// Appends `DUET_SESSION_ID` so a session's own shell can tell `duet agent
-/// send`/`duet agent list` (`control.rs`) which live session issued the
-/// command. Applied uniformly to every `Launch` after `Agent::launch`
-/// builds the rest of its envs, so no provider in `agent.rs` needs to know
-/// anything about messaging.
-fn with_session_env(mut launch: Launch, session_id: Uuid) -> Launch {
-    launch
-        .envs
-        .push(("DUET_SESSION_ID".to_string(), session_id.to_string()));
-    launch
-}
-
 /// Looks up `role_id` and updates `node`'s title-bar badge to match —
 /// shared by `create_session` and `spawn_workspace_contents` so a session's
 /// assigned role is shown the same way whether it was just created or
@@ -2008,20 +1838,4 @@ fn build_launch_and_record(
         size: (720.0, 504.0),
     };
     Ok((launch, record))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// No trailing `\r` here — the submitting keystroke is written as its
-    /// own, separately-timed `write_input` call (see `MESSAGE_SUBMIT_DELAY`),
-    /// not appended to the envelope text itself.
-    #[test]
-    fn message_envelope_has_no_trailing_submit_byte() {
-        assert_eq!(
-            message_envelope("sender (Codex)", "Please review this."),
-            "[duet message from sender (Codex)]: Please review this."
-        );
-    }
 }

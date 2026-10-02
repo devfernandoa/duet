@@ -218,6 +218,18 @@ pub fn codex_summarize_launch() -> Launch {
     }
 }
 
+/// Appends `DUET_SESSION_ID` so a session's own shell can tell `duet agent
+/// send`/`duet agent list` (`control.rs`) which live session issued the
+/// command. Applied uniformly to every `Launch` after `Agent::launch` builds
+/// the rest of its envs, so no provider above needs to know anything about
+/// messaging.
+pub fn with_session_env(mut launch: Launch, session_id: Uuid) -> Launch {
+    launch
+        .envs
+        .push(("DUET_SESSION_ID".to_string(), session_id.to_string()));
+    launch
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +335,26 @@ mod tests {
                 std::ffi::OsStr::new("FOO"),
                 Some(std::ffi::OsStr::new("bar"))
             )]
+        );
+    }
+
+    #[test]
+    fn with_session_env_appends_duet_session_id() {
+        let id = Uuid::nil();
+        let launch = with_session_env(
+            Launch {
+                program: "sh".to_string(),
+                args: vec![],
+                envs: vec![("FOO".to_string(), "bar".to_string())],
+            },
+            id,
+        );
+        assert_eq!(
+            launch.envs,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("DUET_SESSION_ID".to_string(), id.to_string()),
+            ]
         );
     }
 
