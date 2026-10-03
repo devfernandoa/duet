@@ -1,0 +1,53 @@
+name: Release
+
+# Publishing a version is pushing its tag: `git tag v1.0.0 && git push origin v1.0.0`.
+# The release notes come from docs/release-notes/<tag>.md, versioned with the code.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install GTK4, libadwaita, VTE, GtkSourceView and WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libgtksourceview-5-dev libwebkitgtk-6.0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches Cargo.toml's version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$TAG" || { echo "tag $TAG != Cargo.toml v$version"; exit 1; }
+          test -f "docs/release-notes/$TAG.md" || { echo "missing docs/release-notes/$TAG.md"; exit 1; }
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          dir="duet-$TAG-x86_64-linux"
+          mkdir "$dir"
+          cp target/release/duet target/release/duetctl README.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Duet ${{ env.TAG }}
+          body_path: docs/release-notes/${{ env.TAG }}.md
+          files: |
+            duet-${{ env.TAG }}-x86_64-linux.tar.gz
+            duet-${{ env.TAG }}-x86_64-linux.tar.gz.sha256
