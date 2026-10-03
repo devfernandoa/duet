@@ -27,6 +27,10 @@
 //! shape can't go (a headless remote-API process, say) — Milestone 14's
 //! problem, not this one's.
 
+mod files;
+
+pub use files::install_canvas_drop;
+
 use crate::account::AccountStore;
 use crate::agent::{Agent, Launch, LaunchRequest, with_session_env};
 use crate::canvas::{
@@ -42,6 +46,7 @@ use crate::model::{
     NotePayload, NoteViewMode, TerminalPayload, TextPayload,
 };
 use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
+use crate::node_files::{EditorNode, FileTreeNode};
 use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
 use crate::role::Role;
 use crate::runtime::{AgentActivity, SessionRuntime};
@@ -104,8 +109,10 @@ pub enum NodeWidget {
     Terminal(SessionNode),
     Note(NoteNode),
     Text(TextNode),
-    /// `FileTree`/`Portal`/`Drawing`/`Group` all render as the same
-    /// placeholder today — see `model.rs`'s doc comment for why.
+    FileTree(FileTreeNode),
+    Editor(EditorNode),
+    /// `Portal`/`Drawing`/`Group` all render as the same placeholder today
+    /// — see `model.rs`'s doc comment for why.
     Placeholder(PlaceholderNode),
 }
 
@@ -115,6 +122,8 @@ impl NodeWidget {
             NodeWidget::Terminal(node) => &node.container,
             NodeWidget::Note(node) => &node.container,
             NodeWidget::Text(node) => &node.container,
+            NodeWidget::FileTree(node) => &node.container,
+            NodeWidget::Editor(node) => &node.container,
             NodeWidget::Placeholder(node) => &node.container,
         }
     }
@@ -124,6 +133,8 @@ impl NodeWidget {
             NodeWidget::Terminal(node) => &node.drag_handle,
             NodeWidget::Note(node) => &node.drag_handle,
             NodeWidget::Text(node) => &node.drag_handle,
+            NodeWidget::FileTree(node) => &node.drag_handle,
+            NodeWidget::Editor(node) => &node.drag_handle,
             NodeWidget::Placeholder(node) => &node.drag_handle,
         }
     }
@@ -133,6 +144,8 @@ impl NodeWidget {
             NodeWidget::Terminal(node) => &node.resize_handle,
             NodeWidget::Note(node) => &node.resize_handle,
             NodeWidget::Text(node) => &node.resize_handle,
+            NodeWidget::FileTree(node) => &node.resize_handle,
+            NodeWidget::Editor(node) => &node.resize_handle,
             NodeWidget::Placeholder(node) => &node.resize_handle,
         }
     }
@@ -142,6 +155,8 @@ impl NodeWidget {
             NodeWidget::Terminal(node) => &node.close_button,
             NodeWidget::Note(node) => &node.close_button,
             NodeWidget::Text(node) => &node.close_button,
+            NodeWidget::FileTree(node) => &node.close_button,
+            NodeWidget::Editor(node) => &node.close_button,
             NodeWidget::Placeholder(node) => &node.close_button,
         }
     }
@@ -154,6 +169,8 @@ impl NodeWidget {
             NodeWidget::Terminal(node) => node.terminal.clone().upcast(),
             NodeWidget::Note(node) => node.container.clone().upcast(),
             NodeWidget::Text(node) => node.text_view.clone().upcast(),
+            NodeWidget::FileTree(node) => node.container.clone().upcast(),
+            NodeWidget::Editor(node) => node.container.clone().upcast(),
             NodeWidget::Placeholder(node) => node.container.clone().upcast(),
         }
     }
@@ -171,7 +188,10 @@ impl NodeWidget {
                     .set_size_request(size.0 as i32, size.1 as i32);
                 node.refresh_preview_after_resize();
             }
-            NodeWidget::Text(_) | NodeWidget::Placeholder(_) => {
+            NodeWidget::Text(_)
+            | NodeWidget::FileTree(_)
+            | NodeWidget::Editor(_)
+            | NodeWidget::Placeholder(_) => {
                 self.container()
                     .set_size_request(size.0 as i32, size.1 as i32);
             }
@@ -190,6 +210,8 @@ impl NodeWidget {
             NodeWidget::Terminal(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Note(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Text(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::FileTree(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::Editor(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Placeholder(node) => node.collapse.set_collapsed(collapsed),
         }
     }
@@ -324,6 +346,15 @@ pub struct App {
     /// The debounce timer for `schedule_persist`, if a save is currently
     /// pending. `None` when no save is scheduled.
     pending_save: Option<glib::SourceId>,
+    /// Runtime sync state of every live file-backed Note and Editor, keyed
+    /// by node id (see `files::FileSyncState`). Never persisted.
+    pub file_sync: HashMap<Uuid, files::FileSyncState>,
+    /// Runtime state of every live FileTree (history, search query, file
+    /// list cache). Never persisted.
+    pub tree_state: HashMap<Uuid, files::TreeState>,
+    /// Counts `sync_project_files` calls, so slower work (FileTree
+    /// refreshes) can run every few ticks.
+    sync_tick: u32,
 }
 
 impl App {
@@ -358,6 +389,9 @@ impl App {
             redo_stack: Vec::new(),
             snap_to_grid: false,
             pending_save: None,
+            file_sync: HashMap::new(),
+            tree_state: HashMap::new(),
+            sync_tick: 0,
         }))
     }
 
@@ -620,6 +654,8 @@ impl App {
             app_mut.selected.clear();
             app_mut.undo_stack.clear();
             app_mut.redo_stack.clear();
+            app_mut.file_sync.clear();
+            app_mut.tree_state.clear();
         }
     }
 
@@ -993,6 +1029,7 @@ impl App {
                 .map(|entry| match &entry.record.kind {
                     NodeKind::Terminal(terminal) => terminal.name.clone(),
                     NodeKind::Note(note) => orchestration::notes::note_title(&note.markdown),
+                    NodeKind::Editor(editor) => editor.path.clone(),
                     _ => entry.record.kind.label().to_string(),
                 })
                 .unwrap_or_else(|| "?".to_string())
@@ -1082,11 +1119,22 @@ impl App {
         let reference = orchestration::resource::ResourceRef::parse(reference)?;
         let views = self.workspace_views();
         let context = self.resolve_context(requested_by);
-        Ok(orchestration::resource::resolve(
+        // `File`/`Diff` references resolve against the active workspace's
+        // project root — the only workspace an agent can be running in (see
+        // `resolve_context`), and the one the human operator is looking at.
+        let project = self.project();
+        let scope = orchestration::resource::ProjectScope {
+            workspace_id: self.workspace_id,
+            workspace_name: self.workspace_name.clone(),
+            floor: context.map(|context| context.floor).unwrap_or_default(),
+            project: &project,
+        };
+        Ok(orchestration::resource::resolve_with_project(
             &reference,
             &views,
             &self.roles(),
             context.as_ref(),
+            Some(&scope),
         ))
     }
 
@@ -1113,6 +1161,7 @@ impl App {
         let reference = orchestration::resource::ResourceRef {
             kind: None,
             name: id.to_string(),
+            lines: None,
         };
         let views = self.workspace_views();
         match orchestration::resource::resolve(&reference, &views, &self.roles(), None) {
@@ -1138,6 +1187,12 @@ impl App {
                         .find(|note| note.id == id)
                         .map(orchestration::resource::ResourceDetail::Note)
                         .ok_or_else(|| format!("no note with id {id}"))?,
+                    // A bare id only ever matches node resources; a project
+                    // path's derived id isn't reversible (inspect files with
+                    // `duetctl file inspect <path>` instead).
+                    orchestration::ResourceKind::File | orchestration::ResourceKind::Diff => {
+                        return Err(format!("no resource with id {id}"));
+                    }
                 };
                 Ok((resource, detail))
             }
@@ -1218,6 +1273,7 @@ impl App {
                 Some(crate::message::NoteSummary {
                     id: entry.record.id,
                     title: orchestration::notes::note_title(&note.markdown),
+                    file: note.file.as_ref().map(|file| file.path.clone()),
                 })
             })
             .collect()
@@ -1248,6 +1304,7 @@ impl App {
             title: orchestration::notes::note_title(&note.markdown),
             markdown: note.markdown.clone(),
             color: note.color.clone(),
+            file: note.file.as_ref().map(|file| file.path.clone()),
         })
     }
 
@@ -1668,6 +1725,7 @@ impl App {
                 markdown: String::new(),
                 color: "yellow".to_string(),
                 view_mode: NoteViewMode::Edit,
+                file: None,
             }),
         };
         let _ = materialize_node(app, record.clone(), &adw::ToastOverlay::new());
@@ -2157,6 +2215,7 @@ impl App {
                 app_mut.selected_edge = None;
             }
             app_mut.selected.remove(&id);
+            files::forget_node(&mut app_mut, id);
             app_mut.refresh_link_highlight();
             (canvas, removed)
         };
@@ -2867,6 +2926,12 @@ fn duplicate_records(records: &[NodeRecord]) -> Vec<NodeRecord> {
                 // discovery prompt.
                 terminal.never_launched = true;
             }
+            // A duplicated file-backed note becomes an internal copy of the
+            // file's content: two notes silently co-owning one file would
+            // just manufacture sync conflicts.
+            if let NodeKind::Note(note) = &mut copy.kind {
+                note.file = None;
+            }
             copy
         })
         .collect()
@@ -3359,6 +3424,7 @@ fn materialize_node(
                 }
             });
             wire_note_link_controls(app, &node, id, toast_overlay);
+            files::wire_note_file(app, &node, id, note.file.as_ref(), toast_overlay);
             NodeWidget::Note(node)
         }
         NodeKind::Text(text) => {
@@ -3385,11 +3451,14 @@ fn materialize_node(
             });
             NodeWidget::Text(node)
         }
-        NodeKind::FileTree(_) | NodeKind::Portal(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => {
+        NodeKind::FileTree(_) => {
+            files::materialize_file_tree(app, id, record.collapsed, toast_overlay)
+        }
+        NodeKind::Editor(payload) => {
+            files::materialize_editor(app, id, payload, record.collapsed, toast_overlay)
+        }
+        NodeKind::Portal(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => {
             let detail = match &record.kind {
-                NodeKind::FileTree(payload) if !payload.root_label.is_empty() => {
-                    payload.root_label.clone()
-                }
                 NodeKind::Portal(payload) if !payload.url.is_empty() => payload.url.clone(),
                 NodeKind::Group(payload) if !payload.label.is_empty() => payload.label.clone(),
                 _ => "Not implemented yet".to_string(),
@@ -3409,6 +3478,13 @@ fn materialize_node(
 
     if clear_never_launched && let NodeKind::Terminal(terminal) = &mut record.kind {
         terminal.never_launched = false;
+    }
+    // Every other kind starts at its persisted size, the same way a resize
+    // drag sizes it (a `Terminal` was already sized through `request_grid`
+    // above). Without this a restored — or newly opened, larger-than-default
+    // — card came up at its widgets' minimum size until resized by hand.
+    if record.as_terminal().is_none() {
+        widget.apply_resize(record.size);
     }
 
     {
@@ -3678,12 +3754,13 @@ fn build_terminal_record(
     })
 }
 
-/// The four placeholder node kinds `main.rs`'s "New node" picker offers,
+/// The three placeholder node kinds `main.rs`'s "New node" picker offers
+/// (FileTree stopped being a placeholder in Milestone 6 — see
+/// `App::create_file_tree`),
 /// each with an empty default payload — real content (a file-tree root, a
 /// portal URL, ...) is a later milestone's job to fill in.
 pub fn placeholder_kind(label: &str) -> Option<NodeKind> {
     match label {
-        "File Tree" => Some(NodeKind::FileTree(Default::default())),
         "Portal" => Some(NodeKind::Portal(Default::default())),
         "Drawing" => Some(NodeKind::Drawing(Default::default())),
         "Group" => Some(NodeKind::Group(GroupPayload::default())),
@@ -3723,6 +3800,7 @@ mod tests {
                 markdown: "# hi\n- one\n- two".to_string(),
                 color: "yellow".to_string(),
                 view_mode: NoteViewMode::Preview,
+                file: None,
             }),
         }
     }
@@ -3786,6 +3864,7 @@ mod tests {
             markdown: String::new(),
             color: "yellow".to_string(),
             view_mode: NoteViewMode::Edit,
+            file: None,
         });
         let id = note.id;
         materialize_node(&app, note, &toast_overlay).unwrap();

@@ -16,14 +16,17 @@ browser portals, and the prompt composer are not yet — see
 
 ## Build
 
-Requires the GTK4 desktop stack: `gtk4`, `libadwaita`, and `vte4` (the GTK4
-terminal-widget library) as system packages. On Arch:
+Requires the GTK4 desktop stack: `gtk4`, `libadwaita`, `vte4` (the GTK4
+terminal-widget library) and `gtksourceview5` (the embedded editor) as
+system packages, plus `git` (and optionally `ripgrep`, for faster content
+search) at runtime. On Arch:
 
 ```sh
-sudo pacman -S gtk4 libadwaita vte4
+sudo pacman -S gtk4 libadwaita vte4 gtksourceview5
 ```
 
-(Debian/Ubuntu: `libgtk-4-dev`, `libadwaita-1-dev`, `libvte-2.91-gtk4-dev`.)
+(Debian/Ubuntu: `libgtk-4-dev`, `libadwaita-1-dev`, `libvte-2.91-gtk4-dev`,
+`libgtksourceview-5-dev`.)
 
 ```sh
 # Installs both binaries this crate builds: `duet` (the GUI) and `duetctl`
@@ -151,6 +154,37 @@ actions are refused with a clear error for anything but a manager-role
 agent. `duet agent list` / `duet agent send <target> "..."` still work too,
 preserved for anything already using them.
 
+### Project files and Git (`duetctl file`, `duetctl git`)
+
+Every workspace's root directory is its *project*. Files in it are Duet
+resources: `@file:src/auth.rs` (or `@file:src/auth.rs#L10-20` for a line
+range) and `@diff:src/auth.rs` (uncommitted changes; `@diff:.` for
+everything) resolve through `duetctl resolve` like any other reference, and
+can never point outside the project root.
+
+```sh
+duetctl file inspect <path|@file:path>             # size, revision, Git status
+duetctl file read <path|@file:path#L1-20>          # content (or a line range)
+duetctl file list [dir] [--hidden]
+duetctl file search <query>                        # fuzzy file names
+duetctl file search --content <pattern>            # ripgrep (builtin fallback)
+duetctl file write <path> --revision <rev>         # stdin; refused if the file changed since <rev>
+duetctl git status | diff [path] [--staged|--unstaged] | log [path] [-n N]
+duetctl git stage <path>... | unstage <path>... | discard <path>... --confirm | commit -m "<msg>"
+duetctl notes attach <note-id> <path>              # sync a note with a Markdown file
+```
+
+On the canvas, a **File Tree** node (header folder button, or Edit menu →
+New File Tree) browses the project with Git status markers, hidden-file and
+`.gitignore` toggles, back/forward, fuzzy search, and `>pattern` content
+search; right-click a file to open it, diff/stage/unstage/discard it, copy
+its `@file:` reference, or ask an agent about it. Markdown files open as
+file-backed notes that follow external edits and never overwrite a
+concurrent change silently (a conflict banner asks instead); other text
+opens in a GtkSourceView editor (Ctrl+S save, Ctrl+F/H find/replace, Ctrl+G
+go to line). Dragging a file from the tree — or from a file manager — onto
+the canvas opens it there.
+
 A message delivered to an agent is queued, delivered in order (never two
 messages interleaved mid-delivery to the same agent), and arrives as
 ordinary terminal input prefixed `[duet message from <sender>]:` — the
@@ -246,11 +280,11 @@ from.
 
 ## Known limitations
 
-- `FileTree`, `Portal`, `Drawing`, and `Group` are placeholder node kinds
-  only — no real file tree, embedded browser, freehand drawing, or
-  containment semantics yet.
-- Notes aren't agent-readable/writable yet, and have no file-backed sync —
-  `duetctl` has no `notes` subcommand today.
+- `Portal`, `Drawing`, and `Group` are placeholder node kinds only — no
+  embedded browser, freehand drawing, or containment semantics yet.
+- Projects are local only: `ProjectFilesystem` has a single, local
+  implementation until SSH/Docker environments arrive. The editor has no
+  tabs or split view.
 - `ReadNote`, `WriteNote`, `ControlPortal`, and `ShareContext` edge
   capabilities are representable but not enforced by anything yet, since
   the features they'd gate don't exist.

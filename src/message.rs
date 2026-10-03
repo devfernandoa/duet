@@ -128,6 +128,9 @@ pub struct WhoamiInfo {
 pub struct NoteSummary {
     pub id: Uuid,
     pub title: String,
+    /// The project file a file-backed note is synced with (Milestone 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// One note's full content, as `duetctl notes read` reports it.
@@ -137,6 +140,9 @@ pub struct NoteDetail {
     pub title: String,
     pub markdown: String,
     pub color: String,
+    /// The project file a file-backed note is synced with (Milestone 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 #[cfg(test)]

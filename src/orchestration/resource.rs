@@ -11,18 +11,29 @@
 //! the same way knowing a file exists is different from being allowed to
 //! open it. See section 8: "resolution and access are different."
 //!
-//! Only `Agent` and `Note` are implemented today — the two resource kinds
-//! that already have an identity and a service behind them. `ResourceKind`
-//! is deliberately a plain enum with one `candidates_for_kind` match inside
-//! this module, not a `dyn` provider registry: with two variants, a trait
-//! object registry would be the "empty abstraction for naming symmetry"
-//! CLAUDE.md warns against. Adding `File`/`Portal`/`Floor`/`Workspace` later
-//! means adding a variant and one match arm here, nowhere else — the one
-//! place this crate is allowed to know about every resource kind at once.
+//! `Agent` and `Note` (Milestone 5) resolve against workspace node records;
+//! `File` and `Diff` (Milestone 6) resolve against the caller's project root
+//! through `project::ProjectFilesystem`, so `@file:src/auth.rs` means "this
+//! file in *my* workspace's project", never a guess across workspaces, and
+//! can never reach outside that root (`project::ProjectPath` rejects
+//! traversal at parse time; `LocalProject` rejects symlink escapes).
+//! `ResourceKind` is deliberately a plain enum with one match per kind
+//! inside this module, not a `dyn` provider registry — the one place this
+//! crate is allowed to know about every resource kind at once. Adding
+//! `Portal`/`Floor`/`Workspace` later still means a variant and a match arm.
+//!
+//! File references accept an optional selection suffix,
+//! `@file:src/auth.rs#L10-20`, and an *unqualified* reference that is
+//! recognizably path-shaped (`@src/auth.rs`, `@README.md` — see
+//! [`is_path_like`]) is also tried as a file. A plain word never is: `@auth`
+//! only ever searches agents and notes.
 
 use super::identity::agent_identities;
 use super::notes::note_title;
 use crate::model::{EdgeRecord, FloorRef, NodeRecord};
+use crate::project::Project;
+use crate::project::git::GitService;
+use crate::project::path::{LineRange, ProjectPath, split_line_suffix};
 use crate::role::Role;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -34,6 +45,11 @@ use uuid::Uuid;
 pub enum ResourceKind {
     Agent,
     Note,
+    /// A file or directory under the caller's project root.
+    File,
+    /// The uncommitted Git changes (working tree vs `HEAD`) of a file,
+    /// directory, or — as `@diff:.` — the whole project.
+    Diff,
 }
 
 impl ResourceKind {
@@ -43,6 +59,8 @@ impl ResourceKind {
         match raw.to_ascii_lowercase().as_str() {
             "agent" => Some(ResourceKind::Agent),
             "note" => Some(ResourceKind::Note),
+            "file" => Some(ResourceKind::File),
+            "diff" => Some(ResourceKind::Diff),
             _ => None,
         }
     }
@@ -51,7 +69,40 @@ impl ResourceKind {
         match self {
             ResourceKind::Agent => "agent",
             ResourceKind::Note => "note",
+            ResourceKind::File => "file",
+            ResourceKind::Diff => "diff",
         }
+    }
+
+    /// Whether this kind lives in the project filesystem rather than in a
+    /// workspace's node records.
+    pub fn is_project_kind(&self) -> bool {
+        matches!(self, ResourceKind::File | ResourceKind::Diff)
+    }
+}
+
+/// Whether an unqualified reference body is recognizably a path, and so
+/// should also be tried as a file: it contains a `/`, or it is a single word
+/// with a file extension (`README.md`, `Cargo.toml`). Deliberately narrow —
+/// an ordinary word (`@backend`, `@auth`) is never treated as a file.
+pub fn is_path_like(name: &str) -> bool {
+    let name = split_line_suffix(name)
+        .map(|(path, _)| path)
+        .unwrap_or(name);
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if name.contains('/') {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((stem, extension)) => {
+            !stem.is_empty()
+                && (1..=10).contains(&extension.len())
+                && extension.starts_with(|c: char| c.is_ascii_alphabetic())
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
     }
 }
 
@@ -62,12 +113,16 @@ impl ResourceKind {
 pub struct ResourceRef {
     pub kind: Option<ResourceKind>,
     pub name: String,
+    /// A `#L10-20` selection, only ever set for a file (qualified, or an
+    /// unqualified path-like reference).
+    pub lines: Option<LineRange>,
 }
 
 impl ResourceRef {
-    /// Parses `@name` or `@kind:name`. The leading `@` is required — it's
-    /// the explicit, deterministic signal section 10 asks for; plain words
-    /// are never upgraded into a reference by this parser.
+    /// Parses `@name`, `@kind:name`, `@file:path#L10-20`, or a path-like
+    /// `@src/auth.rs`. The leading `@` is required — it's the explicit,
+    /// deterministic signal section 10 asks for; plain words are never
+    /// upgraded into a reference by this parser.
     pub fn parse(raw: &str) -> Result<ResourceRef, String> {
         let body = raw.strip_prefix('@').ok_or_else(|| {
             format!("'{raw}' is not a resource reference (expected @name or @kind:name)")
@@ -78,19 +133,38 @@ impl ResourceRef {
         match body.split_once(':') {
             Some((kind, name)) => {
                 let kind = ResourceKind::parse(kind).ok_or_else(|| {
-                    format!("unknown resource kind '{kind}' (expected agent or note)")
+                    format!("unknown resource kind '{kind}' (expected agent, note, file or diff)")
                 })?;
                 if name.is_empty() {
                     return Err(format!("'@{}:' needs a name after the colon", kind.label()));
                 }
+                let (name, lines) = match kind {
+                    ResourceKind::File => split_line_suffix(name)?,
+                    _ => (name, None),
+                };
+                if kind.is_project_kind() {
+                    // Validated here, so `@file:../etc/passwd` is a clear
+                    // error rather than a quiet "not found".
+                    ProjectPath::parse(name).map_err(|error| error.to_string())?;
+                }
                 Ok(ResourceRef {
                     kind: Some(kind),
                     name: name.to_string(),
+                    lines,
+                })
+            }
+            None if is_path_like(body) => {
+                let (name, lines) = split_line_suffix(body)?;
+                Ok(ResourceRef {
+                    kind: None,
+                    name: name.to_string(),
+                    lines,
                 })
             }
             None => Ok(ResourceRef {
                 kind: None,
                 name: body.to_string(),
+                lines: None,
             }),
         }
     }
@@ -102,11 +176,58 @@ impl ResourceRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedResource {
     pub kind: ResourceKind,
+    /// A node resource's own stable id. For a `File`/`Diff`, a
+    /// deterministic id derived from the workspace and path (see
+    /// [`project_resource_id`]) — the path itself is that resource's real
+    /// identity, carried in `path`.
     pub id: Uuid,
     pub name: String,
     pub workspace_id: Uuid,
     pub workspace_name: String,
     pub floor: FloorRef,
+    /// Project-relative path, for `File`/`Diff` resources only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The selected line range of a `File` reference, if one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<LineRange>,
+}
+
+impl ResolvedResource {
+    /// The canonical `@kind:...` form of this resource — what to pass on to
+    /// another agent so it can resolve exactly the same thing.
+    pub fn reference(&self) -> String {
+        match (self.kind, &self.path) {
+            (ResourceKind::File, Some(path)) => match self.lines {
+                Some(lines) => format!("@file:{path}#{lines}"),
+                None => format!("@file:{path}"),
+            },
+            (ResourceKind::Diff, Some(path)) => format!("@diff:{path}"),
+            (kind, _) => format!("@{}:{}", kind.label(), self.id),
+        }
+    }
+}
+
+/// The project a reference's `File`/`Diff` candidates resolve against: the
+/// caller's own workspace's root (CLAUDE.md, "resolution must be scoped to
+/// the current Workspace/Floor project root"). Every file a caller can name
+/// lives under this one root; there is no cross-workspace file resolution.
+pub struct ProjectScope<'a> {
+    pub workspace_id: Uuid,
+    pub workspace_name: String,
+    pub floor: FloorRef,
+    pub project: &'a dyn Project,
+}
+
+/// A stable, deterministic id for a project-path resource (UUIDv5 of the
+/// workspace id and `kind:path`): the same file always gets the same id, so
+/// it can sit next to node ids in JSON output, but it is derived, never
+/// stored — the path is the identity.
+pub fn project_resource_id(workspace_id: Uuid, kind: ResourceKind, path: &ProjectPath) -> Uuid {
+    Uuid::new_v5(
+        &workspace_id,
+        format!("{}:{}", kind.label(), path.display()).as_bytes(),
+    )
 }
 
 /// The result of resolving one [`ResourceRef`] — always one of these three
@@ -167,6 +288,8 @@ fn agent_candidates(view: &WorkspaceView, roles: &[Role]) -> Vec<ResolvedResourc
             workspace_id: view.id,
             workspace_name: view.name.clone(),
             floor: identity.floor,
+            path: None,
+            lines: None,
         })
         .collect()
 }
@@ -183,6 +306,8 @@ fn note_candidates(view: &WorkspaceView) -> Vec<ResolvedResource> {
                 workspace_id: view.id,
                 workspace_name: view.name.clone(),
                 floor: node.floor,
+                path: None,
+                lines: None,
             })
         })
         .collect()
@@ -196,10 +321,48 @@ fn candidates_for_kind(
     match kind {
         ResourceKind::Agent => agent_candidates(view, roles),
         ResourceKind::Note => note_candidates(view),
+        // Project kinds don't come from node records; see `project_candidate`.
+        ResourceKind::File | ResourceKind::Diff => Vec::new(),
     }
 }
 
-const ALL_KINDS: [ResourceKind; 2] = [ResourceKind::Agent, ResourceKind::Note];
+const NODE_KINDS: [ResourceKind; 2] = [ResourceKind::Agent, ResourceKind::Note];
+
+/// The `File`/`Diff` candidate `reference` names in `scope`, if any. A file
+/// must exist; a diff must name the project root, an existing path, or a
+/// path Git reports as changed (a deleted file still has a diff).
+fn project_candidate(
+    kind: ResourceKind,
+    reference: &ResourceRef,
+    scope: &ProjectScope,
+) -> Option<ResolvedResource> {
+    let path = ProjectPath::parse(&reference.name).ok()?;
+    let exists = match kind {
+        ResourceKind::File => !path.is_root() && scope.project.exists(&path),
+        ResourceKind::Diff => {
+            path.is_root()
+                || scope.project.exists(&path)
+                || GitService::new(scope.project)
+                    .status()
+                    .is_ok_and(|status| status.has_changes_under(&path))
+        }
+        ResourceKind::Agent | ResourceKind::Note => false,
+    };
+    exists.then(|| ResolvedResource {
+        kind,
+        id: project_resource_id(scope.workspace_id, kind, &path),
+        name: path.display().to_string(),
+        workspace_id: scope.workspace_id,
+        workspace_name: scope.workspace_name.clone(),
+        floor: scope.floor,
+        path: Some(path.display().to_string()),
+        lines: if kind == ResourceKind::File {
+            reference.lines
+        } else {
+            None
+        },
+    })
+}
 
 /// Resolves `reference` against every workspace in `workspaces`. Matching is
 /// case-insensitive on name (an `@backend` reference is meant to find an
@@ -214,16 +377,31 @@ pub fn resolve(
     roles: &[Role],
     context: Option<&ResolveContext>,
 ) -> ResolveOutcome {
-    let kinds: &[ResourceKind] = match &reference.kind {
+    resolve_with_project(reference, workspaces, roles, context, None)
+}
+
+/// [`resolve`], plus `File`/`Diff` resolution against `project` (the
+/// caller's own project root). An unqualified reference is tried as a file
+/// only when it [`is_path_like`]; if it *also* matches an agent or note by
+/// name, the result is `Ambiguous`, never a silent pick.
+pub fn resolve_with_project(
+    reference: &ResourceRef,
+    workspaces: &[WorkspaceView],
+    roles: &[Role],
+    context: Option<&ResolveContext>,
+    project: Option<&ProjectScope>,
+) -> ResolveOutcome {
+    let node_kinds: &[ResourceKind] = match &reference.kind {
+        Some(kind) if kind.is_project_kind() => &[],
         Some(kind) => std::slice::from_ref(kind),
-        None => &ALL_KINDS,
+        None => &NODE_KINDS,
     };
     let wanted_id = Uuid::parse_str(&reference.name).ok();
 
-    let candidates: Vec<ResolvedResource> = workspaces
+    let mut candidates: Vec<ResolvedResource> = workspaces
         .iter()
         .flat_map(|view| {
-            kinds
+            node_kinds
                 .iter()
                 .flat_map(move |&kind| candidates_for_kind(kind, view, roles))
         })
@@ -231,6 +409,19 @@ pub fn resolve(
             wanted_id == Some(candidate.id) || candidate.name.eq_ignore_ascii_case(&reference.name)
         })
         .collect();
+
+    if let Some(scope) = project {
+        let project_kind = match reference.kind {
+            Some(kind) if kind.is_project_kind() => Some(kind),
+            None if is_path_like(&reference.name) => Some(ResourceKind::File),
+            _ => None,
+        };
+        if let Some(kind) = project_kind
+            && let Some(candidate) = project_candidate(kind, reference, scope)
+        {
+            candidates.push(candidate);
+        }
+    }
 
     match candidates.len() {
         0 => ResolveOutcome::NotFound,
@@ -315,6 +506,7 @@ mod tests {
                 markdown: markdown.to_string(),
                 color: "yellow".to_string(),
                 view_mode: NoteViewMode::Preview,
+                file: None,
             }),
         }
     }
@@ -334,14 +526,16 @@ mod tests {
             ResourceRef::parse("@backend").unwrap(),
             ResourceRef {
                 kind: None,
-                name: "backend".to_string()
+                name: "backend".to_string(),
+                lines: None,
             }
         );
         assert_eq!(
             ResourceRef::parse("@agent:backend").unwrap(),
             ResourceRef {
                 kind: Some(ResourceKind::Agent),
-                name: "backend".to_string()
+                name: "backend".to_string(),
+                lines: None,
             }
         );
     }
@@ -353,7 +547,7 @@ mod tests {
 
     #[test]
     fn an_unknown_qualifier_is_rejected() {
-        assert!(ResourceRef::parse("@file:readme").is_err());
+        assert!(ResourceRef::parse("@bogus:readme").is_err());
     }
 
     #[test]
@@ -373,6 +567,8 @@ mod tests {
                     workspace_id: views[0].id,
                     workspace_name: "main".to_string(),
                     floor: FloorRef::Ground,
+                    path: None,
+                    lines: None,
                 }
             }
         );
@@ -615,5 +811,211 @@ mod tests {
             serde_json::to_value(&ResolveOutcome::NotFound).unwrap()["status"],
             "not_found"
         );
+    }
+
+    fn project_scope(project: &dyn Project, workspace_id: Uuid) -> ProjectScope<'_> {
+        ProjectScope {
+            workspace_id,
+            workspace_name: "main".to_string(),
+            floor: FloorRef::Ground,
+            project,
+        }
+    }
+
+    #[test]
+    fn file_references_parse_with_and_without_qualifiers() {
+        let qualified = ResourceRef::parse("@file:src/auth.rs").unwrap();
+        assert_eq!(qualified.kind, Some(ResourceKind::File));
+        assert_eq!(qualified.name, "src/auth.rs");
+        assert_eq!(qualified.lines, None);
+
+        let selected = ResourceRef::parse("@file:src/auth.rs#L10-20").unwrap();
+        assert_eq!(selected.lines, Some(LineRange { start: 10, end: 20 }));
+
+        let unqualified = ResourceRef::parse("@src/auth.rs#L3").unwrap();
+        assert_eq!(unqualified.kind, None);
+        assert_eq!(unqualified.name, "src/auth.rs");
+        assert_eq!(unqualified.lines, Some(LineRange { start: 3, end: 3 }));
+
+        let diff = ResourceRef::parse("@diff:.").unwrap();
+        assert_eq!(diff.kind, Some(ResourceKind::Diff));
+
+        assert!(ResourceRef::parse("@file:../etc/passwd").is_err());
+        assert!(ResourceRef::parse("@file:/etc/passwd").is_err());
+        assert!(ResourceRef::parse("@file:a.rs#Lnope").is_err());
+    }
+
+    #[test]
+    fn only_path_shaped_words_are_path_like() {
+        for path_like in [
+            "src/auth.rs",
+            "README.md",
+            "Cargo.toml",
+            "./x",
+            "a/b",
+            "src/auth.rs#L2",
+        ] {
+            assert!(is_path_like(path_like), "{path_like}");
+        }
+        for word in ["backend", "auth", "v1.2", "Secret Plan", "x.", ".hidden"] {
+            assert!(!is_path_like(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn file_references_resolve_within_the_project_root_only() {
+        use crate::project::LocalProject;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/auth.rs"), "fn login() {}\n").unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# hi\n").unwrap();
+        let project = LocalProject::new(tmp.path());
+        let workspace_id = Uuid::new_v4();
+        let views = vec![workspace(workspace_id, "main", vec![])];
+        let scope = project_scope(&project, workspace_id);
+        let resolve_file = |raw: &str| {
+            resolve_with_project(
+                &ResourceRef::parse(raw).unwrap(),
+                &views,
+                &[],
+                None,
+                Some(&scope),
+            )
+        };
+
+        let ResolveOutcome::Found { resource } = resolve_file("@file:src/auth.rs#L1") else {
+            panic!("expected Found");
+        };
+        assert_eq!(resource.kind, ResourceKind::File);
+        assert_eq!(resource.path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(resource.lines, Some(LineRange { start: 1, end: 1 }));
+        assert_eq!(resource.workspace_id, workspace_id);
+        assert_eq!(resource.reference(), "@file:src/auth.rs#L1");
+        assert_eq!(
+            resource.id,
+            project_resource_id(
+                workspace_id,
+                ResourceKind::File,
+                &ProjectPath::parse("src/auth.rs").unwrap()
+            )
+        );
+
+        // Unqualified but path-like.
+        assert!(matches!(
+            resolve_file("@src/auth.rs"),
+            ResolveOutcome::Found { .. }
+        ));
+        assert!(matches!(
+            resolve_file("@./README.md"),
+            ResolveOutcome::Found { .. }
+        ));
+        // Missing files and plain words don't resolve as files.
+        assert_eq!(
+            resolve_file("@file:src/missing.rs"),
+            ResolveOutcome::NotFound
+        );
+        assert_eq!(resolve_file("@auth"), ResolveOutcome::NotFound);
+        // Without a project scope, files never resolve.
+        assert_eq!(
+            resolve(
+                &ResourceRef::parse("@file:src/auth.rs").unwrap(),
+                &views,
+                &[],
+                None
+            ),
+            ResolveOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn a_path_like_reference_that_also_names_a_note_is_ambiguous() {
+        use crate::project::LocalProject;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("plan.md"), "# plan\n").unwrap();
+        let project = LocalProject::new(tmp.path());
+        let workspace_id = Uuid::new_v4();
+        let views = vec![workspace(
+            workspace_id,
+            "main",
+            vec![note_node("# plan.md", FloorRef::Ground)],
+        )];
+        let scope = project_scope(&project, workspace_id);
+        let outcome = resolve_with_project(
+            &ResourceRef::parse("@plan.md").unwrap(),
+            &views,
+            &[],
+            None,
+            Some(&scope),
+        );
+        let ResolveOutcome::Ambiguous { candidates } = outcome else {
+            panic!("expected Ambiguous");
+        };
+        let kinds: Vec<_> = candidates.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec![ResourceKind::Note, ResourceKind::File]);
+        // Qualifying picks exactly one.
+        assert!(matches!(
+            resolve_with_project(
+                &ResourceRef::parse("@file:plan.md").unwrap(),
+                &views,
+                &[],
+                None,
+                Some(&scope)
+            ),
+            ResolveOutcome::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn symlinks_out_of_the_root_do_not_resolve() {
+        use crate::project::LocalProject;
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "x").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            tmp.path().join("link.txt"),
+        )
+        .unwrap();
+        let project = LocalProject::new(tmp.path());
+        let scope = project_scope(&project, Uuid::new_v4());
+        assert_eq!(
+            resolve_with_project(
+                &ResourceRef::parse("@file:link.txt").unwrap(),
+                &[],
+                &[],
+                None,
+                Some(&scope)
+            ),
+            ResolveOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn diff_references_resolve_for_the_root_existing_and_deleted_paths() {
+        use crate::project::ProjectFilesystem;
+        use crate::project::git::tests::{git, p, repo};
+        let (tmp, project) = repo();
+        git(tmp.path(), &["rm", "-q", "src/auth.rs"]);
+        let scope = project_scope(&project, Uuid::new_v4());
+        let diff = |raw: &str| {
+            resolve_with_project(
+                &ResourceRef::parse(raw).unwrap(),
+                &[],
+                &[],
+                None,
+                Some(&scope),
+            )
+        };
+        let ResolveOutcome::Found { resource } = diff("@diff:.") else {
+            panic!("expected Found");
+        };
+        assert_eq!(resource.reference(), "@diff:.");
+        // Deleted from disk, but Git still has a diff for it.
+        assert!(!project.exists(&p("src/auth.rs")));
+        assert!(matches!(
+            diff("@diff:src/auth.rs"),
+            ResolveOutcome::Found { .. }
+        ));
+        assert_eq!(diff("@diff:nowhere.rs"), ResolveOutcome::NotFound);
     }
 }

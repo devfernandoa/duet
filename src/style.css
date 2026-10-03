@@ -122,3 +122,29 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
     margin-top: 6px;
     margin-bottom: 6px;
 }
+
+/* Milestone 6: FileTree / Editor cards and file-sync banners. */
+.file-tree-node, .editor-node { background-color: @card_bg_color; }
+.file-tree-list { background: transparent; }
+.file-tree-list row { padding: 0; min-height: 22px; }
+.file-tree-toolbar button, .file-tree-toolbar togglebutton {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0 2px;
+}
+.git-marker { font-weight: bold; font-family: monospace; }
+.git-modified { color: #e5a50a; }
+.git-added { color: #2ec27e; }
+.git-deleted { color: #e01b24; }
+.git-renamed { color: #3584e4; }
+.git-untracked { color: #9a9996; }
+.git-conflict { color: #e01b24; }
+.git-changed { color: #e5a50a; }
+.file-banner {
+    padding: 4px 6px;
+    background-color: rgba(229, 165, 10, 0.35);
+    color: #1f1f1f;
+}
+.file-banner button { min-height: 22px; padding: 0 6px; }
+.editor-search-bar { padding: 2px 4px; }
+.note-file-label { font-size: 0.8em; color: #3d3d3d; }

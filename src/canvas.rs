@@ -53,6 +53,29 @@ use gtk4::{glib, graphene, gsk};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// The CSS class a widget inside a card carries to keep a drag that starts
+/// on it from panning the canvas (see the pan gesture in `Canvas::new`).
+pub const NO_CANVAS_PAN_CLASS: &str = "no-canvas-pan";
+
+/// Whether the press at `(x, y)` (in the gesture widget's coordinates) lands
+/// inside a widget marked with `NO_CANVAS_PAN_CLASS`.
+fn pressed_inside_no_pan(gesture: &gtk4::GestureDrag, x: f64, y: f64) -> bool {
+    let Some(widget) = gesture.widget() else {
+        return false;
+    };
+    let mut current = widget.pick(x, y, gtk4::PickFlags::DEFAULT);
+    while let Some(candidate) = current {
+        if candidate == widget {
+            return false;
+        }
+        if candidate.has_css_class(NO_CANVAS_PAN_CLASS) {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
 /// A tracked canvas child, paired with its world-space position (see
 /// `Canvas::nodes`'s doc comment for why the position is tracked
 /// independently of the widget's own GTK transform).
@@ -144,6 +167,15 @@ impl Canvas {
             let drag_start_pan = Rc::clone(&drag_start_pan);
             let marquee_start = Rc::clone(&marquee_start);
             drag.connect_drag_begin(move |gesture, start_x, start_y| {
+                // A press inside a widget that does its own dragging (a
+                // FileTree row being dragged onto the canvas) isn't a pan:
+                // its own drag source only claims the press after moving a
+                // few pixels, by which time this gesture would already
+                // have panned. Such widgets opt out with this CSS class.
+                if pressed_inside_no_pan(gesture, start_x, start_y) {
+                    gesture.set_state(gtk4::EventSequenceState::Denied);
+                    return;
+                }
                 *drag_start_pan.borrow_mut() = state.borrow().pan;
                 let shift_held = gesture
                     .current_event()
