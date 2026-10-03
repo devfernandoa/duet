@@ -1,3 +1,32 @@
+//! `App`: the single place GTK widgets, persisted workspace state and live
+//! runtime handles all meet. Its `pub fn`/static methods (`send_message`,
+//! `create_session`, `close_node`, `unload_workspace`, ...) ARE this
+//! codebase's application-service layer — see CLAUDE.md's "CLI and GUI"
+//! section. `control.rs`'s CLI/agent dispatch and every GTK dialog share
+//! this same underlying logic, so neither path can diverge from the other's
+//! business rules: messaging (`send_message`) and workspace/session
+//! mutation (`create_session`/`close_node`) are called by both; the three
+//! manager-permission-gated wrappers CLI/agent callers go through instead
+//! (`create_agent`/`remove_agent`/`assign_role`, each starting with
+//! `App::require_manager`) are CLI/agent-only entry points over that same
+//! shared logic — the GUI, trusted unconditionally as the human operator
+//! already is for `send_message`'s sourceless case, calls the underlying
+//! `create_session`/`close_node` directly and has no UI for role
+//! reassignment yet at all.
+//!
+//! This is deliberately not split into separate `WorkspaceService`/
+//! `AgentService`/`MessageService` *types*: the domain/runtime logic those
+//! names would hold (`orchestration::{bus, registry, permissions, identity}`,
+//! `runtime::SessionRuntime`) already lives in its own GTK-free modules, and
+//! `App` itself is the thin coordinator that wires them to persistence and to
+//! the live widget tree — introducing parallel service structs here would
+//! just be another name for the same coordination, not a new boundary (see
+//! CLAUDE.md's "Incremental development rule": "do not turn a small task
+//! into a broad rewrite"). Split it for real
+//! once a method here needs to run somewhere `App`'s own GTK/`Rc<RefCell<_>>`
+//! shape can't go (a headless remote-API process, say) — Milestone 14's
+//! problem, not this one's.
+
 use crate::account::AccountStore;
 use crate::agent::{Agent, Launch, LaunchRequest, with_session_env};
 use crate::canvas::{
