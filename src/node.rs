@@ -446,6 +446,7 @@ pub struct NoteNode {
     edit_scroller: gtk4::ScrolledWindow,
     preview_scroller: gtk4::ScrolledWindow,
     pub mode_button: gtk4::Button,
+    pub link_button: gtk4::Button,
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
@@ -476,6 +477,14 @@ impl NoteNode {
         let mode_button = gtk4::Button::with_label(mode_label(initial_mode));
         mode_button.add_css_class("flat");
         mode_button.set_tooltip_text(Some("Cycle Edit / Preview / Split"));
+        // Milestone 4 generalizes the link-button/click-to-complete gesture
+        // (previously Terminal-only — see `model.rs`'s `EdgeRecord` doc
+        // comment anticipating exactly this) onto Note cards, so a Note can
+        // be connected to an agent or to another Note the same way two
+        // agents already connect to each other.
+        let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
+        link_button.add_css_class("flat");
+        link_button.set_tooltip_text(Some("Connect this note to an agent or another note"));
         let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
         minimize_button.add_css_class("flat");
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
@@ -486,6 +495,7 @@ impl NoteNode {
         title_bar.add_css_class("note-title-bar");
         title_bar.append(&drag_handle);
         title_bar.append(&mode_button);
+        title_bar.append(&link_button);
         title_bar.append(&minimize_button);
         title_bar.append(&close_button);
 
@@ -571,6 +581,7 @@ impl NoteNode {
             edit_scroller,
             preview_scroller,
             mode_button,
+            link_button,
             drag_handle,
             close_button,
             resize_handle,
@@ -578,6 +589,25 @@ impl NoteNode {
         };
         node.set_view_mode(initial_mode);
         node
+    }
+
+    /// Calls `f` on a plain click anywhere in either text pane (Edit or
+    /// Preview) — the click target for completing a pending link onto this
+    /// note, the same role `node.terminal` plays for `SessionNode` (see
+    /// `app::wire_link_controls`). Both panes are wired, not just whichever
+    /// is currently visible, since `set_view_mode` can toggle between them
+    /// at any time and the link-completion target shouldn't depend on which
+    /// mode the note happens to be in.
+    pub fn connect_link_target(&self, f: impl Fn() + 'static) {
+        let f = Rc::new(f);
+        for view in [&self.edit_view, &self.preview_view] {
+            let click = gtk4::GestureClick::new();
+            click.connect_pressed({
+                let f = Rc::clone(&f);
+                move |_gesture, _n_press, _x, _y| f()
+            });
+            view.add_controller(click);
+        }
     }
 
     /// Schedules a re-render of the Preview pane from the current Edit

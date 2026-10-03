@@ -13,6 +13,7 @@ pub mod adapter;
 pub mod bus;
 pub mod env;
 pub mod identity;
+pub mod notes;
 pub mod permissions;
 pub mod registry;
 pub mod skill;
