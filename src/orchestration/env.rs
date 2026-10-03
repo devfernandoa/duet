@@ -24,7 +24,9 @@ to see every agent, and `duetctl send --to <agent> \"message\"` to message one y
 to (your id is already in $DUET_AGENT_ID). If an instruction contains an explicit @reference \
 (e.g. @backend, @agent:backend, @note:requirements, @file:src/main.rs#L1-20, @diff:.), resolve \
 it first with `duetctl resolve @reference` rather than guessing its identity; read files with \
-`duetctl file read` and diffs with `duetctl git diff`.";
+`duetctl file read` and diffs with `duetctl git diff`. Drive a browser portal you're connected \
+to (@portal:name) only through `duetctl portal ...` (list, text, navigate, click, type, reload, \
+screenshot) — read its URL/title/text before assuming what it shows.";
 
 /// The `DUET_*` variables section 8 asks every launched agent to receive.
 /// `DUET_FLOOR_ID` is `"ground"` until Milestone 9 introduces real floors —

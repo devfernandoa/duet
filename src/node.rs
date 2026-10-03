@@ -182,7 +182,7 @@ pub(crate) fn wire_minimize(
 /// The compact title-bar buttons every card keeps: collapse and close.
 /// Everything else a card can do lives in its right-click menu (wired in
 /// `app.rs`), so the title bar stays readable at any card width.
-fn title_buttons(close_tooltip: &str) -> (gtk4::Button, gtk4::Button) {
+pub(crate) fn title_buttons(close_tooltip: &str) -> (gtk4::Button, gtk4::Button) {
     let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
     minimize_button.add_css_class("flat");
     let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
@@ -192,7 +192,7 @@ fn title_buttons(close_tooltip: &str) -> (gtk4::Button, gtk4::Button) {
 }
 
 /// An empty, expanding spacer for a title bar.
-fn spacer() -> gtk4::Box {
+pub(crate) fn spacer() -> gtk4::Box {
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     spacer

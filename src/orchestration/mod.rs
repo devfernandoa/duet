@@ -15,6 +15,7 @@ pub mod env;
 pub mod identity;
 pub mod notes;
 pub mod permissions;
+pub mod portal;
 pub mod registry;
 pub mod resource;
 pub mod skill;

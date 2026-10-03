@@ -11,16 +11,21 @@
 //! connection packages its parsed `ControlRequest` with a one-shot reply
 //! channel into a `ControlEvent` and hands it to `main.rs`'s existing
 //! timer-poll loop (the same `std::sync::mpsc` + `glib::timeout_add_local`
-//! shape `App::pump_output` already uses), which calls `handle_request`
-//! against the live `App` and sends the answer back. `App`'s session map
+//! shape `App::pump_output` already uses), which calls `dispatch` against
+//! the live `App`: most requests are answered on the spot by
+//! `handle_request`; a browser-portal page operation (Milestone 8) is
+//! asynchronous in WebKit, so its reply channel is handed to the
+//! `PortalService` callback and answered from there, never blocking the
+//! loop. `App`'s session map
 //! and GTK widgets are not `Send`, so this is the one safe way to reach
 //! them from a request that arrived on another thread.
 
 use crate::agent::Agent;
-use crate::app::App;
+use crate::app::{App, PortalStep};
 use crate::message::{
     AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, NoteDetail, NoteSummary,
-    WhoamiInfo, WorkspaceInfo,
+    PortalAction, PortalInfo, PortalPage, PortalScreenshot, PortalSummary, WhoamiInfo,
+    WorkspaceInfo,
 };
 use crate::orchestration::resource::{ResolveOutcome, ResolvedResource, ResourceDetail};
 use crate::project::fs::DirEntry;
@@ -155,9 +160,13 @@ pub enum ControlRequest {
     },
     /// `duetctl resource inspect <id>`: basic, non-gated metadata for any
     /// resource kind the resolver knows about — see
-    /// `orchestration::resource::ResourceDetail`.
+    /// `orchestration::resource::ResourceDetail`. `requested_by` only
+    /// shapes what a portal's summary reveals (its URL needs
+    /// `ControlPortal`).
     ResourceInspect {
         id: Uuid,
+        #[serde(default)]
+        requested_by: Option<Uuid>,
     },
     /// `duetctl notes attach <id> <path>`: makes a note file-backed (see
     /// `App::attach_note_file`). Fails without `WriteNote`.
@@ -243,6 +252,115 @@ pub enum ControlRequest {
     GitCommit {
         message: String,
     },
+    /// `duetctl portal list` — Milestone 8's browser portals; see
+    /// `app::portals`. Every portal request names its portal as `portal`:
+    /// an id, `@portal:name`, `@name` or a bare name, resolved app-side by
+    /// `App::resolve_portal_argument` (so ambiguity is reported, never
+    /// guessed). Every one except `list` needs `ControlPortal` for an agent.
+    PortalList {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    /// `duetctl portal inspect|url|title <portal>`.
+    PortalInspect {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        /// `url`/`title` for `duetctl portal url|title`: the client then
+        /// prints just that field. Presentation only — the answer is the
+        /// same `PortalDetail` either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show: Option<String>,
+    },
+    /// `duetctl portal navigate <portal> <url>`; answers once loaded.
+    PortalNavigate {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        url: String,
+    },
+    /// `duetctl portal back|forward|reload <portal>`.
+    PortalStep {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        step: PortalStep,
+    },
+    /// `duetctl portal text <portal> [--selector css] [--html] [--limit N]`.
+    PortalText {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        #[serde(default)]
+        selector: Option<String>,
+        #[serde(default)]
+        html: bool,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// `duetctl portal screenshot <portal> [--full]`.
+    PortalScreenshot {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        #[serde(default)]
+        full_page: bool,
+    },
+    /// `duetctl portal evaluate <portal>` (script on stdin or as an
+    /// argument). Privileged: needs the portal's `allow_scripts` too.
+    PortalEvaluate {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        script: String,
+    },
+    /// `duetctl portal click <portal> <selector>`.
+    PortalClick {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        selector: String,
+    },
+    /// `duetctl portal type <portal> <selector> <text> [--append] [--submit]`.
+    PortalType {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        portal: String,
+        selector: String,
+        text: String,
+        #[serde(default)]
+        append: bool,
+        #[serde(default)]
+        submit: bool,
+    },
+}
+
+impl ControlRequest {
+    /// Whether this request is answered asynchronously, from a WebKit
+    /// callback, rather than by `handle_request` — see `dispatch`.
+    fn is_async(&self) -> bool {
+        matches!(
+            self,
+            ControlRequest::PortalNavigate { .. }
+                | ControlRequest::PortalStep { .. }
+                | ControlRequest::PortalText { .. }
+                | ControlRequest::PortalScreenshot { .. }
+                | ControlRequest::PortalEvaluate { .. }
+                | ControlRequest::PortalClick { .. }
+                | ControlRequest::PortalType { .. }
+        )
+    }
+
+    /// How long a client waits for this request's answer. Page operations
+    /// may legitimately wait for a page to load (`LOAD_TIMEOUT`), so they
+    /// get longer than the snappy default.
+    fn reply_timeout(&self) -> Duration {
+        if self.is_async() {
+            crate::portal_runtime::LOAD_TIMEOUT * 2 + Duration::from_secs(5)
+        } else {
+            REPLY_TIMEOUT
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +444,25 @@ pub enum ControlResponse {
     GitDone {
         message: String,
     },
+    Portals {
+        portals: Vec<PortalSummary>,
+    },
+    PortalDetail {
+        portal: PortalInfo,
+    },
+    PortalAction {
+        action: PortalAction,
+    },
+    PortalPage {
+        page: PortalPage,
+    },
+    PortalScreenshot {
+        screenshot: PortalScreenshot,
+    },
+    PortalEvaluated {
+        id: Uuid,
+        value: serde_json::Value,
+    },
     Error {
         error: String,
     },
@@ -390,9 +527,10 @@ fn handle_connection(stream: UnixStream, tx: &Sender<ControlEvent>) {
     let response = match serde_json::from_str::<ControlRequest>(line.trim_end()) {
         Ok(request) => {
             let (respond, answer) = channel();
+            let timeout = request.reply_timeout();
             match tx.send(ControlEvent { request, respond }) {
                 Ok(()) => answer
-                    .recv_timeout(REPLY_TIMEOUT)
+                    .recv_timeout(timeout)
                     .unwrap_or(ControlResponse::Error {
                         error: "duet did not respond in time".to_string(),
                     }),
@@ -451,8 +589,143 @@ fn resolve_optional_role(app: &App, role: Option<String>) -> Result<Option<Uuid>
     }
 }
 
-/// Answers one request against the live `App` — called from `main.rs`'s
-/// poll loop, on the GTK main thread.
+/// Answers one accepted request — called from `main.rs`'s poll loop, on
+/// the GTK main thread. Most requests are answered right away by
+/// `handle_request`; a portal operation that needs the page (navigation,
+/// text, screenshots, interaction) is asynchronous in WebKit, so its
+/// one-shot reply channel travels into the `PortalService` callback and is
+/// answered from there — the poll loop never blocks on a page.
+pub fn dispatch(app: &Rc<RefCell<App>>, event: ControlEvent) {
+    let ControlEvent { request, respond } = event;
+    if !request.is_async() {
+        let _ = respond.send(handle_request(app, request));
+        return;
+    }
+    let answer = move |response: ControlResponse| {
+        let _ = respond.send(response);
+    };
+    let resolve = |portal: &str, requested_by: Option<Uuid>| {
+        app.borrow().resolve_portal_argument(portal, requested_by)
+    };
+    let on_action = |result: Result<PortalAction, String>| match result {
+        Ok(action) => ControlResponse::PortalAction { action },
+        Err(error) => ControlResponse::Error { error },
+    };
+    macro_rules! resolved {
+        ($portal:expr, $requested_by:expr) => {
+            match resolve(&$portal, $requested_by) {
+                Ok(id) => id,
+                Err(error) => return answer(ControlResponse::Error { error }),
+            }
+        };
+    }
+    match request {
+        ControlRequest::PortalNavigate {
+            requested_by,
+            portal,
+            url,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_navigate(app, requested_by, id, &url, move |result| {
+                answer(on_action(result))
+            });
+        }
+        ControlRequest::PortalStep {
+            requested_by,
+            portal,
+            step,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_step(app, requested_by, id, step, move |result| {
+                answer(on_action(result))
+            });
+        }
+        ControlRequest::PortalText {
+            requested_by,
+            portal,
+            selector,
+            html,
+            limit,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_text(
+                app,
+                requested_by,
+                id,
+                selector,
+                html,
+                limit,
+                move |result| {
+                    answer(match result {
+                        Ok(page) => ControlResponse::PortalPage { page },
+                        Err(error) => ControlResponse::Error { error },
+                    })
+                },
+            );
+        }
+        ControlRequest::PortalScreenshot {
+            requested_by,
+            portal,
+            full_page,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_screenshot(app, requested_by, id, full_page, move |result| {
+                answer(match result {
+                    Ok(screenshot) => ControlResponse::PortalScreenshot { screenshot },
+                    Err(error) => ControlResponse::Error { error },
+                })
+            });
+        }
+        ControlRequest::PortalEvaluate {
+            requested_by,
+            portal,
+            script,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_evaluate(app, requested_by, id, &script, move |result| {
+                answer(match result {
+                    Ok(value) => ControlResponse::PortalEvaluated { id, value },
+                    Err(error) => ControlResponse::Error { error },
+                })
+            });
+        }
+        ControlRequest::PortalClick {
+            requested_by,
+            portal,
+            selector,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_click(app, requested_by, id, &selector, move |result| {
+                answer(on_action(result))
+            });
+        }
+        ControlRequest::PortalType {
+            requested_by,
+            portal,
+            selector,
+            text,
+            append,
+            submit,
+        } => {
+            let id = resolved!(portal, requested_by);
+            App::portal_type(
+                app,
+                requested_by,
+                id,
+                &selector,
+                &text,
+                append,
+                submit,
+                move |result| answer(on_action(result)),
+            );
+        }
+        request => answer(handle_request(app, request)),
+    }
+}
+
+/// Answers one synchronous request against the live `App` — see
+/// `dispatch`, which routes every request here except the asynchronous
+/// portal operations.
 pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> ControlResponse {
     match request {
         ControlRequest::List => {
@@ -603,6 +876,7 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                     role_instructions: identity.role.map(|role| role.instructions),
                     connected_agents,
                     connected_files: app_ref.connected_files(agent_id),
+                    connected_portals: app_ref.list_portals(Some(agent_id)),
                 },
             }
         }
@@ -657,10 +931,12 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             Ok(outcome) => ControlResponse::Resolved { outcome },
             Err(error) => ControlResponse::Error { error },
         },
-        ControlRequest::ResourceInspect { id } => match app.borrow().inspect_resource(id) {
-            Ok((resource, detail)) => ControlResponse::ResourceInspected { resource, detail },
-            Err(error) => ControlResponse::Error { error },
-        },
+        ControlRequest::ResourceInspect { id, requested_by } => {
+            match app.borrow().inspect_resource(id, requested_by) {
+                Ok((resource, detail)) => ControlResponse::ResourceInspected { resource, detail },
+                Err(error) => ControlResponse::Error { error },
+            }
+        }
         ControlRequest::NotesAttach {
             requested_by,
             id,
@@ -755,6 +1031,33 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 message: format!("committed {hash}"),
             }
         }),
+        ControlRequest::PortalList { requested_by } => ControlResponse::Portals {
+            portals: app.borrow().list_portals(requested_by),
+        },
+        ControlRequest::PortalInspect {
+            requested_by,
+            portal,
+            ..
+        } => {
+            let app_ref = app.borrow();
+            respond(
+                app_ref
+                    .resolve_portal_argument(&portal, requested_by)
+                    .and_then(|id| app_ref.inspect_portal(requested_by, id)),
+                |portal| ControlResponse::PortalDetail { portal },
+            )
+        }
+        // Asynchronous: answered by `dispatch`, never here. Reaching this
+        // arm means a caller bypassed `dispatch`.
+        ControlRequest::PortalNavigate { .. }
+        | ControlRequest::PortalStep { .. }
+        | ControlRequest::PortalText { .. }
+        | ControlRequest::PortalScreenshot { .. }
+        | ControlRequest::PortalEvaluate { .. }
+        | ControlRequest::PortalClick { .. }
+        | ControlRequest::PortalType { .. } => ControlResponse::Error {
+            error: "internal: portal page operations must go through control::dispatch".to_string(),
+        },
     }
 }
 
@@ -783,6 +1086,8 @@ pub fn is_cli_verb(verb: &str) -> bool {
             | "resource"
             | "file"
             | "git"
+            | "portal"
+            | "portals"
     )
 }
 
@@ -815,6 +1120,17 @@ pub fn run_cli(args: &[String]) -> bool {
                     "{}",
                     serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
                 );
+            } else if let (
+                ControlRequest::PortalInspect {
+                    show: Some(field), ..
+                },
+                ControlResponse::PortalDetail { portal },
+            ) = (&request, &response)
+            {
+                match field.as_str() {
+                    "url" => println!("{}", portal.url),
+                    _ => println!("{}", portal.title.as_deref().unwrap_or("")),
+                }
             } else {
                 print_response(&response);
             }
@@ -877,6 +1193,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, rest @ ..] if cmd == "resource" => parse_resource(rest),
         [cmd, rest @ ..] if cmd == "file" => parse_file(rest),
         [cmd, rest @ ..] if cmd == "git" => parse_git(rest),
+        [cmd, rest @ ..] if cmd == "portal" || cmd == "portals" => parse_portal(rest),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -914,6 +1231,15 @@ const USAGE: &str = r#"usage:
   duetctl git unstage <path>...
   duetctl git discard <path>... --confirm
   duetctl git commit -m "<message>"
+  duetctl portal list
+  duetctl portal inspect|url|title <portal>      (<portal>: id, @portal:name, @name or name)
+  duetctl portal navigate <portal> <url>
+  duetctl portal back|forward|reload <portal>
+  duetctl portal text <portal> [--selector <css>] [--html] [--limit N]
+  duetctl portal screenshot <portal> [--full]
+  duetctl portal click <portal> <selector>
+  duetctl portal type <portal> <selector> <text> [--append] [--submit]
+  duetctl portal evaluate <portal> [<script>]    (script read from stdin if omitted)
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -922,6 +1248,7 @@ const RESOURCE_USAGE: &str = r#"usage:
 fn parse_resource(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [cmd, id] if cmd == "inspect" => Ok(ControlRequest::ResourceInspect {
+            requested_by: acting_agent_id(),
             id: parse_uuid_arg(id)?,
         }),
         _ => anyhow::bail!(RESOURCE_USAGE),
@@ -967,6 +1294,159 @@ const GIT_USAGE: &str = r#"usage:
   duetctl git unstage <path>...
   duetctl git discard <path>... --confirm
   duetctl git commit -m "<message>""#;
+
+const PORTAL_USAGE: &str = r#"usage:
+  duetctl portal list
+  duetctl portal inspect <portal>
+  duetctl portal url <portal>
+  duetctl portal title <portal>
+  duetctl portal navigate <portal> <url>
+  duetctl portal back|forward|reload <portal>
+  duetctl portal text <portal> [--selector <css>] [--html] [--limit N]
+  duetctl portal screenshot <portal> [--full]
+  duetctl portal click <portal> <selector>
+  duetctl portal type <portal> <selector> <text> [--append] [--submit]
+  duetctl portal evaluate <portal> [<script>]    (script read from stdin if omitted)
+<portal> is a portal id, @portal:name, @name, or a bare portal name"#;
+
+/// `duetctl portal ...`. `url`/`title` are `inspect` with a narrower
+/// printout (`PortalInspect::show`), so they ride the same request.
+fn parse_portal(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let requested_by = acting_agent_id();
+    let Some((verb, rest)) = args.split_first() else {
+        anyhow::bail!(PORTAL_USAGE);
+    };
+    let (positional, flags) = split_flags(rest, &["--selector", "--limit"], PORTAL_USAGE)?;
+    let has = |flag: &str| flags.iter().any(|(name, _)| *name == flag);
+    let value = |flag: &str| {
+        flags
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .and_then(|(_, value)| *value)
+    };
+    let known_flags: &[&str] = match verb.as_str() {
+        "text" => &["--selector", "--html", "--limit"],
+        "screenshot" => &["--full"],
+        "type" => &["--append", "--submit"],
+        _ => &[],
+    };
+    if let Some((unknown, _)) = flags.iter().find(|(name, _)| !known_flags.contains(name)) {
+        anyhow::bail!("unknown flag {unknown} for `portal {verb}`\n\n{PORTAL_USAGE}");
+    }
+    let portal = |index: usize| -> anyhow::Result<String> {
+        positional
+            .get(index)
+            .map(|portal| portal.to_string())
+            .ok_or_else(|| anyhow::anyhow!("`portal {verb}` needs a portal\n\n{PORTAL_USAGE}"))
+    };
+    let only = |count: usize| -> anyhow::Result<()> {
+        if positional.len() > count {
+            anyhow::bail!(
+                "too many arguments for `portal {verb}` (quote selectors and text)\n\n{PORTAL_USAGE}"
+            );
+        }
+        Ok(())
+    };
+    Ok(match verb.as_str() {
+        "list" => {
+            only(0)?;
+            ControlRequest::PortalList { requested_by }
+        }
+        "inspect" | "url" | "title" => {
+            only(1)?;
+            ControlRequest::PortalInspect {
+                requested_by,
+                portal: portal(0)?,
+                show: (verb != "inspect").then(|| verb.clone()),
+            }
+        }
+        "navigate" | "open" => {
+            only(2)?;
+            ControlRequest::PortalNavigate {
+                requested_by,
+                portal: portal(0)?,
+                url: positional
+                    .get(1)
+                    .map(|url| url.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("`portal navigate` needs a URL"))?,
+            }
+        }
+        "back" | "forward" | "reload" => {
+            only(1)?;
+            ControlRequest::PortalStep {
+                requested_by,
+                portal: portal(0)?,
+                step: match verb.as_str() {
+                    "back" => PortalStep::Back,
+                    "forward" => PortalStep::Forward,
+                    _ => PortalStep::Reload,
+                },
+            }
+        }
+        "text" => {
+            only(1)?;
+            ControlRequest::PortalText {
+                requested_by,
+                portal: portal(0)?,
+                selector: value("--selector").map(str::to_string),
+                html: has("--html"),
+                limit: parse_limit(value("--limit"))?,
+            }
+        }
+        "screenshot" => {
+            only(1)?;
+            ControlRequest::PortalScreenshot {
+                requested_by,
+                portal: portal(0)?,
+                full_page: has("--full"),
+            }
+        }
+        "click" => {
+            only(2)?;
+            ControlRequest::PortalClick {
+                requested_by,
+                portal: portal(0)?,
+                selector: positional
+                    .get(1)
+                    .map(|selector| selector.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("`portal click` needs a CSS selector"))?,
+            }
+        }
+        "type" => {
+            only(3)?;
+            ControlRequest::PortalType {
+                requested_by,
+                portal: portal(0)?,
+                selector: positional
+                    .get(1)
+                    .map(|selector| selector.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("`portal type` needs a CSS selector"))?,
+                text: positional
+                    .get(2)
+                    .map(|text| text.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("`portal type` needs the text to type"))?,
+                append: has("--append"),
+                submit: has("--submit"),
+            }
+        }
+        "evaluate" | "eval" => {
+            only(2)?;
+            let script = match positional.get(1) {
+                Some(script) => script.to_string(),
+                None => read_stdin_to_string()?,
+            };
+            if script.trim().is_empty() {
+                anyhow::bail!("`portal evaluate` needs a script (as an argument or on stdin)");
+            }
+            ControlRequest::PortalEvaluate {
+                requested_by,
+                portal: portal(0)?,
+                script,
+            }
+        }
+        _ => anyhow::bail!(PORTAL_USAGE),
+    })
+}
 
 /// `split_flags`' result: positional arguments, then `(flag, value)` pairs.
 type SplitArgs<'a> = (Vec<&'a str>, Vec<(&'a str, Option<&'a str>)>);
@@ -1379,6 +1859,21 @@ fn print_response(response: &ControlResponse) {
                     println!("  {reference}");
                 }
             }
+            if !info.connected_portals.is_empty() {
+                println!("\nconnected browser portals (`duetctl portal inspect <id>`):");
+                for portal in &info.connected_portals {
+                    println!(
+                        "  {}\t{}\t{}",
+                        portal.id,
+                        portal.name,
+                        if portal.controllable {
+                            "control"
+                        } else {
+                            "no access"
+                        }
+                    );
+                }
+            }
         }
         ControlResponse::Notes { notes } => {
             if notes.is_empty() {
@@ -1497,7 +1992,81 @@ fn print_response(response: &ControlResponse) {
                 ResourceDetail::Note(note) => {
                     println!("title:     {}", note.title);
                 }
+                ResourceDetail::Portal(portal) => {
+                    println!("url:       {}", portal.url.as_deref().unwrap_or("-"));
+                    println!("scripts:   {}", portal.allow_scripts);
+                }
             }
+        }
+        ControlResponse::Portals { portals } => {
+            if portals.is_empty() {
+                println!("no portals");
+            }
+            for portal in portals {
+                let access = if portal.controllable {
+                    "control"
+                } else {
+                    "no access"
+                };
+                println!(
+                    "{}\t{}\t{access}\t{}",
+                    portal.id,
+                    portal.name,
+                    portal
+                        .url
+                        .as_deref()
+                        .filter(|url| !url.is_empty())
+                        .unwrap_or("-")
+                );
+            }
+        }
+        ControlResponse::PortalDetail { portal } => {
+            println!("id:          {}", portal.id);
+            println!("name:        {}", portal.name);
+            println!("url:         {}", portal.url);
+            println!("title:       {}", portal.title.as_deref().unwrap_or("-"));
+            println!("loading:     {}", portal.loading);
+            println!(
+                "history:     back={} forward={}",
+                portal.can_go_back, portal.can_go_forward
+            );
+            println!("profile:     {} ({})", portal.profile_id, portal.storage);
+            println!("scripts:     {}", portal.allow_scripts);
+            println!(
+                "controllers: {}",
+                if portal.controllers.is_empty() {
+                    "-".to_string()
+                } else {
+                    portal.controllers.join(", ")
+                }
+            );
+        }
+        ControlResponse::PortalAction { action } => {
+            println!("{}", action.detail);
+            println!("url:   {}", action.url);
+            println!("title: {}", action.title.as_deref().unwrap_or("-"));
+        }
+        ControlResponse::PortalPage { page } => {
+            println!("url:   {}", page.url);
+            println!("title: {}", page.title);
+            println!();
+            println!("{}", page.text);
+            if page.truncated {
+                println!("\n[truncated — use --selector or --limit to read a specific part]");
+            }
+        }
+        ControlResponse::PortalScreenshot { screenshot } => {
+            println!("{}", screenshot.path);
+            println!(
+                "{}x{} of {}",
+                screenshot.width, screenshot.height, screenshot.url
+            );
+        }
+        ControlResponse::PortalEvaluated { value, .. } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_string())
+            );
         }
         ControlResponse::Error { error } => {
             eprintln!("duetctl: {error}");
@@ -1874,7 +2443,7 @@ mod tests {
     #[test]
     fn resource_inspect_parses_its_id() {
         let id = Uuid::new_v4();
-        let ControlRequest::ResourceInspect { id: parsed_id } = parse_cli_request(&[
+        let ControlRequest::ResourceInspect { id: parsed_id, .. } = parse_cli_request(&[
             "resource".to_string(),
             "inspect".to_string(),
             id.to_string(),
@@ -1931,6 +2500,171 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn portal_commands_parse() {
+        assert!(is_cli_verb("portal") && is_cli_verb("portals"));
+        assert!(matches!(
+            parse_cli_request(&args(&["portal", "list"])).unwrap(),
+            ControlRequest::PortalList { .. }
+        ));
+        for (verb, expected) in [
+            ("inspect", None),
+            ("url", Some("url")),
+            ("title", Some("title")),
+        ] {
+            let ControlRequest::PortalInspect { portal, show, .. } =
+                parse_cli_request(&args(&["portal", verb, "@portal:frontend"])).unwrap()
+            else {
+                panic!("expected PortalInspect");
+            };
+            assert_eq!(portal, "@portal:frontend");
+            assert_eq!(show.as_deref(), expected);
+        }
+        let ControlRequest::PortalNavigate { portal, url, .. } =
+            parse_cli_request(&args(&["portal", "navigate", "frontend", "localhost:3000"]))
+                .unwrap()
+        else {
+            panic!("expected PortalNavigate");
+        };
+        assert_eq!(
+            (portal.as_str(), url.as_str()),
+            ("frontend", "localhost:3000")
+        );
+        for (verb, step) in [
+            ("back", PortalStep::Back),
+            ("forward", PortalStep::Forward),
+            ("reload", PortalStep::Reload),
+        ] {
+            let ControlRequest::PortalStep { step: parsed, .. } =
+                parse_cli_request(&args(&["portal", verb, "@frontend"])).unwrap()
+            else {
+                panic!("expected PortalStep");
+            };
+            assert_eq!(parsed, step);
+        }
+        let ControlRequest::PortalText {
+            selector,
+            html,
+            limit,
+            ..
+        } = parse_cli_request(&args(&[
+            "portal",
+            "text",
+            "@frontend",
+            "--selector",
+            "#status",
+            "--html",
+            "--limit",
+            "500",
+        ]))
+        .unwrap()
+        else {
+            panic!("expected PortalText");
+        };
+        assert_eq!(selector.as_deref(), Some("#status"));
+        assert!(html);
+        assert_eq!(limit, Some(500));
+        assert!(matches!(
+            parse_cli_request(&args(&["portal", "screenshot", "@frontend", "--full"])).unwrap(),
+            ControlRequest::PortalScreenshot {
+                full_page: true,
+                ..
+            }
+        ));
+        let ControlRequest::PortalClick { selector, .. } =
+            parse_cli_request(&args(&["portal", "click", "@frontend", "button.primary"])).unwrap()
+        else {
+            panic!("expected PortalClick");
+        };
+        assert_eq!(selector, "button.primary");
+        let ControlRequest::PortalType {
+            selector,
+            text,
+            append,
+            submit,
+            ..
+        } = parse_cli_request(&args(&[
+            "portal",
+            "type",
+            "@frontend",
+            "#user",
+            "ada lovelace",
+            "--submit",
+        ]))
+        .unwrap()
+        else {
+            panic!("expected PortalType");
+        };
+        assert_eq!(
+            (selector.as_str(), text.as_str()),
+            ("#user", "ada lovelace")
+        );
+        assert!(submit && !append);
+        let ControlRequest::PortalEvaluate { script, .. } = parse_cli_request(&args(&[
+            "portal",
+            "evaluate",
+            "@frontend",
+            "document.title",
+        ]))
+        .unwrap() else {
+            panic!("expected PortalEvaluate");
+        };
+        assert_eq!(script, "document.title");
+
+        // Missing arguments, unknown flags, unquoted extra words and
+        // unknown verbs are refused rather than guessed at.
+        for bad in [
+            &["portal"][..],
+            &["portal", "text"],
+            &["portal", "navigate", "frontend"],
+            &["portal", "click", "frontend"],
+            &["portal", "type", "frontend", "#user"],
+            &["portal", "text", "frontend", "--full"],
+            &["portal", "click", "frontend", "a", "b"],
+            &["portal", "explode", "frontend"],
+        ] {
+            assert!(parse_cli_request(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn portal_requests_are_async_and_round_trip_through_json() {
+        let request = ControlRequest::PortalType {
+            requested_by: Some(Uuid::new_v4()),
+            portal: "@portal:frontend".to_string(),
+            selector: "#q".to_string(),
+            text: "x\ny".to_string(),
+            append: true,
+            submit: false,
+        };
+        assert!(request.is_async());
+        assert!(request.reply_timeout() > REPLY_TIMEOUT);
+        let json = serde_json::to_string(&request).unwrap();
+        let ControlRequest::PortalType { text, append, .. } = serde_json::from_str(&json).unwrap()
+        else {
+            panic!("expected PortalType");
+        };
+        assert_eq!((text.as_str(), append), ("x\ny", true));
+        let list = ControlRequest::PortalList { requested_by: None };
+        assert!(!list.is_async());
+        assert_eq!(list.reply_timeout(), REPLY_TIMEOUT);
+        // `show` is presentation-only and omitted when unset.
+        let inspect = serde_json::to_string(&ControlRequest::PortalInspect {
+            requested_by: None,
+            portal: "x".to_string(),
+            show: None,
+        })
+        .unwrap();
+        assert!(!inspect.contains("show"));
+        let response = ControlResponse::PortalEvaluated {
+            id: Uuid::nil(),
+            value: serde_json::json!({"a": 1}),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["result"], "portal_evaluated");
+        assert_eq!(json["value"]["a"], 1);
     }
 
     #[test]

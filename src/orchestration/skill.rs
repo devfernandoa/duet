@@ -19,7 +19,7 @@ pub const SKILL_NAME: &str = "duet";
 
 const SKILL_MD: &str = r#"---
 name: duet
-description: Use at the very start of every session, before responding to anything else. You are running inside Duet, a multi-agent orchestration workspace, and this skill explains how to find your role and talk to other agents.
+description: Use at the very start of every session, before responding to anything else. You are running inside Duet, a multi-agent orchestration workspace, and this skill explains how to find your role, talk to other agents, and use Duet resources — notes, project files and browser portals — including @references such as @portal:frontend.
 ---
 
 # Duet orchestration
@@ -142,6 +142,47 @@ path-shaped reference without a qualifier, like `@src/auth.rs` or
 6. `duetctl whoami` lists the files and folders the user connected to you on
    the canvas ("connected files") — start from those when a task is vague
    about which code it means.
+
+## Browser portals (@portal:)
+
+A Portal is an embedded browser on the canvas — the app you're building,
+docs, an admin page — that you can drive through Duet. `@portal:frontend`
+names a portal by its name; an unqualified `@frontend` may mean a portal too.
+Duet owns the browser: use only the `duetctl portal` commands below, never
+your own browser automation, and never assume what a page shows.
+
+1. Resolve first: `duetctl resolve @portal:frontend` (or `@frontend`; if it is
+   ambiguous, use the qualified form or the portal id it lists).
+   `duetctl portal list` shows the portals you're connected to and whether
+   you may control them. Every `portal` command accepts the portal's id or
+   the reference itself, e.g. `duetctl portal text @portal:frontend`.
+2. Inspect before acting: `duetctl portal inspect <portal>` (URL, title,
+   loading, history), or just `portal url` / `portal title`.
+3. Read the page as text: `duetctl portal text <portal>` returns the page's
+   readable text; `--selector "<css>"` narrows it to one element, `--html`
+   returns that element's HTML (the DOM) instead. Prefer text — a heading,
+   an error message or a form's state doesn't need a screenshot.
+4. Take a screenshot only when you need to see layout or visuals:
+   `duetctl portal screenshot <portal>` (`--full` for the whole page) prints
+   the path of a PNG Duet saved; open that file with your image-reading tool.
+5. Navigate where you're authorized: `duetctl portal navigate <portal> <url>`
+   (e.g. `localhost:3000`; only http/https), `portal back`, `portal forward`,
+   and `portal reload` after you change the code it serves. Each waits for
+   the page to finish loading.
+6. Interact through Duet only: `duetctl portal click <portal> "<css>"` and
+   `duetctl portal type <portal> "<css>" "<text>"` (replaces the field's value;
+   `--append` to add, `--submit` to submit its form). If an interaction
+   navigates, the command waits for the new page; then read it again.
+7. `duetctl portal evaluate <portal> "<js>"` runs arbitrary JavaScript and is
+   privileged: it is refused unless the user enabled scripts for that portal.
+   Don't ask for it when text/click/type are enough.
+8. Controlling a portal needs a connection to it on the canvas; being in the
+   same workspace isn't enough. A refusal is enforced by Duet — ask the user
+   to connect you rather than working around it.
+
+A typical loop: start the dev server in your terminal, `portal navigate` to
+it, `portal text` to check, `click`/`type` to exercise the UI, edit the
+source, `portal reload`, `portal text` again to verify.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)
@@ -182,6 +223,12 @@ mod tests {
         assert!(content.contains("duetctl file read"));
         assert!(content.contains("duetctl git diff"));
         assert!(content.contains("--revision"));
+        assert!(content.contains("@portal:frontend"));
+        assert!(content.contains("duetctl portal text"));
+        assert!(content.contains("duetctl portal screenshot"));
+        assert!(content.contains("duetctl portal click"));
+        assert!(content.contains("duetctl portal type"));
+        assert!(content.contains("portal reload"));
     }
 
     #[test]

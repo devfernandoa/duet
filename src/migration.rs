@@ -29,7 +29,7 @@
 //!   conversion step — unlike schema 3 -> 4, the on-disk *shape* of a node
 //!   didn't change, only which optional fields a `WorkspaceRecord`/
 //!   `TerminalPayload` may carry.
-//! - 6 (current): purely additive again — Milestone 6's project filesystem
+//! - 6: purely additive again — Milestone 6's project filesystem
 //!   work. `FileTreePayload` gains real view state (`root`, `expanded`,
 //!   `selected`, `show_hidden`, `respect_gitignore`, `show_git_status`),
 //!   `NotePayload` gains an optional `file` backing, and `NodeKind` gains an
@@ -40,6 +40,15 @@
 //!   version still moves so a file that *uses* the new shape is never
 //!   silently half-read by an older binary: that binary sees version 6 and
 //!   takes the future-schema backup path below instead.
+//! - 7 (current): Milestone 8's browser portals. `PortalPayload` (until now
+//!   a placeholder holding only `url`) gains `name`, a required `profile`
+//!   (`model::PortalProfile`, the portal's isolated browser-storage
+//!   identity) and `allow_scripts`. `name`/`allow_scripts` default through
+//!   serde, but a profile id must be *stable* — a random serde default
+//!   would hand the same portal a different cookie jar on every load until
+//!   the next save — so [`migrate_v6_portals`] derives one explicitly and
+//!   deterministically from the node id (UUIDv5) for every pre-7 portal.
+//!   Every other node is untouched.
 //!
 //! A `schema_version` *greater* than [`CURRENT_SCHEMA_VERSION`] means the
 //! file was written by a newer duet. Rather than guess at a shape it has
@@ -60,7 +69,7 @@ use uuid::Uuid;
 
 /// The schema version this binary reads and writes. Bump this and add a
 /// migration step below whenever `Store`'s on-disk shape changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Plain-function form of [`CURRENT_SCHEMA_VERSION`], for serde's
 /// `#[serde(default = "...")]` attribute on `Store::schema_version` (which
@@ -336,6 +345,63 @@ fn backup_future_schema_file(path: &Path, found_version: u32) -> (Store, Option<
     )
 }
 
+/// The deterministic profile id a pre-schema-7 portal is given: the same
+/// node always maps to the same profile, so loading an old store twice
+/// (say, a backup) never splits one portal's browser data in two.
+pub fn migrated_portal_profile_id(node_id: Uuid) -> Uuid {
+    Uuid::new_v5(&node_id, b"duet-portal-profile")
+}
+
+/// Schema 6 -> 7: gives every `Portal` node (in every workspace) the fields
+/// a schema-7 portal requires — a `name` and an isolated, persistent
+/// `profile` with a deterministic id — leaving any field already present,
+/// and every non-portal node, exactly as it was. Works on the raw JSON so
+/// the current `PortalPayload` can require `profile` without a random
+/// serde default.
+fn migrate_v6_portals(store: &mut serde_json::Value) {
+    let Some(workspaces) = store
+        .get_mut("workspaces")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for workspace in workspaces {
+        let Some(nodes) = workspace
+            .get_mut("nodes")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for node in nodes {
+            let node_id = node
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok());
+            let Some(kind) = node
+                .get_mut("kind")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            if kind.get("kind").and_then(serde_json::Value::as_str) != Some("Portal") {
+                continue;
+            }
+            kind.entry("name")
+                .or_insert_with(|| crate::model::DEFAULT_PORTAL_NAME.into());
+            kind.entry("url").or_insert_with(|| "".into());
+            if !kind.contains_key("profile") {
+                let profile_id = node_id
+                    .map(migrated_portal_profile_id)
+                    .unwrap_or_else(Uuid::new_v4);
+                kind.insert(
+                    "profile".to_string(),
+                    serde_json::json!({"id": profile_id, "storage": "persistent"}),
+                );
+            }
+        }
+    }
+}
+
 fn declared_schema_version(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
     obj.get("schema_version")
         .and_then(serde_json::Value::as_u64)
@@ -373,10 +439,15 @@ pub fn load(path: &Path, contents: &str) -> (Store, Option<String>) {
             return backup_future_schema_file(path, version);
         }
         if version >= 4 {
-            // Schemas 4, 5 and 6 share the same nodes/edges shape; 5 and 6
+            // Schemas 4 through 7 share the same nodes/edges shape; 5 and 6
             // only add new fields/variants, every field `#[serde(default)]`,
             // so a schema-4 or -5 file deserializes directly as the current
-            // `Store` with no dedicated conversion step.
+            // `Store` with no dedicated conversion step. 7 additionally
+            // needs every portal's stable profile id filled in first.
+            let mut value = value;
+            if version < 7 {
+                migrate_v6_portals(&mut value);
+            }
             return match serde_json::from_value::<Store>(value) {
                 Ok(store) => (store, None),
                 Err(error) => backup_corrupt_file(path, &error.to_string()),
@@ -556,7 +627,74 @@ mod tests {
         resaved.save(&path).unwrap();
         let (reloaded, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
         assert!(warning.is_none());
-        assert_eq!(reloaded.schema_version, 6);
+        assert_eq!(reloaded.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(reloaded.workspaces[0].nodes, store.workspaces[0].nodes);
+    }
+
+    #[test]
+    fn v6_placeholder_portals_migrate_to_named_portals_with_stable_profiles() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        let contents = r##"{
+            "schema_version": 6,
+            "workspaces": [{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "web",
+                "root_dir": "/home/fernando/web",
+                "nodes": [
+                    {
+                        "id": "00000000-0000-0000-0000-00000000000a",
+                        "position": [5.0, 6.0],
+                        "size": [220.0, 160.0],
+                        "kind": {"kind": "Portal", "url": "http://localhost:3000"}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-00000000000b",
+                        "position": [0.0, 0.0],
+                        "size": [220.0, 160.0],
+                        "kind": {"kind": "Portal", "url": ""}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-00000000000c",
+                        "position": [0.0, 0.0],
+                        "size": [220.0, 160.0],
+                        "kind": {"kind": "Text", "content": "untouched"}
+                    }
+                ],
+                "edges": [],
+                "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
+            }],
+            "active_workspace": "00000000-0000-0000-0000-000000000000"
+        }"##;
+        write(&path, contents);
+        let (store, warning) = load(&path, contents);
+        assert!(warning.is_none(), "{warning:?}");
+        let nodes = &store.workspaces[0].nodes;
+        let first = nodes[0].as_portal().unwrap();
+        assert_eq!(first.name, "Portal");
+        assert_eq!(first.url, "http://localhost:3000");
+        assert_eq!(first.profile.id, migrated_portal_profile_id(nodes[0].id));
+        assert_eq!(
+            first.profile.storage,
+            crate::model::PortalStorage::Persistent
+        );
+        assert!(!first.allow_scripts);
+        assert_eq!(nodes[0].position, (5.0, 6.0));
+        // Each portal gets its own profile: isolation by default.
+        let second = nodes[1].as_portal().unwrap();
+        assert_ne!(first.profile.id, second.profile.id);
+        assert!(matches!(&nodes[2].kind, NodeKind::Text(t) if t.content == "untouched"));
+
+        // Deterministic: loading the same old file again gives the same ids.
+        let (again, _) = load(&path, contents);
+        assert_eq!(again.workspaces[0].nodes, store.workspaces[0].nodes);
+
+        // Saved as 7 and reloaded unchanged (no second migration).
+        let resaved = Store::new(store.workspaces.clone(), store.active_workspace, Vec::new());
+        resaved.save(&path).unwrap();
+        let (reloaded, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
+        assert!(warning.is_none());
+        assert_eq!(reloaded.schema_version, 7);
         assert_eq!(reloaded.workspaces[0].nodes, store.workspaces[0].nodes);
     }
 
