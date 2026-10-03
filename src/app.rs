@@ -28,8 +28,10 @@
 //! problem, not this one's.
 
 mod files;
+mod portals;
 
 pub use files::install_canvas_drop;
+pub use portals::PortalStep;
 
 use crate::account::AccountStore;
 use crate::agent::{Agent, Launch, LaunchRequest, with_session_env};
@@ -46,7 +48,9 @@ use crate::model::{
 };
 use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
 use crate::node_files::{EditorNode, FileTreeNode};
+use crate::node_portal::PortalNode;
 use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
+use crate::portal_runtime::PortalRuntime;
 use crate::role::Role;
 use crate::runtime::{AgentActivity, SessionRuntime};
 use crate::store::{CanvasRecord, Store, WorkspaceRecord};
@@ -114,8 +118,9 @@ pub enum NodeWidget {
     Text(TextNode),
     FileTree(FileTreeNode),
     Editor(EditorNode),
-    /// `Portal`/`Drawing`/`Group` all render as the same placeholder today
-    /// — see `model.rs`'s doc comment for why.
+    Portal(PortalNode),
+    /// `Drawing`/`Group` both render as the same placeholder today — see
+    /// `model.rs`'s doc comment for why.
     Placeholder(PlaceholderNode),
 }
 
@@ -127,6 +132,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => &node.container,
             NodeWidget::FileTree(node) => &node.container,
             NodeWidget::Editor(node) => &node.container,
+            NodeWidget::Portal(node) => &node.container,
             NodeWidget::Placeholder(node) => &node.container,
         }
     }
@@ -138,6 +144,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => &node.drag_handle,
             NodeWidget::FileTree(node) => &node.drag_handle,
             NodeWidget::Editor(node) => &node.drag_handle,
+            NodeWidget::Portal(node) => &node.drag_handle,
             NodeWidget::Placeholder(node) => &node.drag_handle,
         }
     }
@@ -149,6 +156,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => &node.resize_handle,
             NodeWidget::FileTree(node) => &node.resize_handle,
             NodeWidget::Editor(node) => &node.resize_handle,
+            NodeWidget::Portal(node) => &node.resize_handle,
             NodeWidget::Placeholder(node) => &node.resize_handle,
         }
     }
@@ -160,6 +168,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => &node.close_button,
             NodeWidget::FileTree(node) => &node.close_button,
             NodeWidget::Editor(node) => &node.close_button,
+            NodeWidget::Portal(node) => &node.close_button,
             NodeWidget::Placeholder(node) => &node.close_button,
         }
     }
@@ -174,6 +183,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => node.text_view.clone().upcast(),
             NodeWidget::FileTree(node) => node.container.clone().upcast(),
             NodeWidget::Editor(node) => node.container.clone().upcast(),
+            NodeWidget::Portal(node) => node.container.clone().upcast(),
             NodeWidget::Placeholder(node) => node.container.clone().upcast(),
         }
     }
@@ -197,6 +207,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => node.collapse.set_card_size(width, height),
             NodeWidget::FileTree(node) => node.collapse.set_card_size(width, height),
             NodeWidget::Editor(node) => node.collapse.set_card_size(width, height),
+            NodeWidget::Portal(node) => node.collapse.set_card_size(width, height),
             NodeWidget::Placeholder(node) => node.collapse.set_card_size(width, height),
         }
     }
@@ -215,6 +226,7 @@ impl NodeWidget {
             NodeWidget::Text(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::FileTree(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Editor(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::Portal(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Placeholder(node) => node.collapse.set_collapsed(collapsed),
         }
     }
@@ -379,6 +391,16 @@ pub struct App {
     /// Counts `sync_project_files` calls, so slower work (FileTree
     /// refreshes) can run every few ticks.
     sync_tick: u32,
+    /// Every live Portal's WebKit view and every profile's network session
+    /// (Milestone 8) — like `runtime`, independent of which workspace is on
+    /// screen. Never persisted.
+    pub portals: PortalRuntime,
+    /// Per-terminal dev-server URL detection state (see
+    /// `orchestration::portal::DevUrlScanner`). Runtime-only.
+    pub dev_urls: HashMap<Uuid, orchestration::portal::DevUrlScanner>,
+    /// Newly detected dev-server URLs waiting to be offered to the user
+    /// (`App::offer_dev_server_urls`), with the terminal that printed them.
+    pub pending_dev_urls: Vec<(Uuid, String)>,
     /// Where card menus and other in-canvas actions report to the user.
     /// A detached overlay until `main.rs` hands over the window's real one
     /// (`set_toast_overlay`), so tests and headless paths can still toast.
@@ -389,6 +411,7 @@ impl App {
     pub fn new(accounts: AccountStore, store_path: PathBuf) -> Rc<RefCell<App>> {
         Rc::new(RefCell::new(App {
             accounts,
+            portals: PortalRuntime::new(portal_data_dir(&store_path)),
             store_path,
             canvas: Canvas::new(),
             // Overwritten by `restore` if the store already has workspaces;
@@ -421,6 +444,8 @@ impl App {
             file_sync: HashMap::new(),
             tree_state: HashMap::new(),
             sync_tick: 0,
+            dev_urls: HashMap::new(),
+            pending_dev_urls: Vec::new(),
             toast_overlay: adw::ToastOverlay::new(),
         }))
     }
@@ -722,6 +747,16 @@ impl App {
         for (id, env) in terminals {
             environment::terminate(&mut app.borrow_mut().runtime, id, env);
         }
+        let portals: Vec<Uuid> = app
+            .borrow()
+            .nodes
+            .iter()
+            .filter(|(_, entry)| entry.record.as_portal().is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in portals {
+            app.borrow_mut().portals.remove(id);
+        }
         App::detach_active_workspace(app);
     }
 
@@ -926,21 +961,34 @@ impl App {
         if app.borrow().workspace_id == id {
             anyhow::bail!("switch away from a workspace before unloading it");
         }
-        let terminals: Vec<(Uuid, EnvironmentKind)> = {
+        let (terminals, portals): (Vec<(Uuid, EnvironmentKind)>, Vec<Uuid>) = {
             let app_ref = app.borrow();
             let workspace = app_ref
                 .inactive_workspaces
                 .iter()
                 .find(|w| w.id == id)
                 .context("workspace not found")?;
-            workspace
-                .nodes
-                .iter()
-                .filter_map(|node| node.as_terminal().map(|t| (node.id, t.environment)))
-                .collect()
+            (
+                workspace
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.as_terminal().map(|t| (node.id, t.environment)))
+                    .collect(),
+                workspace
+                    .nodes
+                    .iter()
+                    .filter(|node| node.as_portal().is_some())
+                    .map(|node| node.id)
+                    .collect(),
+            )
         };
         for (node_id, env) in terminals {
             environment::terminate(&mut app.borrow_mut().runtime, node_id, env);
+        }
+        // A background portal's page is runtime too (Milestone 8); its
+        // profile's stored data is not, and stays.
+        for node_id in portals {
+            app.borrow_mut().portals.remove(node_id);
         }
         Ok(())
     }
@@ -960,7 +1008,7 @@ impl App {
         let any_alive = workspace
             .nodes
             .iter()
-            .any(|node| self.runtime.is_alive(node.id));
+            .any(|node| self.runtime.is_alive(node.id) || self.portals.is_live(node.id));
         if any_alive {
             WorkspaceRuntimeState::Background
         } else {
@@ -1001,6 +1049,12 @@ impl App {
             let chunks = self.runtime.try_recv_output(id);
             for chunk in &chunks {
                 node.feed(chunk);
+            }
+            let scanner = self.dev_urls.entry(id).or_default();
+            for chunk in &chunks {
+                for url in scanner.feed(chunk) {
+                    self.pending_dev_urls.push((id, url));
+                }
             }
             if !entry.exit_shown {
                 // Section 10: show the agent's current activity on its own
@@ -1199,6 +1253,7 @@ impl App {
     pub fn inspect_resource(
         &self,
         id: Uuid,
+        requested_by: Option<Uuid>,
     ) -> Result<
         (
             orchestration::resource::ResolvedResource,
@@ -1235,6 +1290,13 @@ impl App {
                         .find(|note| note.id == id)
                         .map(orchestration::resource::ResourceDetail::Note)
                         .ok_or_else(|| format!("no note with id {id}"))?,
+                    // A portal's name is basic metadata; the page it shows
+                    // is not (its URL is only filled in for a requester
+                    // holding `ControlPortal`).
+                    orchestration::ResourceKind::Portal => self
+                        .portal_summary_for(id, requested_by)
+                        .map(orchestration::resource::ResourceDetail::Portal)
+                        .ok_or_else(|| format!("no portal with id {id}"))?,
                     // A bare id only ever matches node resources; a project
                     // path's derived id isn't reversible (inspect files with
                     // `duetctl file inspect <path>` instead).
@@ -1844,7 +1906,8 @@ impl App {
     /// Two `Terminal` nodes get `SendMessages` by default; a `Terminal` and
     /// a `Note` get both `ReadNote` and `WriteNote`; a `Terminal` and an
     /// `Editor`/`FileTree` get `ShareContext` (the file shows up in the
-    /// agent's `whoami`); a `Note` and a `Note`
+    /// agent's `whoami`); a `Terminal` and a `Portal` get `ControlPortal`
+    /// (the agent may drive that browser — Milestone 8); a `Note` and a `Note`
     /// get neither (there's no agent on either side for a capability to be
     /// granted *to* — the edge is still recorded and discoverable via
     /// `App::note_connections`, just visual/structural rather than
@@ -1903,6 +1966,14 @@ impl App {
                 // A file or folder handed to an agent: it shows up in the
                 // agent's `duetctl whoami` as context to start from.
                 edge.capabilities.insert(EdgeCapability::ShareContext);
+            } else if let (Some(a), Some(b)) = (app.nodes.get(&source), app.nodes.get(&target))
+                && let Some(capability) =
+                    portals::default_portal_capability(&a.record.kind, &b.record.kind)
+            {
+                // An agent connected to a portal may drive it (Milestone 8).
+                // Being in the same workspace without this edge grants
+                // nothing.
+                edge.capabilities.insert(capability);
             }
             app.edges.push(edge.clone());
             app.undo_stack.push(CanvasCommand::AddEdge { edge });
@@ -2455,6 +2526,7 @@ impl App {
             }
             app_mut.selected.remove(&id);
             files::forget_node(&mut app_mut, id);
+            portals::forget_node(&mut app_mut, id);
             app_mut.refresh_link_highlight();
             (canvas, removed)
         };
@@ -3302,6 +3374,11 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
                 "Stop process".to_string(),
                 Box::new(move || on_this_card(&app_c, id, App::terminate_selected_terminals)),
             ));
+            let open_in_portal = portals::terminal_portal_menu_items(app, id);
+            if !open_in_portal.is_empty() {
+                items.push(separator());
+                items.extend(open_in_portal);
+            }
             items
         }
         NodeKind::Note(note) => {
@@ -3324,9 +3401,8 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
         }
         NodeKind::Editor(_) => files::editor_menu_items(app, id),
         NodeKind::FileTree(_) => files::tree_menu_items(app, id),
-        NodeKind::Text(_) | NodeKind::Portal(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => {
-            Vec::new()
-        }
+        NodeKind::Portal(_) => portals::portal_menu_items(app, id),
+        NodeKind::Text(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => Vec::new(),
     };
     items.push(separator());
     let app_c = Rc::clone(app);
@@ -3453,6 +3529,9 @@ fn duplicate_records(records: &[NodeRecord]) -> Vec<NodeRecord> {
             // just manufacture sync conflicts.
             if let NodeKind::Note(note) = &mut copy.kind {
                 note.file = None;
+            }
+            if let NodeKind::Portal(portal) = &mut copy.kind {
+                portals::isolate_duplicate(portal);
             }
             copy
         })
@@ -3947,9 +4026,11 @@ fn materialize_node(
         NodeKind::Editor(payload) => {
             files::materialize_editor(app, id, payload, record.collapsed, toast_overlay)
         }
-        NodeKind::Portal(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => {
+        NodeKind::Portal(payload) => {
+            portals::materialize_portal(app, id, payload, record.collapsed, toast_overlay)?
+        }
+        NodeKind::Drawing(_) | NodeKind::Group(_) => {
             let detail = match &record.kind {
-                NodeKind::Portal(payload) if !payload.url.is_empty() => payload.url.clone(),
                 NodeKind::Group(payload) if !payload.label.is_empty() => payload.label.clone(),
                 _ => "Not implemented yet".to_string(),
             };
@@ -4244,14 +4325,22 @@ fn build_terminal_record(
     })
 }
 
-/// The three placeholder node kinds `main.rs`'s "New node" picker offers
+/// Where portal profiles and screenshots live: next to the store file
+/// (Duet's data directory in normal use, a temp dir in tests), so a test's
+/// browser data never touches the user's.
+fn portal_data_dir(store_path: &Path) -> PathBuf {
+    store_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The placeholder node kinds `main.rs`'s "New node" picker offers
 /// (FileTree stopped being a placeholder in Milestone 6 — see
-/// `App::create_file_tree`),
-/// each with an empty default payload — real content (a file-tree root, a
-/// portal URL, ...) is a later milestone's job to fill in.
+/// `App::create_file_tree` — and Portal in Milestone 8 — see
+/// `App::create_portal`), each with an empty default payload.
 pub fn placeholder_kind(label: &str) -> Option<NodeKind> {
     match label {
-        "Portal" => Some(NodeKind::Portal(Default::default())),
         "Drawing" => Some(NodeKind::Drawing(Default::default())),
         "Group" => Some(NodeKind::Group(GroupPayload::default())),
         _ => None,
@@ -4577,7 +4666,7 @@ mod tests {
         assert_eq!(resource.id, backend_id);
         assert_eq!(resource.kind, orchestration::ResourceKind::Agent);
 
-        let error = app.borrow().inspect_resource(backend_id).unwrap_err();
+        let error = app.borrow().inspect_resource(backend_id, None).unwrap_err();
         assert!(error.contains("isn't currently active"), "{error}");
     }
 

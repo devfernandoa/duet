@@ -72,6 +72,9 @@ fn build_ui(application: &adw::Application) {
         move || {
             app.borrow_mut().pump_output();
             App::pump_inboxes(&app);
+            // Dev-server URLs `pump_output` just spotted in terminal output
+            // are offered (a toast with "Open in Portal"), never opened.
+            App::offer_dev_server_urls(&app);
             app.borrow().canvas.links_area.queue_draw();
             glib::ControlFlow::Continue
         }
@@ -251,6 +254,15 @@ fn build_ui(application: &adw::Application) {
                     }
                 }),
             ));
+            let (app_c, toast_c) = (app.clone(), toast_overlay.clone());
+            items.push((
+                "New browser portal".to_string(),
+                Box::new(move || {
+                    if let Err(error) = App::create_portal(&app_c, None, "", world) {
+                        toast_c.add_toast(adw::Toast::new(&error));
+                    }
+                }),
+            ));
             app::popup_menu(&canvas_menu, items);
         }
     });
@@ -299,8 +311,7 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         move || {
             while let Ok(event) = control_rx.try_recv() {
-                let response = control::handle_request(&app, event.request);
-                let _ = event.respond.send(response);
+                control::dispatch(&app, event);
             }
             glib::ControlFlow::Continue
         }
@@ -513,7 +524,7 @@ fn wire_canvas_edit_actions(
     toast_overlay: &adw::ToastOverlay,
     edit_menu_button: &gtk4::MenuButton,
 ) {
-    // `new-text-node`, `new-file-tree` and the three placeholder-kind creators, which need a
+    // `new-text-node`, `new-file-tree`, `new-portal` and the two placeholder-kind creators, which need a
     // spawn position, and `toggle-snap-to-grid`, which needs a toast
     // describing its new state, are registered separately below instead of
     // forced into this shape.
@@ -768,7 +779,26 @@ fn wire_canvas_edit_actions(
         Some("app.new-file-tree"),
     ));
 
-    for kind_label in ["Portal", "Drawing", "Group"] {
+    let portal_action = gtk4::gio::SimpleAction::new("new-portal", None);
+    portal_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| {
+            if let Err(error) =
+                App::create_portal(&app, None, "", viewport_center_world(&app, &window))
+            {
+                toast_overlay.add_toast(adw::Toast::new(&error));
+            }
+        }
+    });
+    application.add_action(&portal_action);
+    create_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("New Browser Portal"),
+        Some("app.new-portal"),
+    ));
+
+    for kind_label in ["Drawing", "Group"] {
         let action_name = format!(
             "new-placeholder-{}",
             kind_label.to_lowercase().replace(' ', "-")

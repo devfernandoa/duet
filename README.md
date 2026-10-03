@@ -4,29 +4,31 @@ A GTK4/libadwaita desktop app for running multiple AI coding agents side by
 side on an infinite, pannable/zoomable canvas — and having them talk to each
 other. Each agent (Claude Code, Codex, OpenCode, a plain shell, or a custom
 command) runs in a real PTY inside its own card; notes, plain-text labels,
-and a handful of placeholder node kinds share the same canvas. Connect two
+file trees, editors, embedded browser portals and a couple of placeholder
+node kinds share the same canvas. Connect two
 agent cards and they can message each other with `duetctl`, duet's local
 control CLI — the same service layer the GUI itself calls, so nothing an
 agent can do is a GUI-only trick.
 
-Milestones 0 through 3 (stabilization, the generic canvas, persistent
-workspaces, and agent orchestration) are done; floors, scores, the file tree,
-browser portals, and the prompt composer are not yet — see
+Milestones 0 through 6 and 8 (stabilization, the generic canvas, persistent
+workspaces, agent orchestration, agent-writable notes, `@` resource
+addressing, the project file tree/editor/Git, and browser portals) are done;
+terminal/chat views, floors and scores are not yet — see
 [Known limitations](#known-limitations) below for the current gaps.
 
 ## Build
 
 Requires the GTK4 desktop stack: `gtk4`, `libadwaita`, `vte4` (the GTK4
-terminal-widget library) and `gtksourceview5` (the embedded editor) as
-system packages, plus `git` (and optionally `ripgrep`, for faster content
-search) at runtime. On Arch:
+terminal-widget library), `gtksourceview5` (the embedded editor) and
+WebKitGTK 6.0 (browser portals) as system packages, plus `git` (and
+optionally `ripgrep`, for faster content search) at runtime. On Arch:
 
 ```sh
-sudo pacman -S gtk4 libadwaita vte4 gtksourceview5
+sudo pacman -S gtk4 libadwaita vte4 gtksourceview5 webkitgtk-6.0
 ```
 
 (Debian/Ubuntu: `libgtk-4-dev`, `libadwaita-1-dev`, `libvte-2.91-gtk4-dev`,
-`libgtksourceview-5-dev`.)
+`libgtksourceview-5-dev`, `libwebkitgtk-6.0-dev`.)
 
 ```sh
 # Installs both binaries this crate builds: `duet` (the GUI) and `duetctl`
@@ -62,9 +64,9 @@ a direct child of it.
 
 Every object on the canvas — a terminal, a note, a plain-text label — is a
 persisted node with a stable id, position, size, z-order, collapsed/locked
-state, and (for terminals) an assigned role. `Portal`, `Drawing`, and
-`Group` exist as placeholder node kinds today (creatable from the edit
-menu's Create section) ahead of the milestones that give them real behavior.
+state, and (for terminals) an assigned role. `Drawing` and `Group` exist as
+placeholder node kinds today (creatable from the edit menu's Create section)
+ahead of the milestones that give them real behavior.
 
 Every card works the same way:
 
@@ -202,6 +204,40 @@ opens in a GtkSourceView editor (Ctrl+S save, Ctrl+F/H find/replace, Ctrl+G
 go to line). Dragging a file from the tree — or from a file manager — onto
 the canvas opens it there.
 
+### Browser portals (`duetctl portal`)
+
+A **Portal** (right-click the canvas → New browser portal, or Edit menu →
+New Browser Portal) is an embedded WebKit browser with back/forward/reload,
+a URL field and "open in your default browser". Each portal has a name
+(double-click the title to rename) — agents address it as `@portal:<name>`,
+or `@<name>` when that's unambiguous — and its own isolated browser profile
+(cookies, storage, cache), so two portals never share a login unless you
+want them to. Its page keeps running when you switch workspaces, like a
+terminal does.
+
+An agent can drive a portal only when it's connected to it on the canvas
+(the connection grants `ControlPortal`); being in the same workspace isn't
+enough. Running arbitrary JavaScript is a separate, per-portal opt-in (card
+menu → "Allow agents to run JavaScript").
+
+```sh
+duetctl portal list                                # portals you're connected to
+duetctl portal inspect|url|title <portal>          # <portal>: id, @portal:name, @name or name
+duetctl portal navigate <portal> localhost:3000    # waits for the page to load
+duetctl portal back|forward|reload <portal>
+duetctl portal text <portal> [--selector <css>] [--html] [--limit N]
+duetctl portal screenshot <portal> [--full]        # prints the PNG's path
+duetctl portal click <portal> "<css>"
+duetctl portal type <portal> "<css>" "<text>" [--append] [--submit]
+duetctl portal evaluate <portal> "<js>"            # privileged: needs the portal's opt-in
+```
+
+When a terminal prints a local dev-server URL (`http://localhost:3000`,
+`http://127.0.0.1:5173/`, ...), duet offers it in a toast — "Open in Portal"
+navigates the portal that terminal controls, or creates a connected one next
+to it. Nothing is ever opened without that click; the terminal's card menu
+lists the URLs it has printed, too.
+
 A message delivered to an agent is queued, delivered in order (never two
 messages interleaved mid-delivery to the same agent), and arrives as
 ordinary terminal input prefixed `[duet message from <sender>]:` — the
@@ -275,7 +311,7 @@ conversation the way they used to.
 | Per-card close button | Remove this card (kills the process, for a terminal) |
 | Right-click a card's title bar | The card's menu (rename, connect, collapse, lock, duplicate, delete, ...) |
 | Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
-| Right-click empty canvas | New terminal / note / text / file tree at that spot |
+| Right-click empty canvas | New terminal / note / text / file tree / browser portal at that spot |
 | Wheel on empty canvas, `Ctrl+wheel` anywhere, pinch | Zoom around the pointer |
 | Two-finger scroll, drag on empty canvas | Pan |
 
@@ -291,6 +327,9 @@ from.
   `CLAUDE_CONFIG_DIR` each).
 - Codex per-terminal isolation: `$XDG_DATA_HOME/duet/codex/<terminal-id>/`
   (one `CODEX_HOME` each); shared login: `$XDG_DATA_HOME/duet/codex-auth/default/auth.json`.
+- Browser portal profiles: `$XDG_DATA_HOME/duet/portal-profiles/<profile-id>/`
+  (owner-only); screenshots: `$XDG_DATA_HOME/duet/portal-screenshots/<portal-id>/`
+  (the newest 20 per portal are kept).
 - Control socket: `$XDG_RUNTIME_DIR/duet/control.sock` (falls back to the
   data dir if no runtime dir is available).
 
@@ -299,16 +338,19 @@ from.
 
 ## Known limitations
 
-- `Portal`, `Drawing`, and `Group` are placeholder node kinds only — no
-  embedded browser, freehand drawing, or containment semantics yet.
+- `Drawing` and `Group` are placeholder node kinds only — no freehand
+  drawing or containment semantics yet.
+- Portal profiles are always persistent and isolated per portal; an
+  ephemeral profile is representable (`PortalStorage::Ephemeral`) but has no
+  UI to choose it yet.
 - Projects are local only: `ProjectFilesystem` has a single, local
   implementation until SSH/Docker environments arrive. The editor has no
   tabs or split view.
-- `ReadNote`, `WriteNote`, `ControlPortal`, and `ShareContext` edge
-  capabilities are representable but not enforced by anything yet, since
-  the features they'd gate don't exist.
-- No prompt composer or `@`-mention resolution yet — messaging is
-  `duetctl send` only.
+- Edge capabilities are granted by the connect gesture's defaults
+  (`SendMessages`, `ReadNote`+`WriteNote`, `ShareContext`, `ControlPortal`
+  depending on the two cards' kinds); there's no UI to edit them yet.
+- No graphical prompt composer — `@` references are resolved by agents
+  through `duetctl resolve` and the `duet` skill.
 - No floors (git-isolated parallel work), reusable arrangements ("Scores"),
   or cross-workspace search yet.
 

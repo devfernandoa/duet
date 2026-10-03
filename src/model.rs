@@ -7,13 +7,15 @@
 //! (`store.rs`) and migrated by `migration.rs`.
 //!
 //! This module intentionally does not implement orchestration permission
-//! behavior for edge capabilities, portal/drawing functionality, or group
+//! behavior for edge capabilities, drawing functionality, or group
 //! containment — those are later milestones. The payload types here exist
 //! so the model is genuinely generic now, not because their owning features
 //! are built. (`FileTree`, `Editor` and file-backed `Note`s became real in
 //! Milestone 6 — their payloads hold only persisted *view* state and
 //! project-relative paths; file contents, Git status and live watchers are
-//! runtime state owned by `app`/`project`, never serialized here.)
+//! runtime state owned by `app`/`project`, never serialized here. `Portal`
+//! became real in Milestone 8 the same way: name, URL and storage profile
+//! only, never the WebKit view.)
 
 use crate::agent::Agent;
 use crate::project::git::DiffScope;
@@ -209,10 +211,84 @@ pub struct EditorPayload {
     pub diff: Option<DiffScope>,
 }
 
-/// Placeholder for Milestone 8's browser portal node.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// A browser Portal (Milestone 8): an embedded WebKit view that is also an
+/// addressable Duet resource (`@portal:frontend`). Only domain state is
+/// persisted — which page it shows, what it is called, which storage
+/// profile it uses and whether agents may run arbitrary scripts in it. The
+/// `WebView`, its network session, history and page content are runtime
+/// state owned by `portal_runtime`, never serialized here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortalPayload {
+    /// Human-readable name ("Frontend", "Docs") — an alias for resolution,
+    /// never an identity (the node id is). Defaults to "Portal" for a
+    /// placeholder saved before Milestone 8 (see `migration.rs`, v6 -> v7).
+    #[serde(default = "default_portal_name")]
+    pub name: String,
+    /// The last committed URL, restored on load. Empty means a blank page.
+    #[serde(default)]
     pub url: String,
+    /// Which browser storage (cookies, local storage, cache) this portal
+    /// uses. Required from schema 7 on; the v6 -> v7 migration derives one
+    /// per pre-existing portal.
+    pub profile: PortalProfile,
+    /// Whether a connected agent may run *arbitrary* JavaScript in this
+    /// portal (`duetctl portal evaluate`). Off by default: `ControlPortal`
+    /// alone covers navigation, reading and selector-based click/type,
+    /// while arbitrary script evaluation is the privileged extra the user
+    /// opts into per portal.
+    #[serde(default)]
+    pub allow_scripts: bool,
+}
+
+pub const DEFAULT_PORTAL_NAME: &str = "Portal";
+
+fn default_portal_name() -> String {
+    DEFAULT_PORTAL_NAME.to_string()
+}
+
+impl PortalPayload {
+    /// A fresh portal with its own, new, isolated persistent profile —
+    /// what every newly created (or duplicated) portal gets.
+    pub fn new(name: &str, url: &str) -> PortalPayload {
+        PortalPayload {
+            name: name.to_string(),
+            url: url.to_string(),
+            profile: PortalProfile::isolated(),
+            allow_scripts: false,
+        }
+    }
+}
+
+/// A portal's browser storage identity, kept separate from the WebKit
+/// widget: two portals only ever share cookies/local storage if they name
+/// the same profile id, which nothing does by default (isolation is the
+/// default). The storage directory is derived from `id` at runtime (see
+/// `orchestration::portal::profile_dirs`), never stored as a path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortalProfile {
+    pub id: Uuid,
+    #[serde(default)]
+    pub storage: PortalStorage,
+}
+
+impl PortalProfile {
+    pub fn isolated() -> PortalProfile {
+        PortalProfile {
+            id: Uuid::new_v4(),
+            storage: PortalStorage::Persistent,
+        }
+    }
+}
+
+/// Whether a profile's browser data survives a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalStorage {
+    /// Kept on disk under Duet's data directory, one directory per profile.
+    #[default]
+    Persistent,
+    /// In memory only; gone when Duet exits.
+    Ephemeral,
 }
 
 /// Placeholder for a future freehand drawing node. No strokes yet.
@@ -320,6 +396,20 @@ impl NodeRecord {
     pub fn as_note_mut(&mut self) -> Option<&mut NotePayload> {
         match &mut self.kind {
             NodeKind::Note(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    pub fn as_portal(&self) -> Option<&PortalPayload> {
+        match &self.kind {
+            NodeKind::Portal(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    pub fn as_portal_mut(&mut self) -> Option<&mut PortalPayload> {
+        match &mut self.kind {
+            NodeKind::Portal(payload) => Some(payload),
             _ => None,
         }
     }
@@ -501,6 +591,19 @@ mod tests {
         })
         .unwrap();
         assert!(!internal.contains("file"));
+    }
+
+    #[test]
+    fn portal_payload_round_trips_and_new_portals_get_their_own_profile() {
+        let a = PortalPayload::new("Frontend", "http://localhost:3000/");
+        let b = PortalPayload::new("Frontend", "http://localhost:3000/");
+        assert_ne!(a.profile.id, b.profile.id);
+        assert_eq!(a.profile.storage, PortalStorage::Persistent);
+        assert!(!a.allow_scripts);
+        let kind = NodeKind::Portal(a);
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(json.contains("\"storage\":\"persistent\""));
+        assert_eq!(serde_json::from_str::<NodeKind>(&json).unwrap(), kind);
     }
 
     #[test]

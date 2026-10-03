@@ -19,14 +19,16 @@
 //! traversal at parse time; `LocalProject` rejects symlink escapes).
 //! `ResourceKind` is deliberately a plain enum with one match per kind
 //! inside this module, not a `dyn` provider registry — the one place this
-//! crate is allowed to know about every resource kind at once. Adding
-//! `Portal`/`Floor`/`Workspace` later still means a variant and a match arm.
+//! crate is allowed to know about every resource kind at once. `Portal`
+//! (Milestone 8) was added exactly that way: a variant, a candidate
+//! function over `Portal` nodes' names, and one more entry in the kinds an
+//! unqualified `@name` searches; `Floor`/`Workspace` will follow suit.
 //!
 //! File references accept an optional selection suffix,
 //! `@file:src/auth.rs#L10-20`, and an *unqualified* reference that is
 //! recognizably path-shaped (`@src/auth.rs`, `@README.md` — see
 //! [`is_path_like`]) is also tried as a file. A plain word never is: `@auth`
-//! only ever searches agents and notes.
+//! only ever searches agents, notes and portals.
 
 use super::identity::agent_identities;
 use super::notes::note_title;
@@ -50,6 +52,8 @@ pub enum ResourceKind {
     /// The uncommitted Git changes (working tree vs `HEAD`) of a file,
     /// directory, or — as `@diff:.` — the whole project.
     Diff,
+    /// A browser Portal node (Milestone 8), by its name.
+    Portal,
 }
 
 impl ResourceKind {
@@ -61,6 +65,7 @@ impl ResourceKind {
             "note" => Some(ResourceKind::Note),
             "file" => Some(ResourceKind::File),
             "diff" => Some(ResourceKind::Diff),
+            "portal" => Some(ResourceKind::Portal),
             _ => None,
         }
     }
@@ -71,6 +76,7 @@ impl ResourceKind {
             ResourceKind::Note => "note",
             ResourceKind::File => "file",
             ResourceKind::Diff => "diff",
+            ResourceKind::Portal => "portal",
         }
     }
 
@@ -133,7 +139,9 @@ impl ResourceRef {
         match body.split_once(':') {
             Some((kind, name)) => {
                 let kind = ResourceKind::parse(kind).ok_or_else(|| {
-                    format!("unknown resource kind '{kind}' (expected agent, note, file or diff)")
+                    format!(
+                        "unknown resource kind '{kind}' (expected agent, note, file, diff or portal)"
+                    )
                 })?;
                 if name.is_empty() {
                     return Err(format!("'@{}:' needs a name after the colon", kind.label()));
@@ -276,6 +284,7 @@ pub struct ResolveContext {
 pub enum ResourceDetail {
     Agent(crate::message::AgentInfo),
     Note(crate::message::NoteSummary),
+    Portal(crate::message::PortalSummary),
 }
 
 fn agent_candidates(view: &WorkspaceView, roles: &[Role]) -> Vec<ResolvedResource> {
@@ -313,6 +322,25 @@ fn note_candidates(view: &WorkspaceView) -> Vec<ResolvedResource> {
         .collect()
 }
 
+fn portal_candidates(view: &WorkspaceView) -> Vec<ResolvedResource> {
+    view.nodes
+        .iter()
+        .filter_map(|node| {
+            let portal = node.as_portal()?;
+            Some(ResolvedResource {
+                kind: ResourceKind::Portal,
+                id: node.id,
+                name: portal.name.clone(),
+                workspace_id: view.id,
+                workspace_name: view.name.clone(),
+                floor: node.floor,
+                path: None,
+                lines: None,
+            })
+        })
+        .collect()
+}
+
 fn candidates_for_kind(
     kind: ResourceKind,
     view: &WorkspaceView,
@@ -321,12 +349,17 @@ fn candidates_for_kind(
     match kind {
         ResourceKind::Agent => agent_candidates(view, roles),
         ResourceKind::Note => note_candidates(view),
+        ResourceKind::Portal => portal_candidates(view),
         // Project kinds don't come from node records; see `project_candidate`.
         ResourceKind::File | ResourceKind::Diff => Vec::new(),
     }
 }
 
-const NODE_KINDS: [ResourceKind; 2] = [ResourceKind::Agent, ResourceKind::Note];
+const NODE_KINDS: [ResourceKind; 3] = [
+    ResourceKind::Agent,
+    ResourceKind::Note,
+    ResourceKind::Portal,
+];
 
 /// The `File`/`Diff` candidate `reference` names in `scope`, if any. A file
 /// must exist; a diff must name the project root, an existing path, or a
@@ -346,7 +379,7 @@ fn project_candidate(
                     .status()
                     .is_ok_and(|status| status.has_changes_under(&path))
         }
-        ResourceKind::Agent | ResourceKind::Note => false,
+        ResourceKind::Agent | ResourceKind::Note | ResourceKind::Portal => false,
     };
     exists.then(|| ResolvedResource {
         kind,
@@ -509,6 +542,106 @@ mod tests {
                 file: None,
             }),
         }
+    }
+
+    fn portal_node(name: &str, floor: FloorRef) -> NodeRecord {
+        NodeRecord {
+            id: Uuid::new_v4(),
+            floor,
+            position: (0.0, 0.0),
+            size: (1.0, 1.0),
+            z_order: 0,
+            collapsed: false,
+            locked: false,
+            kind: NodeKind::Portal(crate::model::PortalPayload::new(name, "")),
+        }
+    }
+
+    #[test]
+    fn portals_resolve_qualified_unqualified_and_report_ambiguity_like_other_kinds() {
+        let frontend = portal_node("Frontend", FloorRef::Ground);
+        let docs = portal_node("Docs", FloorRef::Ground);
+        let admin_agent = agent_node("Admin", FloorRef::Ground);
+        let admin_portal = portal_node("Admin", FloorRef::Ground);
+        let views = vec![workspace(
+            Uuid::new_v4(),
+            "main",
+            vec![
+                frontend.clone(),
+                docs,
+                admin_agent.clone(),
+                admin_portal.clone(),
+            ],
+        )];
+        let resolve_ref = |raw: &str| resolve(&ResourceRef::parse(raw).unwrap(), &views, &[], None);
+
+        // Qualified and (uniquely resolvable) unqualified forms.
+        for raw in ["@portal:frontend", "@frontend", "@PORTAL:Frontend"] {
+            let ResolveOutcome::Found { resource } = resolve_ref(raw) else {
+                panic!("{raw}: expected Found");
+            };
+            assert_eq!(resource.kind, ResourceKind::Portal);
+            assert_eq!(resource.id, frontend.id);
+            assert_eq!(resource.reference(), format!("@portal:{}", frontend.id));
+        }
+        // By stable id, too.
+        assert!(matches!(
+            resolve_ref(&format!("@{}", frontend.id)),
+            ResolveOutcome::Found { .. }
+        ));
+        // A name shared with an agent is ambiguous unqualified, exactly as
+        // agent/note collisions are; qualifying picks one.
+        let ResolveOutcome::Ambiguous { candidates } = resolve_ref("@admin") else {
+            panic!("expected Ambiguous");
+        };
+        let kinds: Vec<_> = candidates.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec![ResourceKind::Agent, ResourceKind::Portal]);
+        let ResolveOutcome::Found { resource } = resolve_ref("@portal:admin") else {
+            panic!("expected Found");
+        };
+        assert_eq!(resource.id, admin_portal.id);
+        let ResolveOutcome::Found { resource } = resolve_ref("@agent:admin") else {
+            panic!("expected Found");
+        };
+        assert_eq!(resource.id, admin_agent.id);
+        assert_eq!(resolve_ref("@portal:nowhere"), ResolveOutcome::NotFound);
+    }
+
+    #[test]
+    fn duplicate_portal_names_are_ambiguous_and_narrowed_only_by_context() {
+        let a = portal_node("Frontend", FloorRef::Ground);
+        let b = portal_node("Frontend", FloorRef::Ground);
+        let c = portal_node("Frontend", FloorRef::Ground);
+        let views = vec![
+            workspace(Uuid::new_v4(), "alpha", vec![a.clone()]),
+            workspace(Uuid::new_v4(), "beta", vec![b, c]),
+        ];
+        let reference = ResourceRef::parse("@portal:frontend").unwrap();
+        let ResolveOutcome::Ambiguous { candidates } = resolve(&reference, &views, &[], None)
+        else {
+            panic!("expected Ambiguous");
+        };
+        assert_eq!(candidates.len(), 3);
+        // The caller's own workspace has exactly one: narrowed.
+        let alpha = ResolveContext {
+            workspace_id: views[0].id,
+            floor: FloorRef::Ground,
+        };
+        assert_eq!(
+            resolve(&reference, &views, &[], Some(&alpha)),
+            ResolveOutcome::Found {
+                resource: portal_candidates(&views[0]).remove(0)
+            }
+        );
+        // Two in the caller's workspace on the same floor: still ambiguous.
+        let beta = ResolveContext {
+            workspace_id: views[1].id,
+            floor: FloorRef::Ground,
+        };
+        assert!(matches!(
+            resolve(&reference, &views, &[], Some(&beta)),
+            ResolveOutcome::Ambiguous { .. }
+        ));
     }
 
     fn workspace(id: Uuid, name: &str, nodes: Vec<NodeRecord>) -> WorkspaceView {

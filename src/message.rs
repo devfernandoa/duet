@@ -124,6 +124,10 @@ pub struct WhoamiInfo {
     /// references — context the user handed this agent to start from.
     #[serde(default)]
     pub connected_files: Vec<String>,
+    /// Browser portals connected to this agent (Milestone 8), each marked
+    /// with whether the agent may control it.
+    #[serde(default)]
+    pub connected_portals: Vec<PortalSummary>,
 }
 
 /// One note, as `duetctl notes list` reports it — just enough to pick a
@@ -148,6 +152,75 @@ pub struct NoteDetail {
     /// The project file a file-backed note is synced with (Milestone 6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+}
+
+/// One portal, as `duetctl portal list` (and `resource inspect`) reports
+/// it. `name` is an alias, never an identity. `url` is only filled in when
+/// the requester may control the portal — which page a portal shows is
+/// itself page state, gated like the rest of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortalSummary {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Whether the requester holds `ControlPortal` on this portal (always
+    /// true for the human operator).
+    pub controllable: bool,
+    /// Whether agents may run arbitrary JavaScript here.
+    pub allow_scripts: bool,
+}
+
+/// `duetctl portal inspect`'s answer: identity, live page state, history,
+/// storage profile and which agents may control it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortalInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub loading: bool,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+    pub profile_id: Uuid,
+    /// `persistent` or `ephemeral`.
+    pub storage: String,
+    pub allow_scripts: bool,
+    /// Agents holding `ControlPortal` on this portal, by name.
+    pub controllers: Vec<String>,
+}
+
+/// A page's readable text (or, with `--html`, the DOM's HTML) as
+/// `duetctl portal text` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortalPage {
+    pub id: Uuid,
+    pub url: String,
+    pub title: String,
+    pub text: String,
+    /// Set when `text` was cut at the requested character limit.
+    pub truncated: bool,
+}
+
+/// A captured screenshot: a PNG file Duet wrote under its own data
+/// directory, for an agent to open with its image-reading tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortalScreenshot {
+    pub id: Uuid,
+    pub path: String,
+    pub width: i32,
+    pub height: i32,
+    pub url: String,
+}
+
+/// The outcome of a navigation or interaction (navigate, back, forward,
+/// reload, click, type): where the portal is now, and what was done.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortalAction {
+    pub id: Uuid,
+    pub url: String,
+    pub title: Option<String>,
+    pub detail: String,
 }
 
 #[cfg(test)]
