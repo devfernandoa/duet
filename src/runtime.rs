@@ -71,7 +71,7 @@ impl SessionRuntime {
     /// Spawns a process under `id` and tracks it. Replaces whatever was
     /// previously tracked under `id` with no explicit termination of the
     /// old one first — callers that are relaunching under the same id (see
-    /// `App::switch_agent`) are expected to `terminate` the old session
+    /// `App::hand_off`) are expected to `terminate` the old session
     /// first, same as before this module existed.
     pub fn spawn(&mut self, id: Uuid, cwd: PathBuf, launch: Launch) -> anyhow::Result<()> {
         let session = Session::spawn(cwd, launch)?;

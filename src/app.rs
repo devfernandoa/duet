@@ -38,7 +38,6 @@ use crate::canvas::{
     card_intersection, card_rect, card_vertical_edge, world_drag_delta,
 };
 use crate::environment;
-use crate::handoff::{summarize_claude, summarize_codex};
 use crate::layout;
 use crate::message::{AgentMessage, AgentSummary, LinkSummary, now_epoch_secs};
 use crate::model::{
@@ -279,6 +278,23 @@ pub enum CanvasCommand {
         before: Vec<NodeRecord>,
         after: Vec<NodeRecord>,
     },
+}
+
+/// A provider (and, for Claude, an account) a terminal session can be
+/// handed off to — see `App::handoff_targets`/`App::hand_off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffTarget {
+    pub agent: Agent,
+    pub claude_account: Option<String>,
+}
+
+impl HandoffTarget {
+    pub fn label(&self) -> String {
+        match (&self.agent, &self.claude_account) {
+            (Agent::Claude, Some(account)) => format!("Claude ({account})"),
+            (agent, _) => agent.display_name(),
+        }
+    }
 }
 
 /// Whether a workspace's widgets are on screen, its processes are merely
@@ -2149,66 +2165,160 @@ impl App {
         Ok(())
     }
 
-    /// Hands a session off from its current agent to the other one.
-    pub fn switch_agent(app: &Rc<RefCell<App>>, id: Uuid) -> anyhow::Result<()> {
-        let record = {
-            let app_ref = app.borrow();
-            app_ref
-                .nodes
-                .get(&id)
-                .context("session not found")?
-                .record
-                .as_terminal()
-                .context("not a terminal node")?
-                .clone()
+    /// Where terminal `id` can be handed off to: Claude on each account
+    /// (so a session can move to another account, e.g. one that isn't
+    /// rate-limited) and Codex — minus wherever it already is. Empty for a
+    /// provider whose conversation can't be summarized (OpenCode, Shell,
+    /// custom commands).
+    pub fn handoff_targets(&self, id: Uuid) -> Vec<HandoffTarget> {
+        let Some(terminal) = self.nodes.get(&id).and_then(|e| e.record.as_terminal()) else {
+            return Vec::new();
         };
-        if !record.agent.supports_handoff() {
-            anyhow::bail!(
-                "{} sessions don't support handing off to another agent",
-                record.agent.display_name()
-            );
+        if !terminal.agent.supports_handoff() {
+            return Vec::new();
         }
+        let mut accounts = self.accounts.list().unwrap_or_default();
+        if !accounts
+            .iter()
+            .any(|a| a == crate::account::DEFAULT_ACCOUNT)
+        {
+            accounts.insert(0, crate::account::DEFAULT_ACCOUNT.to_string());
+        }
+        let mut targets: Vec<HandoffTarget> = accounts
+            .into_iter()
+            .map(|account| HandoffTarget {
+                agent: Agent::Claude,
+                claude_account: Some(account),
+            })
+            .collect();
+        targets.push(HandoffTarget {
+            agent: Agent::Codex,
+            claude_account: None,
+        });
+        let current = HandoffTarget {
+            agent: terminal.agent.clone(),
+            claude_account: terminal.claude_account.clone().or_else(|| {
+                matches!(terminal.agent, Agent::Claude)
+                    .then(|| crate::account::DEFAULT_ACCOUNT.to_string())
+            }),
+        };
+        targets.retain(|target| *target != current);
+        targets
+    }
+
+    /// Hands terminal `id`'s session off to `target`: the current agent is
+    /// stopped, its conversation is summarized (`claude -p --resume` /
+    /// `codex exec resume --last`) *in the background*, and the new agent
+    /// starts in the same card with that summary as its first prompt. The
+    /// summary can take a while; the UI stays responsive meanwhile and the
+    /// card says "handing off…". If summarizing fails, the new agent still
+    /// starts, told to pick up from the working directory.
+    pub fn hand_off(app: &Rc<RefCell<App>>, id: Uuid, target: HandoffTarget) -> anyhow::Result<()> {
+        if !app.borrow().handoff_targets(id).contains(&target) {
+            anyhow::bail!("this session can't be handed off to {}", target.label());
+        }
+        let record = app
+            .borrow()
+            .nodes
+            .get(&id)
+            .and_then(|e| e.record.as_terminal())
+            .cloned()
+            .context("session not found")?;
+        let summary_launch = match record.agent {
+            Agent::Claude => {
+                let session_id = record
+                    .claude_session_id
+                    .context("session has no Claude conversation to summarize")?;
+                let config_dir = record
+                    .claude_account
+                    .as_ref()
+                    .map(|a| app.borrow().accounts.config_dir(a));
+                crate::agent::claude_summarize_launch(session_id, config_dir.as_deref())
+            }
+            _ => {
+                let codex_home = ensure_codex_home(&Agent::Codex, id)?;
+                crate::agent::codex_summarize_launch(codex_home.as_deref())
+            }
+        };
+
         environment::terminate(&mut app.borrow_mut().runtime, id, record.environment);
+        if let Some(entry) = app.borrow_mut().nodes.get_mut(&id) {
+            // Keeps `pump_output` from replacing "handing off…" with
+            // "exited" while the summary runs.
+            entry.exit_shown = true;
+            if let NodeWidget::Terminal(node) = &entry.widget {
+                node.status_label.set_text("handing off…");
+                node.feed(
+                    format!(
+                        "\r\n\x1b[2m[duet] summarizing this conversation to hand it off to {}…\x1b[0m\r\n",
+                        target.label()
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
 
-        let is_claude = matches!(record.agent, Agent::Claude);
-        let summary_result = if is_claude {
-            let session_id = record
-                .claude_session_id
-                .context("session has no Claude session to summarize")?;
-            let config_dir = record
-                .claude_account
-                .as_ref()
-                .map(|a| app.borrow().accounts.config_dir(a));
-            summarize_claude(session_id, config_dir.as_deref(), &record.cwd)
-        } else {
-            summarize_codex(&record.cwd)
-        };
-        let summary = match summary_result {
-            Ok(summary) => summary,
-            Err(_) => "The previous agent session could not be recovered. Start by inspecting the working directory and continue from there.".to_string(),
-        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cwd = record.cwd.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::handoff::run_and_capture(&summary_launch, &cwd));
+        });
+        let app = Rc::clone(app);
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let summary = match receiver.try_recv() {
+                Ok(Ok(summary)) => summary,
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    "The previous agent session could not be summarized. Start by inspecting \
+                     the working directory and continue from there."
+                        .to_string()
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            };
+            match App::finish_hand_off(&app, id, &record, &target, &summary) {
+                Ok(()) => App::notify(
+                    &app,
+                    &format!("{} handed off to {}", record.name, target.label()),
+                ),
+                Err(error) => {
+                    App::notify(&app, &format!("couldn't hand off {}: {error}", record.name))
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        Ok(())
+    }
 
-        let to = if is_claude {
-            Agent::Codex
-        } else {
-            Agent::Claude
-        };
-        let (launch, updated) = {
-            let app_ref = app.borrow();
-            if matches!(to, Agent::Claude) {
-                let account = crate::account::DEFAULT_ACCOUNT.to_string();
-                let config_dir = app_ref.accounts.ensure(&account)?;
+    /// Starts `target`'s agent in terminal `id` with `summary` as its first
+    /// prompt, and records the new provider/account on the node.
+    fn finish_hand_off(
+        app: &Rc<RefCell<App>>,
+        id: Uuid,
+        record: &TerminalPayload,
+        target: &HandoffTarget,
+        summary: &str,
+    ) -> anyhow::Result<()> {
+        if !app.borrow().nodes.contains_key(&id) {
+            // Closed while the summary ran: nothing left to hand off to.
+            return Ok(());
+        }
+        let (launch, updated) = match &target.agent {
+            Agent::Claude => {
+                let account = target
+                    .claude_account
+                    .clone()
+                    .unwrap_or_else(|| crate::account::DEFAULT_ACCOUNT.to_string());
+                let config_dir = app.borrow().accounts.ensure(&account)?;
                 // Role instructions and discovery text are no longer resent
                 // as a prompt (see `build_terminal_launch`'s doc comment) —
                 // only the handoff summary, which is genuine continuation
                 // content, not boilerplate.
                 let skill_installed = orchestration::skill::install(&config_dir).is_ok();
                 let initial_prompt =
-                    orchestration::env::discovery_prompt(Some(&summary), skill_installed)
+                    orchestration::env::discovery_prompt(Some(summary), skill_installed)
                         .unwrap_or_default();
                 let session_id = Uuid::new_v4();
                 let launch = with_session_env(
-                    to.launch(LaunchRequest {
+                    Agent::Claude.launch(LaunchRequest {
                         initial_prompt: Some(&initial_prompt),
                         claude_session_id: Some(session_id),
                         claude_config_dir: Some(&config_dir),
@@ -2220,22 +2330,22 @@ impl App {
                 updated.agent = Agent::Claude;
                 updated.claude_session_id = Some(session_id);
                 updated.claude_account = Some(account);
-                // Launched with `--session-id` (not `--resume`) just above,
-                // via `resume: false` from `LaunchRequest`'s `Default` — by
-                // the time `updated` is stored (after `spawn()?` succeeds
-                // below), this id already has a real conversation.
+                // Launched with `--session-id` (not `--resume`), via
+                // `resume: false` from `LaunchRequest`'s `Default` — by the
+                // time `updated` is stored, this id has a real conversation.
                 updated.never_launched = false;
                 (launch, updated)
-            } else {
+            }
+            _ => {
                 let codex_home = ensure_codex_home(&Agent::Codex, id)?;
                 let skill_installed = codex_home
                     .as_ref()
                     .is_some_and(|dir| orchestration::skill::install(dir).is_ok());
                 let initial_prompt =
-                    orchestration::env::discovery_prompt(Some(&summary), skill_installed)
+                    orchestration::env::discovery_prompt(Some(summary), skill_installed)
                         .unwrap_or_default();
                 let launch = with_session_env(
-                    to.launch(LaunchRequest {
+                    Agent::Codex.launch(LaunchRequest {
                         initial_prompt: Some(&initial_prompt),
                         codex_home_dir: codex_home.as_deref(),
                         ..Default::default()
@@ -2272,11 +2382,19 @@ impl App {
         app.borrow_mut()
             .runtime
             .spawn(id, updated.cwd.clone(), prepared)?;
-        if let Some(entry) = app.borrow_mut().nodes.get_mut(&id)
-            && let Some(terminal) = entry.record.as_terminal_mut()
-        {
-            *terminal = updated;
+        let mut app_mut = app.borrow_mut();
+        if let Some(entry) = app_mut.nodes.get_mut(&id) {
+            if let Some(terminal) = entry.record.as_terminal_mut() {
+                *terminal = updated;
+            }
+            // A fresh process: re-sync its PTY size and status from scratch
+            // (a stale `pty_grid` left the new agent at the PTY's default
+            // size until the card happened to be resized).
+            entry.pty_grid = None;
+            entry.exit_shown = false;
+            entry.last_activity = None;
         }
+        drop(app_mut);
         app.borrow().persist()?;
         Ok(())
     }
@@ -3067,6 +3185,70 @@ pub fn popup_menu(popover: &gtk4::Popover, items: Vec<MenuItem>) {
     popover.popup();
 }
 
+/// "Hand off to another agent…": pick the agent (and Claude account) to
+/// continue this session with, then `App::hand_off`.
+fn open_handoff_dialog(app: &Rc<RefCell<App>>, id: Uuid) {
+    use adw::prelude::MessageDialogExt;
+    let (targets, name, parent) = {
+        let app_ref = app.borrow();
+        let Some(entry) = app_ref.nodes.get(&id) else {
+            return;
+        };
+        let Some(terminal) = entry.record.as_terminal() else {
+            return;
+        };
+        let current = match (&terminal.agent, &terminal.claude_account) {
+            (Agent::Claude, Some(account)) => format!("Claude ({account})"),
+            (agent, _) => agent.display_name(),
+        };
+        (
+            app_ref.handoff_targets(id),
+            format!("{} — currently {current}", terminal.name),
+            entry
+                .widget
+                .container()
+                .root()
+                .and_downcast::<gtk4::Window>(),
+        )
+    };
+    if targets.is_empty() {
+        App::notify(app, "This session can't be handed off.");
+        return;
+    }
+    let labels: Vec<String> = targets.iter().map(HandoffTarget::label).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let choice = gtk4::DropDown::from_strings(&label_refs);
+    let dialog = adw::MessageDialog::new(
+        parent.as_ref(),
+        Some("Hand off to another agent"),
+        Some(&format!(
+            "{name}.\n\nThe current conversation is summarized and the new agent \
+             continues from that summary in this card."
+        )),
+    );
+    dialog.set_extra_child(Some(&choice));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("handoff", "Hand off");
+    dialog.set_response_appearance("handoff", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("handoff"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, {
+        let app = Rc::clone(app);
+        move |_, response| {
+            if response != "handoff" {
+                return;
+            }
+            let Some(target) = targets.get(choice.selected() as usize).cloned() else {
+                return;
+            };
+            if let Err(error) = App::hand_off(&app, id, target) {
+                App::notify(&app, &error.to_string());
+            }
+        }
+    });
+    dialog.present();
+}
+
 /// Runs `f` with the selection set to just `id` — how a card menu reuses
 /// the selection-based commands (collapse, lock, duplicate, delete, ...).
 fn on_this_card(app: &Rc<RefCell<App>>, id: Uuid, f: impl Fn(&Rc<RefCell<App>>)) {
@@ -3099,15 +3281,13 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
                     }
                 }),
             ));
-            let app_c = Rc::clone(app);
-            items.push((
-                "Hand off to the other agent".to_string(),
-                Box::new(move || {
-                    if let Err(error) = App::switch_agent(&app_c, id) {
-                        App::notify(&app_c, &error.to_string());
-                    }
-                }),
-            ));
+            if !app.borrow().handoff_targets(id).is_empty() {
+                let app_c = Rc::clone(app);
+                items.push((
+                    "Hand off to another agent…".to_string(),
+                    Box::new(move || open_handoff_dialog(&app_c, id)),
+                ));
+            }
             let app_c = Rc::clone(app);
             items.push((
                 "Restart process".to_string(),
@@ -5026,5 +5206,110 @@ mod tests {
         assert!(App::cancel_link(&app));
         assert!(!App::cancel_link(&app));
         assert!(app.borrow().pending_edge_source.is_none());
+    }
+
+    /// Handoff: offers every Claude account plus Codex (never the session's
+    /// current agent/account), summarizes in the background instead of
+    /// blocking the UI, and starts the new agent with a fresh PTY state.
+    /// Runs against fake `claude`/`codex` executables on `PATH`.
+    #[test]
+    #[ignore = "needs a display"]
+    fn hand_off_lists_targets_and_switches_without_blocking() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let bin = std::env::temp_dir().join(format!("duet-fake-bin-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["claude", "codex"] {
+            let script = bin.join(name);
+            // Print a summary in print/exec mode; otherwise stay alive like
+            // an interactive agent would.
+            std::fs::write(
+                &script,
+                "#!/bin/sh\ncase \"$*\" in *-p*|*exec*) sleep 0.3; echo 'did X, next Y';; *) sleep 30;; esac\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // SAFETY: display tests run one per process (see this module's doc
+        // comments), so nothing else reads the environment concurrently.
+        unsafe { std::env::set_var("PATH", path) };
+
+        let app = new_test_app();
+        app.borrow().accounts.ensure("work").unwrap();
+        let mut record = terminal_node(EnvironmentKind::LocalPty);
+        if let NodeKind::Terminal(terminal) = &mut record.kind {
+            terminal.agent = Agent::Claude;
+            terminal.claude_session_id = Some(Uuid::new_v4());
+            terminal.claude_account = Some("default".to_string());
+        }
+        let id = record.id;
+        materialize_node(&app, record, &adw::ToastOverlay::new()).unwrap();
+
+        let labels: Vec<String> = app
+            .borrow()
+            .handoff_targets(id)
+            .iter()
+            .map(HandoffTarget::label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Claude (work)".to_string(), "Codex".to_string()]
+        );
+
+        app.borrow_mut().nodes.get_mut(&id).unwrap().pty_grid = Some((80, 24));
+        let target = HandoffTarget {
+            agent: Agent::Claude,
+            claude_account: Some("work".to_string()),
+        };
+        let started = std::time::Instant::now();
+        App::hand_off(&app, id, target).unwrap();
+        // Returned immediately; the summary (0.3 s) runs in the background.
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert_eq!(
+            app.borrow().nodes[&id]
+                .record
+                .as_terminal()
+                .unwrap()
+                .claude_account
+                .as_deref(),
+            Some("default")
+        );
+
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.borrow().nodes[&id]
+            .record
+            .as_terminal()
+            .unwrap()
+            .claude_account
+            .as_deref()
+            != Some("work")
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let app_ref = app.borrow();
+        let entry = &app_ref.nodes[&id];
+        let terminal = entry.record.as_terminal().unwrap();
+        assert_eq!(terminal.claude_account.as_deref(), Some("work"));
+        assert!(matches!(terminal.agent, Agent::Claude));
+        assert_eq!(entry.pty_grid, None);
+        assert!(!entry.exit_shown);
+        assert!(app_ref.runtime.is_alive(id));
+        // Shell sessions have nothing to summarize, so no targets.
+        drop(app_ref);
+        let shell = terminal_node(EnvironmentKind::LocalPty);
+        let shell_id = shell.id;
+        materialize_node(&app, shell, &adw::ToastOverlay::new()).unwrap();
+        assert!(app.borrow().handoff_targets(shell_id).is_empty());
+        let _ = std::fs::remove_dir_all(&bin);
     }
 }

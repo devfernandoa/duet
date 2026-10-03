@@ -80,7 +80,7 @@ Every card works the same way:
   card…", lock, duplicate, delete.
 
 Scroll (two-finger or mouse wheel) over empty canvas to pan; `Ctrl+scroll`
-or a touchpad pinch zooms around the pointer (the zoom buttons and
+anywhere (over cards too) or a touchpad pinch zooms around the pointer (the zoom buttons and
 `Ctrl +`/`Ctrl -`/`Ctrl 0` work too). The edit-menu button (no keyboard accelerator of its own, since a
 focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) holds
 selection, layout (align/distribute), duplicate/copy/paste, undo/redo,
@@ -94,12 +94,13 @@ program and any arguments). The same dialog assigns a role (see
 [Roles](#roles-and-connections) below) and, for Claude, picks which isolated
 account to use.
 
-Only Claude and Codex support handing a session off to "the other" agent via
-"Hand off to the other agent" in the card's menu — summarize the outgoing conversation, then open
-the incoming agent with that summary as its first prompt. The other
-providers are plain interactive processes with no equivalent resumable
-session, so handing off reports that it's unsupported instead of doing
-something meaningless.
+Claude and Codex sessions can be handed off from the card's menu (**Hand off
+to another agent…**): pick Claude on any of your accounts, or Codex. Duet
+summarizes the outgoing conversation in the background and starts the
+chosen agent in the same card with that summary as its first prompt — the
+way to move a session to another account, too. OpenCode, Shell and custom
+commands have no resumable conversation to summarize, so their menu doesn't
+offer a handoff.
 
 A terminal's title bar shows its name (double-click to rename), role, and
 current activity (`starting`, `idle`, `working`, `awaiting reply`, `offline`,
