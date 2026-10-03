@@ -1,3 +1,5 @@
+<p align="center"><img src="data/icons/hicolor/256x256/apps/dev.fernandoa.duet.png" width="128" alt="Duet logo"></p>
+
 # duet
 
 A GTK4/libadwaita desktop app for running multiple AI coding agents side by
@@ -41,6 +43,27 @@ cargo install --path . --root "$HOME/.local"
 duet
 ```
 
+### Add Duet to your app launcher
+
+`install.sh` installs `duet`, `duetctl`, the launcher entry and the icon for
+your user only (into `~/.local`, no root):
+
+```sh
+# From a clone (builds from source):
+./install.sh
+
+# Or from a release download:
+tar xzf duet-v1.0.1-x86_64-linux.tar.gz
+cd duet-v1.0.1-x86_64-linux && ./install.sh
+```
+
+Duet then appears in your launcher (GNOME, KDE, rofi/wofi/fuzzel `drun`,
+...) with its icon; `./install.sh --uninstall` removes it again (your
+workspaces are kept). The launcher entry runs `~/.local/bin/duet` by its full
+path, and agent terminals get that directory on their `PATH` so they always
+find `duetctl` — adding `~/.local/bin` to your own `PATH` is only needed to
+run `duet`/`duetctl` from a terminal.
+
 Requires `claude`/`codex`/`opencode` on `PATH` for those providers; "Shell"
 runs `$SHELL`, and "Custom command" runs whatever program you configure when
 creating the session.
@@ -48,7 +71,12 @@ creating the session.
 ## Workspaces
 
 Everything lives inside a *workspace*: its own canvas, its own nodes and
-edges, its own default working directory and runtime environment. Switch
+edges, its own **project folder** and runtime environment. The project
+folder is what file trees, the editor, `@file:` references, the Git control
+and new terminals use. Creating a workspace asks for its folder; change it
+any time by clicking the folder under the title, from ⋯ → Workspace
+Folder…, or with the folder button in the workspace list (running terminals
+keep their own working directory). Switch
 between them with the workspace button at the left of the header bar (the
 title under "Duet" shows the workspace's folder) or `Ctrl+1`
 through `Ctrl+9` (the Nth workspace in name order). Switching away from a
@@ -117,6 +145,9 @@ A **drawing** is a quick sketch card: pen, eraser (removes the strokes it
 touches), four colors, three widths, undo-last-stroke and clear (asks
 first; undoable from ⋯ → Undo). Strokes are saved as vector data scaled to
 the card, so resizing a drawing stretches it rather than cropping it.
+Connect a drawing to an agent's terminal and the agent can read it:
+`duetctl drawing read <id>` renders it to a PNG (whose path it prints, for
+the agent to open) along with each stroke's color and points.
 
 ### Terminals
 
@@ -165,8 +196,9 @@ depends on what it joins, since there's no capability editor yet:
 
 - terminal ↔ terminal: `SendMessages` (the agents can message each other);
 - terminal ↔ note: `ReadNote` + `WriteNote`;
-- terminal ↔ editor or file tree: `ShareContext` — the file or folder shows
-  up in that agent's `duetctl whoami` as context to start from;
+- terminal ↔ editor, file tree or drawing: `ShareContext` — the file,
+  folder or drawing shows up in that agent's `duetctl whoami` as context to
+  start from (a drawing is read with `duetctl drawing read <id>`);
 - anything else: a purely visual connection.
 
 Lines are drawn under the cards. Click a line to select it and click it
@@ -219,6 +251,7 @@ duetctl git stage <path>...|--all | unstage <path>...|--all | discard <path>... 
 duetctl git branches | branch <new> | switch <branch>
 duetctl git fetch | pull | push [--set-upstream]
 duetctl notes attach <note-id> <path>              # sync a note with a Markdown file
+duetctl drawing list | read <id>                    # drawings connected to you; read renders a PNG
 ```
 
 The header's **Git control** shows the current branch with its state at a
@@ -363,6 +396,8 @@ The header answers four questions and stays out of the way otherwise:
 | Right-click a card's title bar | The card's menu |
 | Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
 | `Ctrl+?` / ⋯ → Keyboard Shortcuts | Every shortcut, in one window |
+| ⋯ → Appearance | Follow System, Light or Dark theme (remembered) |
+| Click the folder under the title / ⋯ → Workspace Folder… | Change the workspace's project folder |
 
 Errors surface in the app rather than only on the terminal duet was
 launched from: a failed restore, create, save or account/role operation as a
@@ -372,6 +407,9 @@ toast; a Git operation Git refused as a dialog with Git's own reason.
 
 - Workspaces, roles, and schema version: `$XDG_DATA_HOME/duet/store.json`
   (atomic write: temp file, fsync, rename).
+- Preferences (theme): `$XDG_DATA_HOME/duet/settings.json`.
+- Drawing images rendered for agents: `$XDG_DATA_HOME/duet/drawing-exports/`
+  (owner-only, one PNG per drawing, overwritten on each read).
 - Claude accounts: `$XDG_DATA_HOME/duet/accounts/<name>/` (one
   `CLAUDE_CONFIG_DIR` each).
 - Codex per-terminal isolation: `$XDG_DATA_HOME/duet/codex/<terminal-id>/`

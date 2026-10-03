@@ -80,6 +80,17 @@ fn build_ui(application: &adw::Application) {
         }
     });
 
+    // The app icon (`data/icons`, installed by `install.sh` into the user's
+    // icon theme). A source checkout's own copy is also searched, so a
+    // `cargo run` shows the logo before anything is installed.
+    let icon_theme = gtk4::IconTheme::for_display(&gtk4::prelude::WidgetExt::display(&window));
+    let checkout_icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons");
+    if checkout_icons.is_dir() {
+        icon_theme.add_search_path(&checkout_icons);
+    }
+    gtk4::Window::set_default_icon_name(APP_ID);
+    window.set_icon_name(Some(APP_ID));
+
     let css = gtk4::CssProvider::new();
     css.load_from_data(include_str!("style.css"));
     gtk4::style_context_add_provider_for_display(
@@ -324,6 +335,14 @@ fn build_ui(application: &adw::Application) {
         move |_, _| open_workspace_switcher_dialog(&app, &window, &toast_overlay, &workspace_label)
     });
     application.add_action(&workspaces_action);
+    let folder_action = gtk4::gio::SimpleAction::new("workspace-folder", None);
+    folder_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| change_active_workspace_folder(&app, &window, &toast_overlay)
+    });
+    application.add_action(&folder_action);
     workspace_button.set_action_name(Some("app.manage-workspaces"));
 
     let note_action = gtk4::gio::SimpleAction::new("new-note", None);
@@ -430,6 +449,7 @@ fn build_ui(application: &adw::Application) {
     }
 
     let menus = wire_canvas_edit_actions(application, &app, &window, &toast_overlay);
+    wire_theme_action(application, &toast_overlay);
     add_button.set_menu_model(Some(&menus.add));
     more_button.set_menu_model(Some(&menus.more));
     wire_help_actions(application, &window);
@@ -442,22 +462,26 @@ fn build_ui(application: &adw::Application) {
         let window_title = window_title.clone();
         move || {
             let app_ref = app.borrow();
-            let root = app_ref.workspace_root.display().to_string();
-            let home = std::env::var("HOME").unwrap_or_default();
-            let shown = match root.strip_prefix(&home) {
-                Some(rest) if !home.is_empty() => format!("~{rest}"),
-                _ => root,
-            };
+            let shown = display_path(&app_ref.workspace_root);
             if window_title.subtitle() != shown {
                 window_title.set_subtitle(&shown);
             }
             window_title.set_tooltip_text(Some(&format!(
-                "Workspace {} in {shown}",
+                "Workspace {} in {shown} — click to change its folder",
                 app_ref.workspace_name
             )));
         }
     });
     update_subtitle();
+    let title_click = gtk4::GestureClick::new();
+    title_click.connect_released({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _, _, _| change_active_workspace_folder(&app, &window, &toast_overlay)
+    });
+    window_title.add_controller(title_click);
+    window_title.set_cursor_from_name(Some("pointer"));
     app.borrow_mut().connect_git_state_changed({
         let update_subtitle = Rc::clone(&update_subtitle);
         move || update_subtitle()
@@ -852,14 +876,73 @@ fn wire_canvas_edit_actions(
     more.append_section(None, &view_section);
     let manage_section = gtk4::gio::Menu::new();
     manage_section.append(Some("Workspaces…"), Some("app.manage-workspaces"));
+    manage_section.append(Some("Workspace Folder…"), Some("app.workspace-folder"));
     manage_section.append(Some("Agent Roles…"), Some("app.manage-roles"));
     manage_section.append(Some("Claude Accounts…"), Some("app.manage-accounts"));
     more.append_section(None, &manage_section);
+    let appearance_section = gtk4::gio::Menu::new();
+    for theme in settings::ThemePreference::ALL {
+        appearance_section.append(
+            Some(theme.label()),
+            Some(&format!("app.theme::{}", theme.id())),
+        );
+    }
+    more.append_submenu(Some("Appearance"), &appearance_section);
     let help_section = gtk4::gio::Menu::new();
     help_section.append(Some("Keyboard Shortcuts"), Some("app.shortcuts"));
     help_section.append(Some("About Duet"), Some("app.about"));
     more.append_section(None, &help_section);
     HeaderMenus { add, more }
+}
+
+fn apply_theme(theme: settings::ThemePreference) {
+    adw::StyleManager::default().set_color_scheme(match theme {
+        settings::ThemePreference::System => adw::ColorScheme::Default,
+        settings::ThemePreference::Light => adw::ColorScheme::ForceLight,
+        settings::ThemePreference::Dark => adw::ColorScheme::ForceDark,
+    });
+}
+
+/// ⋯ → Appearance: Follow System / Light / Dark, applied at once and
+/// remembered in `settings.json`.
+fn wire_theme_action(application: &adw::Application, toast_overlay: &adw::ToastOverlay) {
+    let path = settings::default_settings_path().ok();
+    let (current, warning) = path
+        .as_deref()
+        .map(settings::Settings::load)
+        .unwrap_or_default();
+    if let Some(warning) = warning {
+        toast_overlay.add_toast(adw::Toast::new(&warning));
+    }
+    apply_theme(current.theme);
+    let action = gtk4::gio::SimpleAction::new_stateful(
+        "theme",
+        Some(glib::VariantTy::STRING),
+        &current.theme.id().to_variant(),
+    );
+    action.connect_activate({
+        let toast_overlay = toast_overlay.clone();
+        move |action, parameter| {
+            let Some(theme) = parameter
+                .and_then(|p| p.get::<String>())
+                .and_then(|id| settings::ThemePreference::from_id(&id))
+            else {
+                return;
+            };
+            action.set_state(&theme.id().to_variant());
+            apply_theme(theme);
+            if let Some(path) = &path {
+                let (mut saved, _) = settings::Settings::load(path);
+                saved.theme = theme;
+                if let Err(error) = saved.save(path) {
+                    toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Couldn't save the theme preference: {error}"
+                    )));
+                }
+            }
+        }
+    });
+    application.add_action(&action);
 }
 
 /// "Keyboard Shortcuts" and "About Duet".
@@ -880,7 +963,7 @@ fn wire_help_actions(application: &adw::Application, window: &adw::ApplicationWi
                 .transient_for(&window)
                 .modal(true)
                 .application_name("Duet")
-                .application_icon("utilities-terminal-symbolic")
+                .application_icon(APP_ID)
                 .version(env!("CARGO_PKG_VERSION"))
                 .comments(
                     "A spatial canvas for running and orchestrating coding agents side by side, \
@@ -1871,6 +1954,65 @@ fn open_role_editor_dialog(
 /// Reflects the active workspace's name on the header-bar switcher button.
 /// Called after `App::restore` and after anything that can change which
 /// workspace is active or its name (switch, create, rename, delete).
+/// `path` with the home directory shown as `~`.
+fn display_path(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => match shown.strip_prefix(&home) {
+            Some(rest) => format!("~{rest}"),
+            None => shown,
+        },
+        _ => shown,
+    }
+}
+
+/// Asks for a folder (starting at `initial`), then calls `chosen` with it.
+/// Nothing happens when the user cancels.
+fn pick_folder(
+    parent: &impl IsA<gtk4::Window>,
+    title: &str,
+    initial: &std::path::Path,
+    chosen: impl FnOnce(PathBuf) + 'static,
+) {
+    let file_dialog = gtk4::FileDialog::builder().title(title).modal(true).build();
+    if initial.is_dir() {
+        file_dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(initial)));
+    }
+    file_dialog.select_folder(Some(parent), gtk4::gio::Cancellable::NONE, move |result| {
+        if let Ok(folder) = result
+            && let Some(path) = folder.path()
+        {
+            chosen(path);
+        }
+    });
+}
+
+/// "Workspace Folder…": changes the active workspace's project folder.
+fn change_active_workspace_folder(
+    app: &Rc<RefCell<App>>,
+    parent: &impl IsA<gtk4::Window>,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let (id, root) = {
+        let app_ref = app.borrow();
+        (app_ref.workspace_id, app_ref.workspace_root.clone())
+    };
+    let app = app.clone();
+    let toast_overlay = toast_overlay.clone();
+    pick_folder(
+        parent,
+        "Choose this workspace's project folder",
+        &root,
+        move |path| match App::set_workspace_root(&app, id, &path) {
+            Ok(()) => toast_overlay.add_toast(adw::Toast::new(&format!(
+                "Workspace folder is now {}",
+                display_path(&path)
+            ))),
+            Err(error) => toast_overlay.add_toast(adw::Toast::new(&error.to_string())),
+        },
+    );
+}
+
 fn sync_workspace_button(label: &gtk4::Label, app: &Rc<RefCell<App>>) {
     label.set_text(&app.borrow().workspace_name);
 }
@@ -1899,8 +2041,8 @@ fn open_workspace_switcher_dialog(
     let workspaces_group = adw::PreferencesGroup::new();
     workspaces_group.set_title("Workspaces");
     workspaces_group.set_description(Some(
-        "Each workspace keeps its own canvas: sessions, notes, and links, \
-         independently saved.",
+        "Each workspace is a project folder with its own canvas. Its file \
+         trees, Git and new terminals use that folder.",
     ));
 
     let new_name_row = adw::EntryRow::new();
@@ -1948,28 +2090,49 @@ fn open_workspace_switcher_dialog(
             if name.trim().is_empty() {
                 return;
             }
-            // The new workspace's default root directory is simply wherever
-            // duet was launched from — there's no directory-chooser UI here,
-            // to keep this dialog to "name in, workspace out" (a session's
-            // own working directory can always be set to anything anyway).
-            let root_dir = std::env::current_dir().unwrap_or_default();
-            match App::create_workspace(&app, name, root_dir) {
-                Ok(_) => {
-                    new_name_row.set_text("");
-                    sync_workspace_button(&workspace_label, &app);
-                    populate_workspaces(
-                        &workspaces_group,
-                        &workspace_rows,
-                        &app,
-                        &toast_overlay,
-                        &dialog,
-                        &workspace_label,
-                    );
-                }
-                Err(error) => {
-                    toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
-                }
-            }
+            // Every workspace is a project folder: ask for it (starting
+            // from the current workspace's), rather than silently using
+            // wherever duet happened to be launched from.
+            let initial = app.borrow().workspace_root.clone();
+            let (
+                app,
+                workspaces_group,
+                workspace_rows,
+                new_name_row,
+                toast_overlay,
+                dialog_c,
+                workspace_label,
+            ) = (
+                app.clone(),
+                workspaces_group.clone(),
+                workspace_rows.clone(),
+                new_name_row.clone(),
+                toast_overlay.clone(),
+                dialog.clone(),
+                workspace_label.clone(),
+            );
+            pick_folder(
+                &dialog,
+                &format!("Choose the project folder for “{}”", name.trim()),
+                &initial,
+                move |root_dir| match App::create_workspace(&app, name, root_dir) {
+                    Ok(_) => {
+                        new_name_row.set_text("");
+                        sync_workspace_button(&workspace_label, &app);
+                        populate_workspaces(
+                            &workspaces_group,
+                            &workspace_rows,
+                            &app,
+                            &toast_overlay,
+                            &dialog_c,
+                            &workspace_label,
+                        );
+                    }
+                    Err(error) => {
+                        toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+                    }
+                },
+            );
         }
     };
     add_button.connect_clicked({
@@ -2009,12 +2172,19 @@ fn populate_workspaces(
         let runtime_state = app.borrow().workspace_runtime_state(id);
         let row = adw::ActionRow::new();
         row.set_title(&name);
+        let folder = app
+            .borrow()
+            .workspace_root_of(id)
+            .map(|root| display_path(&root))
+            .unwrap_or_default();
         if id == active_id {
-            row.set_subtitle("Current workspace");
+            row.set_subtitle(&format!("{folder} · current"));
         } else {
-            if runtime_state == WorkspaceRuntimeState::Background {
-                row.set_subtitle("Running in background");
-            }
+            row.set_subtitle(&if runtime_state == WorkspaceRuntimeState::Background {
+                format!("{folder} · running in background")
+            } else {
+                folder.clone()
+            });
             row.set_activatable(true);
             row.connect_activated({
                 let app = app.clone();
@@ -2068,6 +2238,49 @@ fn populate_workspaces(
             });
             row.add_suffix(&unload_button);
         }
+
+        let folder_button = gtk4::Button::from_icon_name("folder-open-symbolic");
+        folder_button.add_css_class("flat");
+        folder_button.set_valign(gtk4::Align::Center);
+        folder_button.set_tooltip_text(Some("Change project folder"));
+        folder_button.connect_clicked({
+            let app = app.clone();
+            let toast_overlay = toast_overlay.clone();
+            let group = group.clone();
+            let workspace_rows = workspace_rows.clone();
+            let dialog_parent = dialog_parent.clone();
+            let workspace_label = workspace_label.clone();
+            move |_| {
+                let initial = app.borrow().workspace_root_of(id).unwrap_or_default();
+                let (app, toast_overlay, group, workspace_rows, dialog_c, workspace_label) = (
+                    app.clone(),
+                    toast_overlay.clone(),
+                    group.clone(),
+                    workspace_rows.clone(),
+                    dialog_parent.clone(),
+                    workspace_label.clone(),
+                );
+                pick_folder(
+                    &dialog_parent,
+                    "Choose the project folder",
+                    &initial,
+                    move |path| {
+                        if let Err(error) = App::set_workspace_root(&app, id, &path) {
+                            toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+                        }
+                        populate_workspaces(
+                            &group,
+                            &workspace_rows,
+                            &app,
+                            &toast_overlay,
+                            &dialog_c,
+                            &workspace_label,
+                        );
+                    },
+                );
+            }
+        });
+        row.add_suffix(&folder_button);
 
         let rename_button = gtk4::Button::from_icon_name("document-edit-symbolic");
         rename_button.add_css_class("flat");

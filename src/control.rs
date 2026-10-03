@@ -103,6 +103,19 @@ pub enum ControlRequest {
     Whoami {
         agent_id: Option<Uuid>,
     },
+    /// `duetctl drawing list`: drawings the requester may read (connected
+    /// ones, for an agent) — see `app::drawings`.
+    DrawingList {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    /// `duetctl drawing read <id>`: renders it to a PNG and returns the path
+    /// and its strokes. Needs a connection (`ShareContext`) for an agent.
+    DrawingRead {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    },
     /// `duetctl notes list`: every note `requested_by` can discover — see
     /// `App::list_notes`.
     NotesList {
@@ -424,6 +437,12 @@ pub enum ControlResponse {
     },
     Notes {
         notes: Vec<NoteSummary>,
+    },
+    Drawings {
+        drawings: Vec<crate::message::DrawingSummary>,
+    },
+    Drawing {
+        drawing: crate::message::DrawingExport,
     },
     Note {
         note: NoteDetail,
@@ -941,8 +960,17 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                     connected_agents,
                     connected_files: app_ref.connected_files(agent_id),
                     connected_portals: app_ref.list_portals(Some(agent_id)),
+                    connected_drawings: app_ref.list_drawings(Some(agent_id)),
                 },
             }
+        }
+        ControlRequest::DrawingList { requested_by } => ControlResponse::Drawings {
+            drawings: app.borrow().list_drawings(requested_by),
+        },
+        ControlRequest::DrawingRead { requested_by, id } => {
+            respond(app.borrow().read_drawing(requested_by, id), |drawing| {
+                ControlResponse::Drawing { drawing }
+            })
         }
         ControlRequest::NotesList { requested_by } => ControlResponse::Notes {
             notes: app.borrow().list_notes(requested_by),
@@ -1183,6 +1211,8 @@ pub fn is_cli_verb(verb: &str) -> bool {
             | "git"
             | "portal"
             | "portals"
+            | "drawing"
+            | "drawings"
     )
 }
 
@@ -1281,6 +1311,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
             agent_id: acting_agent_id(),
         }),
         [cmd, rest @ ..] if cmd == "notes" => parse_notes(rest),
+        [cmd, rest @ ..] if cmd == "drawing" || cmd == "drawings" => parse_drawing(rest),
         [cmd, reference] if cmd == "resolve" => Ok(ControlRequest::Resolve {
             reference: reference.clone(),
             requested_by: acting_agent_id(),
@@ -1751,6 +1782,26 @@ fn parse_uuid_arg(raw: &str) -> anyhow::Result<Uuid> {
     Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("'{raw}' is not a valid id"))
 }
 
+fn parse_drawing(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [] => Ok(ControlRequest::DrawingList {
+            requested_by: acting_agent_id(),
+        }),
+        [only] if only == "list" => Ok(ControlRequest::DrawingList {
+            requested_by: acting_agent_id(),
+        }),
+        [cmd, id] if cmd == "read" => Ok(ControlRequest::DrawingRead {
+            requested_by: acting_agent_id(),
+            id: parse_uuid_arg(id)?,
+        }),
+        _ => anyhow::bail!(DRAWING_USAGE),
+    }
+}
+
+const DRAWING_USAGE: &str = r#"usage:
+  duetctl drawing list         (drawings connected to you)
+  duetctl drawing read <id>    (renders it to a PNG; prints the path and its strokes)"#;
+
 fn parse_notes(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [only] if only == "list" => Ok(ControlRequest::NotesList {
@@ -1982,6 +2033,14 @@ fn print_response(response: &ControlResponse) {
                     println!("  {reference}");
                 }
             }
+            if !info.connected_drawings.is_empty() {
+                println!(
+                    "\nconnected drawings (`duetctl drawing read <id>` renders one to a PNG):"
+                );
+                for drawing in &info.connected_drawings {
+                    println!("  {}\t{} strokes", drawing.id, drawing.strokes);
+                }
+            }
             if !info.connected_portals.is_empty() {
                 println!("\nconnected browser portals (`duetctl portal inspect <id>`):");
                 for portal in &info.connected_portals {
@@ -1996,6 +2055,33 @@ fn print_response(response: &ControlResponse) {
                         }
                     );
                 }
+            }
+        }
+        ControlResponse::Drawings { drawings } => {
+            if drawings.is_empty() {
+                println!("no drawings (connect one to your terminal on the canvas)");
+            }
+            for drawing in drawings {
+                println!("{}\t{} strokes", drawing.id, drawing.strokes);
+            }
+        }
+        ControlResponse::Drawing { drawing } => {
+            println!("image:   {}", drawing.path.display());
+            println!("size:    {}x{} px", drawing.width, drawing.height);
+            println!("strokes: {}", drawing.strokes.len());
+            for (index, stroke) in drawing.strokes.iter().enumerate() {
+                let points: Vec<String> = stroke
+                    .points
+                    .iter()
+                    .map(|(x, y)| format!("{x},{y}"))
+                    .collect();
+                println!(
+                    "  {} {} w{:.0}: {}",
+                    index + 1,
+                    stroke.color,
+                    stroke.width,
+                    points.join(" ")
+                );
             }
         }
         ControlResponse::Notes { notes } => {
@@ -2462,6 +2548,26 @@ mod tests {
             assert!(is_cli_verb(verb));
         }
         assert!(!is_cli_verb("--version"));
+    }
+
+    #[test]
+    fn drawing_commands_parse() {
+        let id = Uuid::new_v4();
+        assert!(is_cli_verb("drawing"));
+        assert!(matches!(
+            parse_cli_request(&["drawing".to_string(), "list".to_string()]).unwrap(),
+            ControlRequest::DrawingList { .. }
+        ));
+        assert!(matches!(
+            parse_cli_request(&["drawing".to_string(), "read".to_string(), id.to_string()])
+                .unwrap(),
+            ControlRequest::DrawingRead { id: parsed, .. } if parsed == id
+        ));
+        assert!(
+            parse_cli_request(&["drawing".to_string(), "read".to_string(), "x".to_string()])
+                .is_err()
+        );
+        assert!(parse_cli_request(&["drawing".to_string(), "draw".to_string()]).is_err());
     }
 
     #[test]

@@ -100,7 +100,33 @@ pub fn apply(
     launch
         .envs
         .extend(env_vars(identity, workspace_name, socket_path));
+    // Agents run `duetctl`; when duet was started from a desktop launcher,
+    // the session's PATH may not include where it's installed. `duetctl` is
+    // installed next to `duet`, so that directory goes first on PATH.
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .filter(|dir| dir.join("duetctl").is_file())
+        && !launch.envs.iter().any(|(key, _)| key == "PATH")
+    {
+        let current = std::env::var("PATH").unwrap_or_default();
+        launch
+            .envs
+            .push(("PATH".to_string(), path_with_first(&dir, &current)));
+    }
     launch
+}
+
+/// `current` (a `PATH` value) with `dir` first, unless it is already on it.
+pub fn path_with_first(dir: &Path, current: &str) -> String {
+    let dir = dir.to_string_lossy();
+    if current.split(':').any(|entry| entry == dir) {
+        current.to_string()
+    } else if current.is_empty() {
+        dir.to_string()
+    } else {
+        format!("{dir}:{current}")
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +153,20 @@ mod tests {
                 manager: false,
             }),
         }
+    }
+
+    #[test]
+    fn duetctl_directory_goes_first_on_path_once() {
+        let dir = Path::new("/home/me/.local/bin");
+        assert_eq!(
+            path_with_first(dir, "/usr/bin:/bin"),
+            "/home/me/.local/bin:/usr/bin:/bin"
+        );
+        assert_eq!(
+            path_with_first(dir, "/usr/bin:/home/me/.local/bin"),
+            "/usr/bin:/home/me/.local/bin"
+        );
+        assert_eq!(path_with_first(dir, ""), "/home/me/.local/bin");
     }
 
     #[test]

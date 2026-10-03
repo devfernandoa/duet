@@ -27,6 +27,7 @@
 //! shape can't go (a headless remote-API process, say) — Milestone 14's
 //! problem, not this one's.
 
+mod drawings;
 mod files;
 mod portals;
 pub mod scm;
@@ -942,6 +943,54 @@ impl App {
     }
 
     /// Renames a workspace, active or dormant.
+    /// A workspace's project folder (`root_dir`), active or dormant.
+    pub fn workspace_root_of(&self, id: Uuid) -> Option<PathBuf> {
+        if self.workspace_id == id {
+            return Some(self.workspace_root.clone());
+        }
+        self.inactive_workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.root_dir.clone())
+    }
+
+    /// Points a workspace at a different project folder: its file trees,
+    /// editors, `@file:` references, Git and the default working directory
+    /// of *new* terminals all follow it. Terminals already running keep
+    /// their own working directory (a process can't be moved). The folder
+    /// must exist.
+    pub fn set_workspace_root(app: &Rc<RefCell<App>>, id: Uuid, root: &Path) -> anyhow::Result<()> {
+        if !root.is_dir() {
+            anyhow::bail!("{} is not a folder", root.display());
+        }
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let active = {
+            let mut app_mut = app.borrow_mut();
+            if app_mut.workspace_id == id {
+                app_mut.workspace_root = root;
+                // Cached listings belong to the old folder.
+                for state in app_mut.tree_state.values_mut() {
+                    *state = files::TreeState::default();
+                }
+                true
+            } else if let Some(workspace) =
+                app_mut.inactive_workspaces.iter_mut().find(|w| w.id == id)
+            {
+                workspace.root_dir = root;
+                false
+            } else {
+                anyhow::bail!("workspace not found");
+            }
+        };
+        app.borrow().persist()?;
+        if active {
+            // Also tells the Git indicator and the header subtitle.
+            App::refresh_file_trees(app);
+            App::sync_project_files(app);
+        }
+        Ok(())
+    }
+
     pub fn rename_workspace(
         app: &Rc<RefCell<App>>,
         id: Uuid,
@@ -2161,9 +2210,13 @@ impl App {
                 .nodes
                 .get(&target)
                 .is_some_and(|e| e.record.as_note().is_some());
+            // Files, folders and drawings handed to an agent as context.
             let is_file_view = |id: Uuid| {
                 app.nodes.get(&id).is_some_and(|e| {
-                    matches!(e.record.kind, NodeKind::Editor(_) | NodeKind::FileTree(_))
+                    matches!(
+                        e.record.kind,
+                        NodeKind::Editor(_) | NodeKind::FileTree(_) | NodeKind::Drawing(_)
+                    )
                 })
             };
             if source_is_terminal && target_is_terminal {
@@ -2176,8 +2229,9 @@ impl App {
             } else if (source_is_terminal && is_file_view(target))
                 || (is_file_view(source) && target_is_terminal)
             {
-                // A file or folder handed to an agent: it shows up in the
-                // agent's `duetctl whoami` as context to start from.
+                // A file, folder or drawing handed to an agent: it shows up
+                // in the agent's `duetctl whoami` as context to start from
+                // (a drawing is then readable with `duetctl drawing read`).
                 edge.capabilities.insert(EdgeCapability::ShareContext);
             } else if let (Some(a), Some(b)) = (app.nodes.get(&source), app.nodes.get(&target))
                 && let Some(capability) =
@@ -6018,6 +6072,109 @@ mod tests {
             ));
         }
         assert_eq!(paint_order(&restarted)[0], group);
+    }
+
+    /// A connected terminal can read a drawing: the connection grants
+    /// `ShareContext`, `whoami`-style listing shows it, and `read_drawing`
+    /// renders a real PNG with the strokes in its pixel space. Unconnected
+    /// agents are refused; the operator may read any.
+    #[test]
+    #[ignore = "needs a display"]
+    fn connected_agents_can_read_drawings_as_images() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let toast = adw::ToastOverlay::new();
+        let agent = terminal_node(EnvironmentKind::LocalPty);
+        materialize_node(&app, agent.clone(), &toast).unwrap();
+        let drawing = App::add_simple_node(
+            &app,
+            NodeKind::Drawing(crate::model::DrawingPayload {
+                strokes: vec![crate::model::Stroke {
+                    color: "#e01b24".to_string(),
+                    width: 4.0,
+                    points: vec![(0.0, 0.0), (1.0, 1.0)],
+                }],
+            }),
+            (0.0, 0.0),
+            (400.0, 332.0),
+        );
+
+        assert!(app.borrow().list_drawings(Some(agent.id)).is_empty());
+        let refused = app
+            .borrow()
+            .read_drawing(Some(agent.id), drawing)
+            .unwrap_err();
+        assert!(refused.contains("not authorized"), "{refused}");
+
+        assert!(App::create_edge(&app, agent.id, drawing));
+        assert_eq!(
+            app.borrow().edges[0].capabilities,
+            [EdgeCapability::ShareContext].into_iter().collect()
+        );
+        let listed = app.borrow().list_drawings(Some(agent.id));
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].id, listed[0].strokes), (drawing, 1));
+
+        let export = app.borrow().read_drawing(Some(agent.id), drawing).unwrap();
+        // 400px surface (332 - toolbar) scaled up to the 800px minimum.
+        assert_eq!((export.width, export.height), (800, 600));
+        assert_eq!(export.strokes.len(), 1);
+        assert_eq!(export.strokes[0].points, vec![(0, 0), (800, 600)]);
+        assert_eq!(export.strokes[0].width, 8.0);
+        let bytes = std::fs::read(&export.path).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        // IHDR width/height.
+        assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 800);
+        assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 600);
+
+        // The operator reads anything; a non-drawing id is an error.
+        assert!(app.borrow().read_drawing(None, drawing).is_ok());
+        assert!(app.borrow().read_drawing(None, agent.id).is_err());
+        App::close_node(&app, agent.id);
+    }
+
+    /// Each workspace's project folder can be changed, active or dormant;
+    /// it persists, and a folder that doesn't exist is refused.
+    #[test]
+    #[ignore = "needs a display"]
+    fn workspace_project_folders_can_be_changed() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let active = app.borrow().workspace_id;
+        App::set_workspace_root(&app, active, first.path()).unwrap();
+        assert_eq!(
+            app.borrow().workspace_root,
+            first.path().canonicalize().unwrap()
+        );
+        assert!(App::set_workspace_root(&app, active, &first.path().join("missing")).is_err());
+
+        let other =
+            App::create_workspace(&app, "Other".to_string(), first.path().to_path_buf()).unwrap();
+        // `create_workspace` switched to it; the first one is now dormant.
+        App::set_workspace_root(&app, active, second.path()).unwrap();
+        assert_eq!(
+            app.borrow().workspace_root_of(active),
+            Some(second.path().canonicalize().unwrap())
+        );
+        assert_eq!(
+            app.borrow().workspace_root_of(other),
+            Some(first.path().to_path_buf())
+        );
+        let toast = adw::ToastOverlay::new();
+        App::switch_workspace(&app, active, &toast);
+        assert_eq!(
+            app.borrow().workspace_root,
+            second.path().canonicalize().unwrap()
+        );
+        // Persisted.
+        let saved = std::fs::read_to_string(&app.borrow().store_path).unwrap();
+        assert!(saved.contains(&*second.path().canonicalize().unwrap().to_string_lossy()));
     }
 
     /// Handoff: offers every Claude account plus Codex (never the session's

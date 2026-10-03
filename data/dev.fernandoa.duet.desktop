@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Duet
+GenericName=Agent Canvas
+Comment=Run and orchestrate AI coding agents side by side on a canvas
+Exec=duet
+Icon=dev.fernandoa.duet
+Terminal=false
+Categories=Development;IDE;GTK;
+Keywords=agent;claude;codex;ai;terminal;canvas;git;
+StartupNotify=true
+StartupWMClass=dev.fernandoa.duet

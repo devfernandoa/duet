@@ -28,4 +28,5 @@ pub mod project;
 pub mod role;
 pub mod runtime;
 pub mod session;
+pub mod settings;
 pub mod store;
