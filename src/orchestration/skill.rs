@@ -82,6 +82,32 @@ directly, instead of having their content pasted into your prompt.
 5. Reading or writing a note you have no connection to, or no write
    capability on, is refused with a clear error — this is enforced by Duet
    itself, not by this skill, so don't attempt to work around it.
+
+## Resource references (@)
+
+When an instruction contains an explicit `@` reference — `@backend`,
+`@agent:backend`, `@note:requirements` — treat it as a Duet resource
+reference, not an ordinary word, and resolve it through Duet rather than
+guessing:
+
+1. Run `duetctl resolve @backend` (add `--json` for machine-readable output).
+   Never invent a resource's id or assume its identity from the reference
+   text — Duet is the only source of truth for what a reference names.
+2. If the result reports more than one match, use a qualified form
+   (`@agent:backend`, `@note:backend`) to disambiguate, or look at the
+   workspace/floor Duet returned for each candidate and pick accordingly.
+3. Act on the resolved id with the command for its kind: `duetctl send --to
+   <id>` for an agent, `duetctl notes read/replace/append/patch <id>` for a
+   note. `duetctl resource inspect <id>` shows basic metadata for any kind.
+4. A prompt may name several resources at once (e.g. "ask @backend to read
+   @requirements and send the result to @reviewer") — resolve each
+   reference independently, then carry out each step with its own command.
+   Duet does not parse or orchestrate the sentence itself; you do.
+
+You may also recognize an Agent or Note described in plain words (without
+`@`) by inspecting `duetctl agents list` / `duetctl notes list` — but an
+explicit `@reference` is the deterministic signal and always takes priority
+over a guess from plain language.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)
@@ -115,6 +141,9 @@ mod tests {
         assert!(content.contains("duetctl notes list"));
         assert!(content.contains("duetctl notes read"));
         assert!(content.contains("duetctl notes patch"));
+        assert!(content.contains("duetctl resolve"));
+        assert!(content.contains("duetctl resource inspect"));
+        assert!(content.contains("@agent:backend"));
     }
 
     #[test]

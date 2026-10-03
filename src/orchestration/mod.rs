@@ -16,6 +16,7 @@ pub mod identity;
 pub mod notes;
 pub mod permissions;
 pub mod registry;
+pub mod resource;
 pub mod skill;
 
 pub use adapter::{AgentAdapter, adapter_for};
@@ -23,3 +24,4 @@ pub use bus::MessageBus;
 pub use identity::{AgentIdentity, agent_identities};
 pub use permissions::authorize;
 pub use registry::AgentRegistry;
+pub use resource::{ResolveContext, ResolveOutcome, ResolvedResource, ResourceKind, ResourceRef};
