@@ -396,7 +396,7 @@ The header answers four questions and stays out of the way otherwise:
 | Right-click a card's title bar | The card's menu |
 | Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
 | `Ctrl+?` / ⋯ → Keyboard Shortcuts | Every shortcut, in one window |
-| ⋯ → Appearance | Follow System, Light or Dark theme (remembered) |
+| ⋯ → Appearance | Follow System, Light or Dark (remembered). Light and Dark are Duet's own white and neutral-grey palettes and apply even under a custom GTK theme (`~/.config/gtk-4.0/gtk.css`, `GTK_THEME`); Follow System uses your desktop theme |
 | Click the folder under the title / ⋯ → Workspace Folder… | Change the workspace's project folder |
 
 Errors surface in the app rather than only on the terminal duet was

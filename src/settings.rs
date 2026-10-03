@@ -166,6 +166,98 @@ mod tests {
         );
     }
 
+    /// Duet's own Light and Dark palettes (`src/themes/*.css`, loaded by
+    /// `main.rs` above the user's GTK theme) must define every libadwaita
+    /// color a user theme might have redefined, or that theme's value would
+    /// leak through.
+    #[test]
+    fn duet_palettes_define_every_libadwaita_color() {
+        let required = [
+            "accent_color",
+            "accent_bg_color",
+            "accent_fg_color",
+            "destructive_color",
+            "destructive_bg_color",
+            "destructive_fg_color",
+            "success_color",
+            "success_bg_color",
+            "success_fg_color",
+            "warning_color",
+            "warning_bg_color",
+            "warning_fg_color",
+            "error_color",
+            "error_bg_color",
+            "error_fg_color",
+            "window_bg_color",
+            "window_fg_color",
+            "view_bg_color",
+            "view_fg_color",
+            "headerbar_bg_color",
+            "headerbar_fg_color",
+            "headerbar_border_color",
+            "headerbar_backdrop_color",
+            "headerbar_shade_color",
+            "headerbar_darker_shade_color",
+            "sidebar_bg_color",
+            "sidebar_fg_color",
+            "sidebar_backdrop_color",
+            "sidebar_shade_color",
+            "card_bg_color",
+            "card_fg_color",
+            "card_shade_color",
+            "dialog_bg_color",
+            "dialog_fg_color",
+            "popover_bg_color",
+            "popover_fg_color",
+            "popover_shade_color",
+            "thumbnail_bg_color",
+            "thumbnail_fg_color",
+            "shade_color",
+            "scrollbar_outline_color",
+        ];
+        for (name, css) in [
+            ("light", include_str!("themes/light.css")),
+            ("dark", include_str!("themes/dark.css")),
+        ] {
+            for color in required {
+                assert!(
+                    css.contains(&format!("@define-color {color} ")),
+                    "{name} palette lacks {color}"
+                );
+            }
+            // Never restyle what Duet's own style.css colors (notes, cards,
+            // lists): this sheet's priority would override it.
+            for forbidden in [".card {", "textview", "list {", ".view"] {
+                assert!(
+                    !css.contains(forbidden),
+                    "{name} palette styles {forbidden}"
+                );
+            }
+        }
+    }
+
+    /// Both palettes parse without a single CSS error under real GTK.
+    #[test]
+    #[ignore = "needs a display"]
+    fn duet_palettes_parse_cleanly() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        for css in [
+            include_str!("themes/light.css"),
+            include_str!("themes/dark.css"),
+        ] {
+            let provider = gtk4::CssProvider::new();
+            let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            provider.connect_parsing_error({
+                let errors = errors.clone();
+                move |_, _, error| errors.borrow_mut().push(error.to_string())
+            });
+            provider.load_from_data(css);
+            assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
+        }
+    }
+
     #[test]
     fn unknown_or_damaged_preferences_fall_back_without_failing() {
         let tmp = tempdir().unwrap();
