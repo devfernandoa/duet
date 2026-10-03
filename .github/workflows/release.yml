@@ -1,6 +1,8 @@
 name: Release
 
-# Publishing a version is pushing its tag: `git tag v1.0.0 && git push origin v1.0.0`.
+# Publishing a version: push its tag (`git tag v1.0.0 && git push origin v1.0.0`),
+# or run this workflow by hand on the commit to release (Actions → Release →
+# Run workflow on `main`, tag `v1.0.0`) — the tag is then created on that commit.
 # The release notes come from docs/release-notes/<tag>.md, versioned with the code.
 on:
   push:
@@ -8,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)publish, e.g. v1.0.0"
+        description: "Tag to publish, e.g. v1.0.0 (created on the selected commit if it doesn't exist)"
         required: true
 
 permissions:
@@ -20,9 +22,8 @@ jobs:
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      # A tag push builds the tag; a manual run builds the commit it was run on.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
       - name: Install GTK4, libadwaita, VTE, GtkSourceView and WebKitGTK dev packages
         run: |
           sudo apt-get update
@@ -46,6 +47,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
           name: Duet ${{ env.TAG }}
           body_path: docs/release-notes/${{ env.TAG }}.md
           files: |
