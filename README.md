@@ -79,9 +79,13 @@ Every card works the same way:
   restart, Edit/Preview, save, find, Git actions, "Connect to another
   card…", lock, duplicate, delete.
 
-Scroll (two-finger or mouse wheel) over empty canvas to pan; `Ctrl+scroll`
-anywhere (over cards too) or a touchpad pinch zooms around the pointer (the zoom buttons and
-`Ctrl +`/`Ctrl -`/`Ctrl 0` work too). The edit-menu button (no keyboard accelerator of its own, since a
+**Right-click empty canvas** to create a terminal, note, text or file tree
+right where you clicked.
+
+The mouse wheel over empty canvas zooms around the pointer (`Ctrl+wheel`
+zooms over cards too); on a touchpad, two-finger scroll pans and pinch
+zooms. Drag empty canvas to pan. (The zoom buttons and
+`Ctrl +`/`Ctrl -`/`Ctrl 0` work too.) The edit-menu button (no keyboard accelerator of its own, since a
 focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) holds
 selection, layout (align/distribute), duplicate/copy/paste, undo/redo,
 front/back ordering, lock/collapse, snap-to-grid, and node creation.
@@ -271,7 +275,9 @@ conversation the way they used to.
 | Per-card close button | Remove this card (kills the process, for a terminal) |
 | Right-click a card's title bar | The card's menu (rename, connect, collapse, lock, duplicate, delete, ...) |
 | Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
-| Scroll / `Ctrl+scroll` / pinch | Pan / zoom around the pointer / zoom |
+| Right-click empty canvas | New terminal / note / text / file tree at that spot |
+| Wheel on empty canvas, `Ctrl+wheel` anywhere, pinch | Zoom around the pointer |
+| Two-finger scroll, drag on empty canvas | Pan |
 
 Errors (a failed restore, a failed create, account/role operations) surface
 as in-app toasts rather than being printed to the terminal duet was launched
