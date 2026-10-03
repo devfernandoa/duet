@@ -100,6 +100,12 @@ pub struct Canvas {
     pub links_area: gtk4::DrawingArea,
     pub state: Rc<RefCell<CanvasState>>,
     nodes: Rc<RefCell<Vec<CanvasNode>>>,
+    /// Children on the background layer (Groups): always first in `fixed`'s
+    /// child order, so they paint beneath — and are hit-tested after — every
+    /// ordinary card, whatever is raised or lowered. See `raise_node`.
+    background: Rc<RefCell<Vec<gtk4::Widget>>>,
+    /// "Right-click to add a card" — shown only while the canvas is empty.
+    empty_hint: gtk4::Box,
     /// Set only from `connect_marquee_end`, called after `Canvas::new()` once
     /// `App` exists — see that method's doc comment. `marquee_area` and
     /// `marquee` themselves (the draw target and transient rectangle state)
@@ -136,6 +142,23 @@ impl Canvas {
         overlay.add_overlay(&links_area);
         overlay.add_overlay(&fixed);
         overlay.add_overlay(&marquee_area);
+
+        let empty_hint = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        empty_hint.set_halign(gtk4::Align::Center);
+        empty_hint.set_valign(gtk4::Align::Center);
+        empty_hint.set_can_target(false);
+        empty_hint.add_css_class("canvas-empty-hint");
+        let hint_title = gtk4::Label::new(Some("This workspace is empty"));
+        hint_title.add_css_class("title-3");
+        let hint_body = gtk4::Label::new(Some(
+            "Right-click anywhere to add a card here, or use + in the header.\n\
+             Ctrl+T starts an agent. Drag empty space to pan; scroll to zoom.",
+        ));
+        hint_body.set_justify(gtk4::Justification::Center);
+        empty_hint.append(&hint_title);
+        empty_hint.append(&hint_body);
+        empty_hint.set_visible(false);
+        overlay.add_overlay(&empty_hint);
 
         let state = Rc::new(RefCell::new(CanvasState::new()));
         let nodes: Rc<RefCell<Vec<CanvasNode>>> = Rc::new(RefCell::new(Vec::new()));
@@ -406,6 +429,8 @@ impl Canvas {
             links_area,
             state,
             nodes,
+            background: Rc::new(RefCell::new(Vec::new())),
+            empty_hint,
             marquee_end,
         }
     }
@@ -479,21 +504,71 @@ impl Canvas {
         apply_transform(&self.fixed, &widget, world_pos, &self.state.borrow());
     }
 
-    /// Moves an existing card to the end of the `Fixed` child order, which
-    /// GTK paints last. Called when a card begins moving so the active card
-    /// remains visible above every overlapping card throughout the drag.
-    pub fn raise_node(&self, child: &impl IsA<gtk4::Widget>) {
-        child.insert_before(&self.fixed, None::<&gtk4::Widget>);
+    /// Adds a child on the background layer (a Group): beneath every
+    /// ordinary card now and after any later raise/lower, above the
+    /// background children already there.
+    pub fn add_background_node(&self, child: &impl IsA<gtk4::Widget>, world_pos: (f64, f64)) {
+        self.background.borrow_mut().push(child.clone().upcast());
+        self.add_node(child, world_pos);
+        self.raise_node(child);
     }
 
-    /// Moves an existing card to the start of the `Fixed` child order, which
-    /// GTK paints first (so every other card then paints on top of it) — the
-    /// "send to back" counterpart of `raise_node`. `insert_after` with no
-    /// sibling means "insert as the first child", the mirror image of
-    /// `raise_node`'s `insert_before` with no sibling meaning "insert as the
-    /// last child".
+    fn is_background(&self, child: &gtk4::Widget) -> bool {
+        self.background.borrow().iter().any(|w| w == child)
+    }
+
+    /// The top-most background child in `fixed`'s current order, other than
+    /// `except`.
+    fn last_background_child(&self, except: Option<&gtk4::Widget>) -> Option<gtk4::Widget> {
+        let mut last = None;
+        let mut current = self.fixed.first_child();
+        while let Some(widget) = current {
+            if Some(&widget) != except && self.is_background(&widget) {
+                last = Some(widget.clone());
+            }
+            current = widget.next_sibling();
+        }
+        last
+    }
+
+    /// Moves a card to the top of its layer — the end of the `Fixed` child
+    /// order (painted last) for an ordinary card; just above the other
+    /// background children for a Group, so it never covers a card. Called
+    /// when a card is pressed so the active card stays visible above every
+    /// overlapping card.
+    pub fn raise_node(&self, child: &impl IsA<gtk4::Widget>) {
+        let widget = child.as_ref();
+        if self.is_background(widget) {
+            match self.last_background_child(Some(widget)) {
+                Some(above) => widget.insert_after(&self.fixed, Some(&above)),
+                None => widget.insert_after(&self.fixed, None::<&gtk4::Widget>),
+            }
+        } else {
+            widget.insert_before(&self.fixed, None::<&gtk4::Widget>);
+        }
+    }
+
+    /// Moves a card to the bottom of its layer — the "send to back"
+    /// counterpart of `raise_node`. A Group goes to the very start of the
+    /// child order (`insert_after` with no sibling); an ordinary card goes
+    /// just above the background layer, never beneath a Group.
     pub fn lower_node(&self, child: &impl IsA<gtk4::Widget>) {
-        child.insert_after(&self.fixed, None::<&gtk4::Widget>);
+        let widget = child.as_ref();
+        if self.is_background(widget) {
+            widget.insert_after(&self.fixed, None::<&gtk4::Widget>);
+        } else {
+            match self.last_background_child(Some(widget)) {
+                Some(below) => widget.insert_after(&self.fixed, Some(&below)),
+                None => widget.insert_after(&self.fixed, None::<&gtk4::Widget>),
+            }
+        }
+    }
+
+    /// Shows or hides the empty-workspace hint.
+    pub fn set_empty_hint_visible(&self, visible: bool) {
+        if self.empty_hint.is_visible() != visible {
+            self.empty_hint.set_visible(visible);
+        }
     }
 
     /// Removes a child from both the `Fixed` container and the internal
@@ -505,6 +580,7 @@ impl Canvas {
     pub fn remove_node(&self, child: &impl IsA<gtk4::Widget>) {
         self.fixed.remove(child);
         self.nodes.borrow_mut().retain(|(w, _)| w != child.as_ref());
+        self.background.borrow_mut().retain(|w| w != child.as_ref());
     }
 
     /// Registers the draw callback for the link lines, which paint on top of
@@ -1154,6 +1230,51 @@ mod tests {
             child = widget.next_sibling();
         }
         order
+    }
+
+    /// Groups (background children) stay beneath every ordinary card
+    /// whatever is raised or lowered, in any order — the layering rule
+    /// Milestone 7.5 needs to hold so a section never covers a card.
+    #[test]
+    #[ignore = "needs a display"]
+    fn background_children_always_stay_beneath_ordinary_cards() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let canvas = Canvas::new();
+        let make = |name: &str| {
+            let label = gtk4::Label::new(None);
+            label.set_widget_name(name);
+            label
+        };
+        let a = make("a");
+        let b = make("b");
+        canvas.add_node(&a, (0.0, 0.0));
+        canvas.add_node(&b, (0.0, 0.0));
+        // A group added after the cards still goes beneath them.
+        let g1 = make("g1");
+        canvas.add_background_node(&g1, (0.0, 0.0));
+        assert_eq!(child_order(&canvas.fixed), vec!["g1", "a", "b"]);
+        let g2 = make("g2");
+        canvas.add_background_node(&g2, (0.0, 0.0));
+        assert_eq!(child_order(&canvas.fixed), vec!["g1", "g2", "a", "b"]);
+
+        // Raising a group: top of the background layer only.
+        canvas.raise_node(&g1);
+        assert_eq!(child_order(&canvas.fixed), vec!["g2", "g1", "a", "b"]);
+        // Lowering a card: bottom of the card layer, still above groups.
+        canvas.lower_node(&b);
+        assert_eq!(child_order(&canvas.fixed), vec!["g2", "g1", "b", "a"]);
+        canvas.raise_node(&b);
+        assert_eq!(child_order(&canvas.fixed), vec!["g2", "g1", "a", "b"]);
+        canvas.lower_node(&g1);
+        assert_eq!(child_order(&canvas.fixed), vec!["g1", "g2", "a", "b"]);
+        // A card added later lands on top; removing a group forgets it.
+        let c = make("c");
+        canvas.add_node(&c, (0.0, 0.0));
+        canvas.remove_node(&g2);
+        canvas.lower_node(&c);
+        assert_eq!(child_order(&canvas.fixed), vec!["g1", "c", "a", "b"]);
     }
 
     /// Regression test for exactly the bug a code review caught in

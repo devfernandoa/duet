@@ -361,7 +361,7 @@ impl App {
 
     /// Git state changed: refresh every tree's markers and every open diff
     /// view.
-    fn after_git_change(app: &Rc<RefCell<App>>) {
+    pub(crate) fn after_git_change(app: &Rc<RefCell<App>>) {
         App::refresh_file_trees(app);
         let diff_editors: Vec<Uuid> = app
             .borrow()
@@ -1119,6 +1119,9 @@ impl App {
             }
             App::refresh_file_tree(app, id);
         }
+        // Every caller (a save, a file write, a Git operation) may have
+        // changed what the header's Git indicator shows.
+        App::git_state_changed(app);
     }
 
     fn tree_widget(&self, id: Uuid) -> Option<(FileTreeNode, FileTreePayload)> {
@@ -1737,7 +1740,7 @@ fn show_tree_menu(
         );
         add(
             &mut items,
-            "Discard changes…",
+            "! Discard changes…",
             Box::new(move || {
                 confirm_discard(&app_c, &path_c, &anchor_c, &toast_c);
             }),
@@ -1779,7 +1782,7 @@ fn confirm_discard(
     dialog.present();
 }
 
-fn open_commit_dialog(
+pub(crate) fn open_commit_dialog(
     app: &Rc<RefCell<App>>,
     anchor: &impl IsA<gtk4::Widget>,
     toast_overlay: &adw::ToastOverlay,

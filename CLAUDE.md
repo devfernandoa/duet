@@ -13,6 +13,11 @@ The existing Duet codebase is the foundation and must be evolved incrementally.
 Read `steps.md` before making architectural decisions. It contains the complete
 roadmap and acceptance criteria.
 
+Duet 1.0 is Milestones 0-6, 8 and 7.5. Everything in steps.md's
+"Post-v1 / Future" section (chat, floors, scores, search/attention, routines,
+SSH/Docker, remote control, hardening) is future work: do not start it unless
+a task explicitly asks for it.
+
 ## Core architectural direction
 
 Duet should evolve toward this dependency direction:

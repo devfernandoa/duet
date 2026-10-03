@@ -1,5 +1,8 @@
-//! Git, behind a service boundary: status, diffs, log, stage/unstage,
-//! discard and commit, all by running the `git` CLI through
+//! Git, behind a service boundary: status (with branch, upstream and
+//! ahead/behind), diffs, log, stage/unstage (one path or everything),
+//! discard, commit, and the everyday branch/remote workflow — list, switch,
+//! create, fetch, fast-forward-only pull and push — all by running the `git`
+//! CLI through
 //! [`ProjectCommands`] — so the same code runs against a remote project once
 //! Milestone 13's SSH/Docker hosts implement that trait, and no GTK callback
 //! ever shells out to git itself (the FileTree, the editor and `duetctl git`
@@ -29,6 +32,9 @@ pub enum GitError {
     ConfirmationRequired(String),
     Invalid(String),
     Failed(String),
+    /// A push of a branch with no upstream: setting one is an explicit
+    /// choice, never a side effect (`push(true)` makes it).
+    UpstreamRequired(PushTarget),
 }
 
 impl fmt::Display for GitError {
@@ -41,6 +47,11 @@ impl fmt::Display for GitError {
             GitError::ConfirmationRequired(message) => write!(f, "{message}"),
             GitError::Invalid(message) => write!(f, "{message}"),
             GitError::Failed(message) => write!(f, "git failed: {message}"),
+            GitError::UpstreamRequired(target) => write!(
+                f,
+                "{} has no upstream yet; publish it to {}/{} explicitly",
+                target.branch, target.remote, target.branch
+            ),
         }
     }
 }
@@ -97,10 +108,22 @@ impl GitStatusEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GitStatus {
     /// The current branch, `None` when detached.
     pub branch: Option<String>,
+    /// The branch's upstream (`origin/main`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Commits on the branch not on its upstream, and the reverse. Both 0
+    /// without an upstream (or with one that no longer exists).
+    #[serde(default)]
+    pub ahead: u32,
+    #[serde(default)]
+    pub behind: u32,
+    /// The upstream is configured but its remote branch is gone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_gone: bool,
     pub entries: Vec<GitStatusEntry>,
 }
 
@@ -114,6 +137,66 @@ impl GitStatus {
     pub fn has_changes_under(&self, dir: &ProjectPath) -> bool {
         self.entries.iter().any(|entry| entry.path.starts_with(dir))
     }
+
+    pub fn is_clean(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn staged_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.has_staged()).count()
+    }
+
+    pub fn unstaged_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.has_unstaged()).count()
+    }
+
+    pub fn conflict_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_conflicted()).count()
+    }
+
+    /// A one-line summary: `main ↑2 ↓1 •3` — branch (or `detached`),
+    /// commits ahead/behind its upstream, and changed paths. Clean and in
+    /// sync is just the branch name.
+    pub fn summary(&self) -> String {
+        let mut text = self
+            .branch
+            .clone()
+            .unwrap_or_else(|| "detached".to_string());
+        if self.ahead > 0 {
+            text.push_str(&format!(" ↑{}", self.ahead));
+        }
+        if self.behind > 0 {
+            text.push_str(&format!(" ↓{}", self.behind));
+        }
+        if !self.entries.is_empty() {
+            text.push_str(&format!(" •{}", self.entries.len()));
+        }
+        text
+    }
+}
+
+/// One local branch, from `git for-each-ref refs/heads`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+}
+
+/// Where a push goes when the branch has no upstream yet: `git push -u
+/// <remote> <branch>`. Returned by [`GitService::push`] as
+/// [`GitError::UpstreamRequired`] so the caller asks before setting it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushTarget {
+    pub remote: String,
+    pub branch: String,
+}
+
+/// What a network operation did, in words for a toast/CLI line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitSyncOutcome {
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +443,247 @@ impl<'a> GitService<'a> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Stages every change in the project (`git add -A -- .`, so a project
+    /// that is a subdirectory of a repository stages only its own files).
+    pub fn stage_all(&self) -> Result<(), GitError> {
+        self.stage(&[ProjectPath::root()])
+    }
+
+    /// Unstages everything in the project, keeping the working tree.
+    pub fn unstage_all(&self) -> Result<(), GitError> {
+        self.unstage(&[ProjectPath::root()])
+    }
+
+    /// Every local branch, sorted by name, the current one marked.
+    pub fn branches(&self) -> Result<Vec<GitBranch>, GitError> {
+        let output = self.run_ok(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname:short)%00%(HEAD)%00%(upstream:short)",
+            "refs/heads",
+        ])?;
+        Ok(parse_branches(&output.stdout))
+    }
+
+    fn remotes(&self) -> Result<Vec<String>, GitError> {
+        let output = self.run_ok(&["remote"])?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Switches to an existing *local* branch. Never forces and never
+    /// stashes: if the switch would overwrite local changes git refuses,
+    /// and its own explanation is returned. `--no-guess` keeps a typo from
+    /// silently creating a tracking branch off a remote one.
+    pub fn switch_branch(&self, name: &str) -> Result<(), GitError> {
+        let branches = self.branches()?;
+        let Some(branch) = branches.iter().find(|b| b.name == name) else {
+            return Err(GitError::Invalid(format!(
+                "there is no local branch '{name}'"
+            )));
+        };
+        if branch.current {
+            return Ok(());
+        }
+        self.run_ok(&["switch", "--no-guess", "--", name])
+            .map(|_| ())
+            .map_err(friendly_failure)
+    }
+
+    /// Creates `name` from the current `HEAD` and switches to it (`git
+    /// switch -c`). Local changes come along, as git always does.
+    pub fn create_branch(&self, name: &str) -> Result<(), GitError> {
+        validate_branch_name(name).map_err(GitError::Invalid)?;
+        let check = self.run(&["check-ref-format", "--branch", name], None)?;
+        if !check.success() {
+            return Err(GitError::Invalid(format!(
+                "'{name}' is not a valid branch name"
+            )));
+        }
+        if self.branches()?.iter().any(|b| b.name == name) {
+            return Err(GitError::Invalid(format!(
+                "a branch named '{name}' already exists"
+            )));
+        }
+        self.run_ok(&["switch", "-c", name])
+            .map(|_| ())
+            .map_err(friendly_failure)
+    }
+
+    /// `git fetch` from the branch's remote (or the only/`origin` remote).
+    /// Updates remote-tracking refs only — the working tree, index and local
+    /// branches are untouched, so it is always safe.
+    pub fn fetch(&self) -> Result<GitSyncOutcome, GitError> {
+        let remote = self.default_remote()?;
+        self.run_ok(&["fetch", "--quiet", "--", &remote])
+            .map_err(friendly_failure)?;
+        let status = self.status()?;
+        let message = match (status.upstream.as_deref(), status.behind, status.ahead) {
+            (None, _, _) => format!("Fetched {remote}"),
+            (Some(upstream), 0, 0) => format!("Fetched {remote}; up to date with {upstream}"),
+            (Some(upstream), behind, ahead) => {
+                format!("Fetched {remote}; {behind} behind and {ahead} ahead of {upstream}")
+            }
+        };
+        Ok(GitSyncOutcome { message })
+    }
+
+    /// The conservative pull: fast-forward only, never rebase, never merge,
+    /// never auto-stash. Anything else (diverged history, local changes git
+    /// would overwrite, conflicts) is refused with git's own reason so the
+    /// user resolves it deliberately.
+    pub fn pull(&self) -> Result<GitSyncOutcome, GitError> {
+        let status = self.status()?;
+        let Some(branch) = status.branch.clone() else {
+            return Err(GitError::Invalid(
+                "HEAD is detached; switch to a branch before pulling".to_string(),
+            ));
+        };
+        let Some(upstream) = status.upstream.clone() else {
+            return Err(GitError::Invalid(format!(
+                "{branch} has no upstream to pull from; push it with an upstream first"
+            )));
+        };
+        if status.conflict_count() > 0 {
+            return Err(GitError::Invalid(
+                "resolve the merge conflicts before pulling".to_string(),
+            ));
+        }
+        self.run_ok(&[
+            "pull",
+            "--ff-only",
+            "--no-rebase",
+            "--no-autostash",
+            "--quiet",
+        ])
+        .map_err(|error| match error {
+            GitError::Failed(message)
+                if message.contains("Not possible to fast-forward")
+                    || message.contains("diverg") =>
+            {
+                GitError::Failed(format!(
+                    "{branch} and {upstream} have diverged; Duet only fast-forwards. \
+                         Merge or rebase in a terminal, then pull again."
+                ))
+            }
+            other => friendly_failure(other),
+        })?;
+        let after = self.status()?;
+        let message = if status.behind == 0 {
+            format!("{branch} is already up to date with {upstream}")
+        } else {
+            format!(
+                "Pulled {} commit{} into {branch}",
+                status.behind,
+                if status.behind == 1 { "" } else { "s" }
+            )
+        };
+        let message = if after.behind > 0 {
+            format!("{message} ({} still behind)", after.behind)
+        } else {
+            message
+        };
+        Ok(GitSyncOutcome { message })
+    }
+
+    /// Pushes the current branch. With an upstream, a plain `git push`;
+    /// without one, refuses with [`GitError::UpstreamRequired`] unless
+    /// `set_upstream` — the caller asked the user — in which case it runs
+    /// `git push -u <remote> <branch>`. Never forces.
+    pub fn push(&self, set_upstream: bool) -> Result<GitSyncOutcome, GitError> {
+        let status = self.status()?;
+        let Some(branch) = status.branch.clone() else {
+            return Err(GitError::Invalid(
+                "HEAD is detached; switch to a branch before pushing".to_string(),
+            ));
+        };
+        if !self.has_head() {
+            return Err(GitError::Invalid(
+                "there are no commits to push yet".to_string(),
+            ));
+        }
+        match status.upstream.clone() {
+            Some(upstream) if !status.upstream_gone => {
+                self.run_ok(&["push", "--quiet"])
+                    .map_err(|error| match error {
+                        GitError::Failed(message)
+                            if message.contains("rejected")
+                                || message.contains("non-fast-forward") =>
+                        {
+                            GitError::Failed(format!(
+                                "{upstream} has commits you don't have; pull (or merge) first. \
+                             Duet never force-pushes."
+                            ))
+                        }
+                        other => friendly_failure(other),
+                    })?;
+                let message = if status.ahead == 0 {
+                    format!("{branch} was already up to date on {upstream}")
+                } else {
+                    format!(
+                        "Pushed {} commit{} to {upstream}",
+                        status.ahead,
+                        if status.ahead == 1 { "" } else { "s" }
+                    )
+                };
+                Ok(GitSyncOutcome { message })
+            }
+            _ => {
+                let target = PushTarget {
+                    remote: self.default_remote()?,
+                    branch: branch.clone(),
+                };
+                if !set_upstream {
+                    return Err(GitError::UpstreamRequired(target));
+                }
+                self.run_ok(&["push", "--quiet", "-u", &target.remote, &branch])
+                    .map_err(friendly_failure)?;
+                Ok(GitSyncOutcome {
+                    message: format!(
+                        "Published {branch} to {}/{branch} and set it as upstream",
+                        target.remote
+                    ),
+                })
+            }
+        }
+    }
+
+    /// The remote a fetch or a first push uses: the current branch's own
+    /// remote if configured, else `origin`, else the only remote.
+    fn default_remote(&self) -> Result<String, GitError> {
+        let remotes = self.remotes()?;
+        if remotes.is_empty() {
+            return Err(GitError::Invalid(
+                "this repository has no remote; add one with `git remote add`".to_string(),
+            ));
+        }
+        if let Some(branch) = self.status()?.branch {
+            let key = format!("branch.{branch}.remote");
+            if let Ok(output) = self.run(&["config", "--get", &key], None)
+                && output.success()
+            {
+                let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if remotes.contains(&remote) {
+                    return Ok(remote);
+                }
+            }
+        }
+        if remotes.iter().any(|r| r == "origin") {
+            return Ok("origin".to_string());
+        }
+        if remotes.len() == 1 {
+            return Ok(remotes[0].clone());
+        }
+        Err(GitError::Invalid(format!(
+            "several remotes ({}) and none is the branch's or 'origin'",
+            remotes.join(", ")
+        )))
+    }
+
     /// Which of `paths` git ignores (`.gitignore`, `.git/info/exclude`, the
     /// user's global excludes). Not a repository, or git missing, means
     /// nothing is ignored — `.gitignore` support degrades gracefully rather
@@ -389,12 +713,31 @@ impl<'a> GitService<'a> {
     }
 }
 
+/// Git's stderr, minus the `hint:` lines, which talk about command-line
+/// flags the user didn't type.
+fn friendly_failure(error: GitError) -> GitError {
+    match error {
+        GitError::Failed(message) => {
+            let cleaned: Vec<&str> = message
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with("hint:"))
+                .collect();
+            let cleaned = cleaned.join(" ");
+            let cleaned = cleaned.strip_prefix("error: ").unwrap_or(&cleaned);
+            let cleaned = cleaned.strip_prefix("fatal: ").unwrap_or(cleaned);
+            GitError::Failed(cleaned.to_string())
+        }
+        other => other,
+    }
+}
+
 /// Parses `git status --porcelain=v1 -z --branch` output. Paths are
 /// reported relative to the repository top level; `prefix` (the project
 /// root's own path inside the repository, with a trailing `/`) is stripped,
 /// and entries outside it are dropped.
 pub fn parse_status(raw: &[u8], prefix: &str) -> GitStatus {
-    let mut branch = None;
+    let mut header = BranchHeader::default();
     let mut entries = Vec::new();
     let mut records = raw.split(|byte| *byte == 0).filter(|r| !r.is_empty());
     let relative = |repo_path: &str| -> Option<ProjectPath> {
@@ -402,8 +745,8 @@ pub fn parse_status(raw: &[u8], prefix: &str) -> GitStatus {
     };
     while let Some(record) = records.next() {
         let text = String::from_utf8_lossy(record);
-        if let Some(header) = text.strip_prefix("## ") {
-            branch = parse_branch_header(header);
+        if let Some(line) = text.strip_prefix("## ") {
+            header = parse_branch_header(line);
             continue;
         }
         let mut chars = text.chars();
@@ -430,17 +773,125 @@ pub fn parse_status(raw: &[u8], prefix: &str) -> GitStatus {
             worktree,
         });
     }
-    GitStatus { branch, entries }
+    GitStatus {
+        branch: header.branch,
+        upstream: header.upstream,
+        ahead: header.ahead,
+        behind: header.behind,
+        upstream_gone: header.gone,
+        entries,
+    }
 }
 
-fn parse_branch_header(header: &str) -> Option<String> {
+/// The `## ...` line of `git status --porcelain=v1 --branch`, parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchHeader {
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub gone: bool,
+}
+
+/// Parses `main...origin/main [ahead 1, behind 2]`, `main`, `No commits
+/// yet on main`, `HEAD (no branch)` and the `[gone]` marker.
+pub fn parse_branch_header(header: &str) -> BranchHeader {
+    let mut result = BranchHeader::default();
     if header.starts_with("HEAD (no branch)") {
-        return None;
+        return result;
     }
-    let name = header.strip_prefix("No commits yet on ").unwrap_or(header);
-    let name = name.split("...").next().unwrap_or(name);
-    let name = name.split(' ').next().unwrap_or(name);
-    (!name.is_empty()).then(|| name.to_string())
+    let header = header
+        .strip_prefix("No commits yet on ")
+        .or_else(|| header.strip_prefix("Initial commit on "))
+        .unwrap_or(header);
+    let (refs, tracking) = match header.split_once(" [") {
+        Some((refs, rest)) => (refs, rest.trim_end_matches(']')),
+        None => (header, ""),
+    };
+    let (branch, upstream) = match refs.split_once("...") {
+        Some((branch, upstream)) => (branch, Some(upstream)),
+        None => (refs, None),
+    };
+    let branch = branch.trim();
+    result.branch = (!branch.is_empty()).then(|| branch.to_string());
+    result.upstream = upstream
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string);
+    for part in tracking.split(", ") {
+        if let Some(n) = part.strip_prefix("ahead ") {
+            result.ahead = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = part.strip_prefix("behind ") {
+            result.behind = n.trim().parse().unwrap_or(0);
+        } else if part.trim() == "gone" {
+            result.gone = true;
+        }
+    }
+    result
+}
+
+/// Parses `git for-each-ref --format=%(refname:short)%00%(HEAD)%00%(upstream:short)`
+/// with records separated by newlines.
+pub fn parse_branches(raw: &[u8]) -> Vec<GitBranch> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\0');
+            let name = fields.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let current = fields.next().is_some_and(|head| head.trim() == "*");
+            let upstream = fields
+                .next()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string);
+            Some(GitBranch {
+                name: name.to_string(),
+                current,
+                upstream,
+            })
+        })
+        .collect()
+}
+
+/// Whether `name` is acceptable as a new local branch name — the rules of
+/// `git check-ref-format --branch`, checked here first so the GUI can
+/// validate as the user types (git still has the final word).
+pub fn validate_branch_name(name: &str) -> Result<(), String> {
+    let name_ref = name;
+    if name_ref.is_empty() {
+        return Err("a branch needs a name".to_string());
+    }
+    if name_ref != name_ref.trim() || name_ref.chars().any(char::is_whitespace) {
+        return Err("branch names can't contain spaces".to_string());
+    }
+    if name_ref.starts_with('-') {
+        return Err("branch names can't start with '-'".to_string());
+    }
+    if name_ref == "@" || name_ref == "HEAD" {
+        return Err(format!("'{name_ref}' is reserved"));
+    }
+    if let Some(bad) = name_ref
+        .chars()
+        .find(|c| c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Err(format!("branch names can't contain '{bad}'"));
+    }
+    if name_ref.contains("..") || name_ref.contains("@{") || name_ref.contains("//") {
+        return Err("branch names can't contain '..', '@{' or '//'".to_string());
+    }
+    if name_ref.ends_with('/') || name_ref.ends_with('.') || name_ref.ends_with(".lock") {
+        return Err("branch names can't end with '/', '.' or '.lock'".to_string());
+    }
+    if name_ref
+        .split('/')
+        .any(|component| component.is_empty() || component.starts_with('.'))
+    {
+        return Err("no part of a branch name may be empty or start with '.'".to_string());
+    }
+    Ok(())
 }
 
 pub fn parse_log(raw: &[u8]) -> Vec<GitLogEntry> {
@@ -519,11 +970,332 @@ pub(crate) mod tests {
         assert_eq!(status.entries[1].marker(), 'R');
         assert!(status.entries[1].has_staged());
         assert_eq!(status.entries[2].marker(), 'A');
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((status.ahead, status.behind), (1, 0));
         assert_eq!(
-            parse_branch_header("No commits yet on main").as_deref(),
+            parse_branch_header("No commits yet on main")
+                .branch
+                .as_deref(),
             Some("main")
         );
-        assert_eq!(parse_branch_header("HEAD (no branch)"), None);
+        assert_eq!(parse_branch_header("HEAD (no branch)").branch, None);
+    }
+
+    #[test]
+    fn branch_headers_parse_upstream_ahead_behind_and_gone() {
+        let both = parse_branch_header("feature/x...origin/feature/x [ahead 2, behind 13]");
+        assert_eq!(both.branch.as_deref(), Some("feature/x"));
+        assert_eq!(both.upstream.as_deref(), Some("origin/feature/x"));
+        assert_eq!((both.ahead, both.behind, both.gone), (2, 13, false));
+        let behind = parse_branch_header("main...upstream/main [behind 4]");
+        assert_eq!((behind.ahead, behind.behind), (0, 4));
+        let gone = parse_branch_header("old...origin/old [gone]");
+        assert!(gone.gone);
+        assert_eq!(gone.upstream.as_deref(), Some("origin/old"));
+        let plain = parse_branch_header("main");
+        assert_eq!(plain.branch.as_deref(), Some("main"));
+        assert_eq!(plain.upstream, None);
+        assert_eq!((plain.ahead, plain.behind), (0, 0));
+        let fresh = parse_branch_header("No commits yet on dev...origin/dev");
+        assert_eq!(fresh.branch.as_deref(), Some("dev"));
+        assert_eq!(fresh.upstream.as_deref(), Some("origin/dev"));
+    }
+
+    #[test]
+    fn status_summary_reads_like_a_branch_indicator() {
+        let mut status = GitStatus {
+            branch: Some("main".to_string()),
+            ..GitStatus::default()
+        };
+        assert_eq!(status.summary(), "main");
+        status.ahead = 2;
+        status.behind = 1;
+        status.entries.push(GitStatusEntry {
+            path: p("a.rs"),
+            original_path: None,
+            index: ' ',
+            worktree: 'M',
+        });
+        assert_eq!(status.summary(), "main ↑2 ↓1 •1");
+        status.branch = None;
+        assert!(status.summary().starts_with("detached"));
+    }
+
+    #[test]
+    fn branch_list_parsing_marks_the_current_branch() {
+        let raw = b"feature\0 \0origin/feature\nmain\0*\0origin/main\nwip\0 \0\n";
+        let branches = parse_branches(raw);
+        assert_eq!(branches.len(), 3);
+        assert_eq!(branches[0].name, "feature");
+        assert!(!branches[0].current);
+        assert_eq!(branches[0].upstream.as_deref(), Some("origin/feature"));
+        assert!(branches[1].current);
+        assert_eq!(branches[2].upstream, None);
+    }
+
+    #[test]
+    fn branch_names_are_validated_like_git_does() {
+        for good in ["feature/login", "fix-1", "release/v1.0", "a_b"] {
+            assert!(validate_branch_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            " x",
+            "has space",
+            "-flag",
+            "a..b",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "end/",
+            "end.",
+            "x.lock",
+            "a//b",
+            ".hidden",
+            "a/.b",
+            "@",
+            "HEAD",
+            "a@{b",
+        ] {
+            assert!(
+                validate_branch_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// A repository cloned from a local bare "remote" (no network), with an
+    /// identity configured in both, plus a second clone to make upstream
+    /// changes from.
+    fn repo_with_remote() -> (TempDir, LocalProject, LocalProject) {
+        let tmp = tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "main"]);
+        git(&seed, &["config", "user.name", "Duet Test"]);
+        git(&seed, &["config", "user.email", "duet@example.invalid"]);
+        git(&seed, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(seed.join("a.txt"), "one\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-q", "-m", "initial"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-q", "-u", "origin", "main"]);
+        let work = tmp.path().join("work");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+        );
+        git(&work, &["config", "user.name", "Duet Test"]);
+        git(&work, &["config", "user.email", "duet@example.invalid"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        (tmp, LocalProject::new(work), LocalProject::new(seed))
+    }
+
+    #[test]
+    fn create_and_switch_branches_never_force() {
+        let (_tmp, project) = repo();
+        let git_service = GitService::new(&project);
+        assert_eq!(
+            git_service.branches().unwrap(),
+            vec![GitBranch {
+                name: "main".to_string(),
+                current: true,
+                upstream: None
+            }]
+        );
+        assert!(matches!(
+            git_service.create_branch("bad name"),
+            Err(GitError::Invalid(_))
+        ));
+        git_service.create_branch("feature/login").unwrap();
+        assert_eq!(
+            git_service.status().unwrap().branch.as_deref(),
+            Some("feature/login")
+        );
+        assert!(matches!(
+            git_service.create_branch("main"),
+            Err(GitError::Invalid(message)) if message.contains("already exists")
+        ));
+        // Commit a change on the feature branch.
+        project
+            .write(&p("src/auth.rs"), b"fn login() { v2() }\n")
+            .unwrap();
+        git_service.stage_all().unwrap();
+        git_service.commit("v2").unwrap();
+
+        // An uncommitted edit that the switch would overwrite: git refuses,
+        // and the edit is still there afterwards — no force, no stash.
+        project.write(&p("src/auth.rs"), b"local edit\n").unwrap();
+        let refused = git_service.switch_branch("main").unwrap_err();
+        assert!(
+            matches!(&refused, GitError::Failed(m) if m.contains("overwritten")),
+            "{refused:?}"
+        );
+        assert_eq!(project.read(&p("src/auth.rs")).unwrap(), b"local edit\n");
+        assert_eq!(
+            git_service.status().unwrap().branch.as_deref(),
+            Some("feature/login")
+        );
+
+        // Unknown branches are refused rather than guessed.
+        assert!(matches!(
+            git_service.switch_branch("nope"),
+            Err(GitError::Invalid(_))
+        ));
+
+        git_service.discard(&[p("src/auth.rs")], true).unwrap();
+        git_service.switch_branch("main").unwrap();
+        assert_eq!(project.read(&p("src/auth.rs")).unwrap(), b"fn login() {}\n");
+        let names: Vec<_> = git_service
+            .branches()
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.name, b.current))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("feature/login".to_string(), false),
+                ("main".to_string(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_all_and_unstage_all_cover_the_whole_project() {
+        let (_tmp, project) = repo();
+        let git_service = GitService::new(&project);
+        project.write(&p("src/auth.rs"), b"changed\n").unwrap();
+        project.write(&p("docs/new.md"), b"new\n").unwrap();
+        git_service.stage_all().unwrap();
+        let status = git_service.status().unwrap();
+        assert_eq!(status.staged_count(), 2);
+        assert_eq!(status.unstaged_count(), 0);
+        git_service.unstage_all().unwrap();
+        let status = git_service.status().unwrap();
+        assert_eq!(status.staged_count(), 0);
+        assert_eq!(status.unstaged_count(), 2);
+        // Working tree untouched.
+        assert_eq!(project.read(&p("src/auth.rs")).unwrap(), b"changed\n");
+    }
+
+    #[test]
+    fn fetch_pull_and_push_against_a_local_remote() {
+        let (_tmp, work, seed) = repo_with_remote();
+        let git_service = GitService::new(&work);
+        let status = git_service.status().unwrap();
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((status.ahead, status.behind), (0, 0));
+
+        // Upstream moves on: fetch notices, pull fast-forwards.
+        std::fs::write(seed.root().join("a.txt"), "two\n").unwrap();
+        git(seed.root(), &["commit", "-q", "-am", "two"]);
+        git(seed.root(), &["push", "-q"]);
+        let fetched = git_service.fetch().unwrap();
+        assert!(fetched.message.contains("1 behind"), "{fetched:?}");
+        assert_eq!(git_service.status().unwrap().behind, 1);
+        let pulled = git_service.pull().unwrap();
+        assert!(pulled.message.contains("Pulled 1 commit"), "{pulled:?}");
+        assert_eq!(work.read(&p("a.txt")).unwrap(), b"two\n");
+        assert_eq!(git_service.status().unwrap().behind, 0);
+
+        // A local commit: ahead 1, push sends it.
+        work.write(&p("b.txt"), b"local\n").unwrap();
+        git_service.stage_all().unwrap();
+        git_service.commit("local").unwrap();
+        assert_eq!(git_service.status().unwrap().ahead, 1);
+        let pushed = git_service.push(false).unwrap();
+        assert!(pushed.message.contains("Pushed 1 commit"), "{pushed:?}");
+        assert_eq!(git_service.status().unwrap().ahead, 0);
+
+        // A new branch has no upstream: push refuses until asked explicitly.
+        git_service.create_branch("feature").unwrap();
+        match git_service.push(false) {
+            Err(GitError::UpstreamRequired(target)) => {
+                assert_eq!(target.remote, "origin");
+                assert_eq!(target.branch, "feature");
+            }
+            other => panic!("expected UpstreamRequired, got {other:?}"),
+        }
+        let published = git_service.push(true).unwrap();
+        assert!(published.message.contains("origin/feature"));
+        assert_eq!(
+            git_service.status().unwrap().upstream.as_deref(),
+            Some("origin/feature")
+        );
+        // Pull without an upstream is refused with a reason, not attempted.
+        git_service.create_branch("lonely").unwrap();
+        assert!(
+            matches!(git_service.pull(), Err(GitError::Invalid(m)) if m.contains("no upstream"))
+        );
+    }
+
+    #[test]
+    fn pull_refuses_to_merge_diverged_history_and_push_never_forces() {
+        let (_tmp, work, seed) = repo_with_remote();
+        let git_service = GitService::new(&work);
+        std::fs::write(seed.root().join("a.txt"), "upstream\n").unwrap();
+        git(seed.root(), &["commit", "-q", "-am", "upstream"]);
+        git(seed.root(), &["push", "-q"]);
+        work.write(&p("c.txt"), b"mine\n").unwrap();
+        git_service.stage_all().unwrap();
+        git_service.commit("mine").unwrap();
+        let head_before = git_service.log(None, 1).unwrap()[0].hash.clone();
+
+        git_service.fetch().unwrap();
+        let status = git_service.status().unwrap();
+        assert_eq!((status.ahead, status.behind), (1, 1));
+        let refused = git_service.pull().unwrap_err();
+        assert!(
+            matches!(&refused, GitError::Failed(m) if m.contains("diverged")),
+            "{refused:?}"
+        );
+        // Nothing merged or rebased.
+        assert_eq!(git_service.log(None, 1).unwrap()[0].hash, head_before);
+        assert_eq!(work.read(&p("a.txt")).unwrap(), b"one\n");
+
+        let rejected = git_service.push(false).unwrap_err();
+        assert!(
+            matches!(&rejected, GitError::Failed(m) if m.contains("never force")),
+            "{rejected:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_without_a_remote_explains_itself() {
+        let (_tmp, project) = repo();
+        let git_service = GitService::new(&project);
+        assert!(
+            matches!(git_service.fetch(), Err(GitError::Invalid(m)) if m.contains("no remote"))
+        );
+        assert!(matches!(git_service.pull(), Err(GitError::Invalid(_))));
+        assert!(
+            matches!(git_service.push(false), Err(GitError::Invalid(m)) if m.contains("no remote"))
+        );
     }
 
     #[test]

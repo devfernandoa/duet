@@ -358,7 +358,14 @@ impl ProjectCommands for LocalProject {
         stdin: Option<&[u8]>,
     ) -> std::io::Result<CommandOutput> {
         use std::process::{Command, Stdio};
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        if program == "git" {
+            // Never block on a credential prompt: there is no terminal to
+            // answer it, so a fetch/push that needs one fails with git's
+            // own message instead of hanging.
+            command.env("GIT_TERMINAL_PROMPT", "0");
+        }
+        let mut child = command
             .args(args)
             .current_dir(&self.root)
             .stdin(if stdin.is_some() {

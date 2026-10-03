@@ -1073,7 +1073,7 @@ pub(super) fn portal_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuIte
     ));
     let app_c = Rc::clone(app);
     items.push((
-        "Clear browsing data".to_string(),
+        "! Clear browsing data".to_string(),
         Box::new(move || App::clear_portal_data(&app_c, id)),
     ));
     items

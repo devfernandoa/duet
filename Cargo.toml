@@ -1,6 +1,6 @@
 [package]
 name = "duet"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 description = "A GTK4 desktop app for running and orchestrating multiple AI coding agents on a persistent canvas"

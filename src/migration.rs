@@ -40,7 +40,7 @@
 //!   version still moves so a file that *uses* the new shape is never
 //!   silently half-read by an older binary: that binary sees version 6 and
 //!   takes the future-schema backup path below instead.
-//! - 7 (current): Milestone 8's browser portals. `PortalPayload` (until now
+//! - 7: Milestone 8's browser portals. `PortalPayload` (until now
 //!   a placeholder holding only `url`) gains `name`, a required `profile`
 //!   (`model::PortalProfile`, the portal's isolated browser-storage
 //!   identity) and `allow_scripts`. `name`/`allow_scripts` default through
@@ -49,6 +49,14 @@
 //!   the next save — so [`migrate_v6_portals`] derives one explicitly and
 //!   deterministically from the node id (UUIDv5) for every pre-7 portal.
 //!   Every other node is untouched.
+//! - 8 (current): Milestone 7.5's real Drawing and Group nodes. A
+//!   `DrawingPayload` gains `strokes` (vector, normalized points) and a
+//!   `GroupPayload` gains `color`; both `#[serde(default)]`, so a schema-7
+//!   placeholder Drawing loads as an empty drawing and a placeholder Group
+//!   (with its possibly-empty `label`) as a blue section titled "Group" —
+//!   no conversion step. The version moves so an older binary, which would
+//!   silently drop the strokes and colors on its next save, refuses the
+//!   file instead (the future-schema backup path).
 //!
 //! A `schema_version` *greater* than [`CURRENT_SCHEMA_VERSION`] means the
 //! file was written by a newer duet. Rather than guess at a shape it has
@@ -69,7 +77,7 @@ use uuid::Uuid;
 
 /// The schema version this binary reads and writes. Bump this and add a
 /// migration step below whenever `Store`'s on-disk shape changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Plain-function form of [`CURRENT_SCHEMA_VERSION`], for serde's
 /// `#[serde(default = "...")]` attribute on `Store::schema_version` (which
@@ -439,11 +447,11 @@ pub fn load(path: &Path, contents: &str) -> (Store, Option<String>) {
             return backup_future_schema_file(path, version);
         }
         if version >= 4 {
-            // Schemas 4 through 7 share the same nodes/edges shape; 5 and 6
-            // only add new fields/variants, every field `#[serde(default)]`,
-            // so a schema-4 or -5 file deserializes directly as the current
-            // `Store` with no dedicated conversion step. 7 additionally
-            // needs every portal's stable profile id filled in first.
+            // Schemas 4 through 8 share the same nodes/edges shape; 5, 6 and
+            // 8 only add new fields/variants, every field `#[serde(default)]`,
+            // so such a file deserializes directly as the current `Store`
+            // with no dedicated conversion step. 7 additionally needs every
+            // portal's stable profile id filled in first.
             let mut value = value;
             if version < 7 {
                 migrate_v6_portals(&mut value);
@@ -694,7 +702,72 @@ mod tests {
         resaved.save(&path).unwrap();
         let (reloaded, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
         assert!(warning.is_none());
-        assert_eq!(reloaded.schema_version, 7);
+        assert_eq!(reloaded.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(reloaded.workspaces[0].nodes, store.workspaces[0].nodes);
+    }
+
+    /// Schema 7 had Drawing and Group only as placeholders: a Drawing with
+    /// no data at all and a Group with just a (often empty) label. Both
+    /// load as real nodes with their geometry and layering intact, and
+    /// round-trip through a schema-8 save.
+    #[test]
+    fn v7_placeholder_groups_and_drawings_load_as_real_nodes() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        let contents = r##"{
+            "schema_version": 7,
+            "workspaces": [{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "web",
+                "root_dir": "/home/fernando/web",
+                "nodes": [
+                    {
+                        "id": "00000000-0000-0000-0000-00000000000a",
+                        "position": [10.0, 20.0],
+                        "size": [600.0, 400.0],
+                        "z_order": 4,
+                        "locked": true,
+                        "kind": {"kind": "Group", "label": ""}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-00000000000b",
+                        "position": [0.0, 0.0],
+                        "size": [220.0, 160.0],
+                        "kind": {"kind": "Group", "label": "Backend"}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-00000000000c",
+                        "position": [30.0, 40.0],
+                        "size": [300.0, 200.0],
+                        "kind": {"kind": "Drawing"}
+                    }
+                ],
+                "edges": [],
+                "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
+            }],
+            "active_workspace": "00000000-0000-0000-0000-000000000000"
+        }"##;
+        write(&path, contents);
+        let (store, warning) = load(&path, contents);
+        assert!(warning.is_none(), "{warning:?}");
+        let nodes = &store.workspaces[0].nodes;
+        let NodeKind::Group(first) = &nodes[0].kind else {
+            panic!("expected a group")
+        };
+        assert_eq!(first.title(), "Group");
+        assert_eq!(first.color_name(), "blue");
+        assert_eq!(nodes[0].position, (10.0, 20.0));
+        assert_eq!(nodes[0].size, (600.0, 400.0));
+        assert_eq!(nodes[0].z_order, 4);
+        assert!(nodes[0].locked);
+        assert!(matches!(&nodes[1].kind, NodeKind::Group(g) if g.title() == "Backend"));
+        assert!(matches!(&nodes[2].kind, NodeKind::Drawing(d) if d.strokes.is_empty()));
+
+        let resaved = Store::new(store.workspaces.clone(), store.active_workspace, Vec::new());
+        resaved.save(&path).unwrap();
+        let (reloaded, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
+        assert!(warning.is_none());
+        assert_eq!(reloaded.schema_version, 8);
         assert_eq!(reloaded.workspaces[0].nodes, store.workspaces[0].nodes);
     }
 
