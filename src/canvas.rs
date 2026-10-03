@@ -90,14 +90,13 @@ type MarqueeRect = Rc<RefCell<Option<((f64, f64), (f64, f64))>>>;
 pub struct Canvas {
     pub overlay: gtk4::Overlay,
     pub fixed: gtk4::Fixed,
-    /// Graph-paper backdrop, *behind* the cards. A separate widget from
-    /// `links_area` purely for z-order: `gtk4::Overlay` paints its base child
-    /// first and each added overlay on top, so the only way to get grid →
-    /// cards → link lines is three layers. Drawing the grid in the same
-    /// callback as the links painted it over every card.
+    /// Graph-paper backdrop, *behind* everything. `gtk4::Overlay` paints its
+    /// base child first and each added overlay on top, so the stacking is
+    /// grid → link lines → cards → marquee, one layer each.
     pub grid_area: gtk4::DrawingArea,
-    /// Link lines, *in front of* the cards — they connect card edges, so a
-    /// line that disappeared under a card would read as broken.
+    /// Link lines, between the grid and the cards: they run from card edge
+    /// to card edge, so they stay visible, but never paint over a card's
+    /// title bar or content.
     pub links_area: gtk4::DrawingArea,
     pub state: Rc<RefCell<CanvasState>>,
     nodes: Rc<RefCell<Vec<CanvasNode>>>,
@@ -131,8 +130,11 @@ impl Canvas {
 
         let overlay = gtk4::Overlay::new();
         overlay.set_child(Some(&grid_area));
-        overlay.add_overlay(&fixed);
+        // Connection lines sit *under* the cards: a line is context, the
+        // card is content, and a line crossing a title bar or a terminal
+        // made both harder to read and use.
         overlay.add_overlay(&links_area);
+        overlay.add_overlay(&fixed);
         overlay.add_overlay(&marquee_area);
 
         let state = Rc::new(RefCell::new(CanvasState::new()));
@@ -287,10 +289,14 @@ impl Canvas {
         }
         fixed.add_controller(motion);
 
-        let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-        // A terminal consumes its own scrolls for scrollback before this
-        // bubble-phase canvas handler sees them. On empty canvas, the wheel
-        // reaches here and zooms the spatial view.
+        // Scrolling over empty canvas pans it (two-finger scroll or a wheel,
+        // both axes); Ctrl+scroll zooms around the pointer, by an amount
+        // proportional to the scroll — so a touchpad's stream of tiny
+        // deltas zooms smoothly instead of jumping a full step per event.
+        // Pinching on a touchpad zooms too (`GestureZoom` below). A card's
+        // own scrollable content (terminal scrollback, a tree, an editor)
+        // consumes its scrolls before this bubble-phase handler sees them.
+        let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
         scroll.set_propagation_phase(gtk4::PropagationPhase::Bubble);
         {
             let state = Rc::clone(&state);
@@ -298,21 +304,67 @@ impl Canvas {
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
             let pointer_position = Rc::clone(&pointer_position);
-            scroll.connect_scroll(move |_controller, _dx, dy| {
+            scroll.connect_scroll(move |controller, dx, dy| {
+                let wheel = controller.unit() == gtk4::gdk::ScrollUnit::Wheel;
+                let zoom_requested = controller
+                    .current_event_state()
+                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let mut state = state.borrow_mut();
-                // Preserve the world-space point under the pointer, rather
-                // than scaling from the canvas origin. This makes the card or
-                // empty region the user is looking at stay under the cursor.
-                let cursor = *pointer_position.borrow();
-                let old_zoom = state.zoom;
-                state.zoom *= if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
-                state.clamp_zoom();
-                state.pan = pan_keeping_anchor_fixed(cursor, state.pan, old_zoom, state.zoom);
+                if zoom_requested {
+                    // Preserve the world-space point under the pointer, so
+                    // whatever the user is looking at stays under the cursor.
+                    let cursor = *pointer_position.borrow();
+                    let old_zoom = state.zoom;
+                    let notches = if wheel {
+                        dy
+                    } else {
+                        dy / SURFACE_PIXELS_PER_NOTCH
+                    };
+                    state.zoom *= ZOOM_STEP.powf(-notches);
+                    state.clamp_zoom();
+                    state.pan = pan_keeping_anchor_fixed(cursor, state.pan, old_zoom, state.zoom);
+                } else {
+                    let scale = if wheel { WHEEL_PAN_PIXELS } else { 1.0 };
+                    let zoom = state.zoom;
+                    state.pan = (
+                        state.pan.0 - dx * scale / zoom,
+                        state.pan.1 - dy * scale / zoom,
+                    );
+                }
                 apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
                 glib::Propagation::Stop
             });
         }
         fixed.add_controller(scroll);
+
+        let pinch = gtk4::GestureZoom::new();
+        let pinch_start: Rc<RefCell<(f64, (f64, f64))>> = Rc::new(RefCell::new((1.0, (0.0, 0.0))));
+        {
+            let state = Rc::clone(&state);
+            let pinch_start = Rc::clone(&pinch_start);
+            pinch.connect_begin(move |gesture, _sequence| {
+                let state = state.borrow();
+                let center = gesture.bounding_box_center().unwrap_or((0.0, 0.0));
+                *pinch_start.borrow_mut() = (state.zoom, center);
+            });
+        }
+        {
+            let state = Rc::clone(&state);
+            let nodes = Rc::clone(&nodes);
+            let fixed = fixed.clone();
+            let grid_area = grid_area.clone();
+            let pinch_start = Rc::clone(&pinch_start);
+            pinch.connect_scale_changed(move |_gesture, scale| {
+                let (start_zoom, center) = *pinch_start.borrow();
+                let mut state = state.borrow_mut();
+                let old_zoom = state.zoom;
+                state.zoom = start_zoom * scale;
+                state.clamp_zoom();
+                state.pan = pan_keeping_anchor_fixed(center, state.pan, old_zoom, state.zoom);
+                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+            });
+        }
+        fixed.add_controller(pinch);
 
         {
             let state = Rc::clone(&state);
@@ -501,6 +553,13 @@ const GRID_MAJOR: f64 = 500.0;
 /// Multiplicative zoom per step, shared by Ctrl+scroll and Ctrl+Plus/Minus
 /// so the two agree on what "one notch" means.
 const ZOOM_STEP: f64 = 1.1;
+
+/// How far one mouse-wheel notch pans the canvas, in screen pixels. A
+/// touchpad already reports its scroll in pixels and isn't scaled.
+const WHEEL_PAN_PIXELS: f64 = 60.0;
+
+/// How many pixels of touchpad Ctrl+scroll count as one zoom notch.
+const SURFACE_PIXELS_PER_NOTCH: f64 = 25.0;
 
 /// The four control points of a link's cubic Bezier, in world space. The
 /// handles stick straight out sideways from each card edge, which is what

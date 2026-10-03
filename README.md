@@ -62,16 +62,26 @@ a direct child of it.
 
 Every object on the canvas — a terminal, a note, a plain-text label — is a
 persisted node with a stable id, position, size, z-order, collapsed/locked
-state, and (for terminals) an assigned role. `FileTree`, `Portal`, `Drawing`,
-and `Group` exist as placeholder node kinds today (creatable from the edit
+state, and (for terminals) an assigned role. `Portal`, `Drawing`, and
+`Group` exist as placeholder node kinds today (creatable from the edit
 menu's Create section) ahead of the milestones that give them real behavior.
 
-Click to select, Shift/Ctrl-click to add to the selection, Shift-drag empty
-canvas for a marquee select. Drag a card's own title bar to move it (dragging
-one of several selected nodes moves all of them together); drag its
-bottom-right corner to resize it. Drag empty canvas space to pan everything
-at once, and `Ctrl+scroll` (or the zoom buttons / `Ctrl +`/`Ctrl -`/`Ctrl 0`)
-to zoom. The edit-menu button (no keyboard accelerator of its own, since a
+Every card works the same way:
+
+- **Click anywhere on it** to select it and bring it to the front
+  (Shift/Ctrl-click adds to the selection; Shift-drag empty canvas for a
+  marquee).
+- **Drag its title bar** — the name included — to move it (dragging one of
+  several selected cards moves them all); drag its bottom-right corner to
+  resize it.
+- Its title bar only shows its name, status, **collapse** (`⌃`) and
+  **close**. **Right-click the title bar** for everything else: rename,
+  restart, Edit/Preview, save, find, Git actions, "Connect to another
+  card…", lock, duplicate, delete.
+
+Scroll (two-finger or mouse wheel) over empty canvas to pan; `Ctrl+scroll`
+or a touchpad pinch zooms around the pointer (the zoom buttons and
+`Ctrl +`/`Ctrl -`/`Ctrl 0` work too). The edit-menu button (no keyboard accelerator of its own, since a
 focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) holds
 selection, layout (align/distribute), duplicate/copy/paste, undo/redo,
 front/back ordering, lock/collapse, snap-to-grid, and node creation.
@@ -85,24 +95,22 @@ program and any arguments). The same dialog assigns a role (see
 account to use.
 
 Only Claude and Codex support handing a session off to "the other" agent via
-each card's handoff button — summarize the outgoing conversation, then open
+"Hand off to the other agent" in the card's menu — summarize the outgoing conversation, then open
 the incoming agent with that summary as its first prompt. The other
 providers are plain interactive processes with no equivalent resumable
-session, so their handoff button reports that it's unsupported instead of
-doing something meaningless.
+session, so handing off reports that it's unsupported instead of doing
+something meaningless.
 
-Every card's title bar has a close button (kills the process, for a
-terminal), a link button (connect this card to another one — see
-[Roles and connections](#roles-and-connections)), and shows its current
-activity (`starting`, `idle`, `working`, `awaiting reply`, `offline`,
+A terminal's title bar shows its name (double-click to rename), role, and
+current activity (`starting`, `idle`, `working`, `awaiting reply`, `offline`,
 `finished`, `failed`) once it's knowable — nothing is guessed when it isn't.
 
 ### Notes
 
 Note cards edit and render Markdown: headings, lists, task lists, links,
 fenced and inline code, blockquotes, and tables (parsed, shown as plain rows
-rather than aligned cells). Switch between Edit, Preview, and Split with the
-note's mode button. Plain-text source editing is always available in Edit
+rather than aligned cells). Double-click a rendered note to edit it; switch
+between Edit, Preview, and Edit + preview from the note's menu. Plain-text source editing is always available in Edit
 mode — a Note is just Markdown source plus a render of it, never a separate
 representation that can drift from what you typed.
 
@@ -118,14 +126,18 @@ assigned it can recruit and dismiss other agents and reassign roles (see
 `duetctl agents create/remove/assign-role` below) — every other role can't,
 so recruiting permissions aren't handed out by default.
 
-Dragging a link from one terminal card to another (today's only
-edge-creation gesture, Terminal-only) records a connection and grants it the
-`SendMessages` capability automatically, since a drawn link between two
-agents is otherwise visually connected but functionally inert — there's no
-capability-editing UI yet to grant it any other way. `ReadNote`,
-`WriteNote`, `ControlPortal`, and `ShareContext` are representable
-capabilities too, reserved for the milestones that give them something to
-authorize. An edge with no capabilities is purely visual.
+To connect two cards, pick **Connect to another card…** from one card's
+menu, then click the other card (`Esc` cancels). What a connection grants
+depends on what it joins, since there's no capability editor yet:
+
+- terminal ↔ terminal: `SendMessages` (the agents can message each other);
+- terminal ↔ note: `ReadNote` + `WriteNote`;
+- terminal ↔ editor or file tree: `ShareContext` — the file or folder shows
+  up in that agent's `duetctl whoami` as context to start from;
+- anything else: a purely visual connection.
+
+Lines are drawn under the cards. Click a line to select it and click it
+again to delete it, or use **Remove connections** in a card's menu.
 
 ## Agent orchestration (`duetctl`)
 
@@ -252,13 +264,13 @@ conversation the way they used to.
 | Roles button / `Ctrl+Shift+R` | Open the role manager (list built-ins, create/edit/delete custom roles) |
 | Edit-menu button | Selection, layout (align/distribute), duplicate/copy/paste, undo/redo, front/back, lock/collapse, snap-to-grid, node creation — no accelerator (a focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) |
 | `Ctrl +` / `Ctrl -` / `Ctrl 0` | Zoom in / out / reset |
-| `Ctrl+scroll` | Zoom around the pointer |
 | Workspace button / `Ctrl+1`..`Ctrl+9` | Switch workspace (via dialog, or jump straight to the Nth) |
 | Per-card title-bar drag handle | Move just this card (doesn't pan the canvas) |
 | Per-card bottom-right grip | Resize this card |
 | Per-card close button | Remove this card (kills the process, for a terminal) |
-| Per-card link button | Start a link from this card; click another terminal card to complete it (grants `SendMessages`) |
-| Per-terminal handoff button | Hand this session off to the other agent (Claude ↔ Codex only) in place |
+| Right-click a card's title bar | The card's menu (rename, connect, collapse, lock, duplicate, delete, ...) |
+| Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
+| Scroll / `Ctrl+scroll` / pinch | Pan / zoom around the pointer / zoom |
 
 Errors (a failed restore, a failed create, account/role operations) surface
 as in-app toasts rather than being printed to the terminal duet was launched

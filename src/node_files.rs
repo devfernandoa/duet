@@ -9,7 +9,7 @@
 //! Self-contained widget behavior that needs no domain knowledge — find /
 //! replace, go to line, syntax highlighting, line selection — lives here.
 
-use crate::node::{CollapseHandle, resize_handle, wire_minimize};
+use crate::node::{CollapseHandle, as_drag_handle, resize_handle, wire_minimize};
 use gtk4::prelude::*;
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -72,24 +72,14 @@ fn flat_button(icon: &str, tooltip: &str) -> gtk4::Button {
     button
 }
 
-fn flat_toggle(icon: &str, tooltip: &str) -> gtk4::ToggleButton {
-    let button = gtk4::ToggleButton::new();
-    button.set_icon_name(icon);
-    button.add_css_class("flat");
-    button.set_tooltip_text(Some(tooltip));
-    button
-}
-
-/// Builds the shared card chrome (title bar with drag handle, minimize and
-/// close, resize grip, collapsible body) around `content`, returning
-/// `(container, title_bar, drag_handle, close_button, resize_handle,
-/// collapse)`. `title_bar` already holds `leading` widgets, then the drag
-/// handle; callers append their own trailing buttons before the
-/// minimize/close pair is appended by `finish_title_bar`.
+/// The shared card chrome (title bar, minimize and close, resize grip,
+/// collapsible body) around `content`. Callers append their own title
+/// widgets to `title_bar`; `finish_chrome` then appends the minimize/close
+/// pair and makes the whole bar the drag handle, the same as every other
+/// card (see `node::as_drag_handle`).
 struct Chrome {
     container: gtk4::Box,
     title_bar: gtk4::Box,
-    drag_handle: gtk4::Box,
     minimize_button: gtk4::Button,
     close_button: gtk4::Button,
     resize_handle: gtk4::Box,
@@ -97,9 +87,6 @@ struct Chrome {
 }
 
 fn chrome(content: &impl IsA<gtk4::Widget>, close_tooltip: &str) -> Chrome {
-    let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    drag_handle.set_hexpand(true);
-    drag_handle.set_cursor_from_name(Some("grab"));
     let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
     minimize_button.add_css_class("flat");
     let close_button = flat_button("window-close-symbolic", close_tooltip);
@@ -115,7 +102,6 @@ fn chrome(content: &impl IsA<gtk4::Widget>, close_tooltip: &str) -> Chrome {
     Chrome {
         container,
         title_bar,
-        drag_handle,
         minimize_button,
         close_button,
         resize_handle,
@@ -130,16 +116,26 @@ fn finish_chrome(
 ) -> CollapseHandle {
     chrome.title_bar.append(&chrome.minimize_button);
     chrome.title_bar.append(&chrome.close_button);
+    as_drag_handle(&chrome.title_bar);
     wire_minimize(
         &chrome.minimize_button,
         &chrome.body,
+        &chrome.container,
         collapsed,
         on_collapse_toggle,
     )
 }
 
-/// A FileTree card: a header of navigation/filter buttons and a search
-/// field over a `ListBox` of rows. Rows are rebuilt wholesale by
+/// An empty, expanding title-bar spacer.
+fn spacer() -> gtk4::Box {
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    spacer
+}
+
+/// A FileTree card: a search field over a `ListBox` of rows. Navigation,
+/// filters, refresh and commit live in the card's right-click menu (built
+/// by `app::files`), not on a toolbar. Rows are rebuilt wholesale by
 /// `set_items` — the tree only ever contains the directories the user
 /// expanded, so this stays small, and it keeps the widget a pure function of
 /// the data `app::files` computed.
@@ -151,14 +147,6 @@ pub struct FileTreeNode {
     pub resize_handle: gtk4::Box,
     pub collapse: CollapseHandle,
     pub title_label: gtk4::Label,
-    pub back_button: gtk4::Button,
-    pub forward_button: gtk4::Button,
-    pub up_button: gtk4::Button,
-    pub refresh_button: gtk4::Button,
-    pub collapse_all_button: gtk4::Button,
-    pub hidden_toggle: gtk4::ToggleButton,
-    pub gitignore_toggle: gtk4::ToggleButton,
-    pub commit_button: gtk4::Button,
     pub search_entry: gtk4::SearchEntry,
     pub status_label: gtk4::Label,
     pub list: gtk4::ListBox,
@@ -191,29 +179,6 @@ impl FileTreeNode {
         scroller.set_vexpand(true);
         scroller.set_hscrollbar_policy(gtk4::PolicyType::Never);
 
-        let back_button = flat_button("go-previous-symbolic", "Back");
-        let forward_button = flat_button("go-next-symbolic", "Forward");
-        let up_button = flat_button("go-up-symbolic", "Parent directory");
-        let refresh_button = flat_button("view-refresh-symbolic", "Refresh");
-        let collapse_all_button = flat_button("view-restore-symbolic", "Collapse all");
-        let hidden_toggle = flat_toggle("view-reveal-symbolic", "Show hidden files");
-        let gitignore_toggle = flat_toggle("action-unavailable-symbolic", "Hide .gitignored files");
-        let commit_button = flat_button("emblem-ok-symbolic", "Commit staged changes…");
-        let toolbar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        toolbar.add_css_class("file-tree-toolbar");
-        for button in [
-            &back_button,
-            &forward_button,
-            &up_button,
-            &refresh_button,
-            &collapse_all_button,
-        ] {
-            toolbar.append(button);
-        }
-        toolbar.append(&hidden_toggle);
-        toolbar.append(&gitignore_toggle);
-        toolbar.append(&commit_button);
-
         let search_entry = gtk4::SearchEntry::new();
         search_entry.set_placeholder_text(Some("Find file… (> to search contents)"));
         search_entry.set_margin_start(4);
@@ -227,7 +192,7 @@ impl FileTreeNode {
         status_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-        content.append(&toolbar);
+        search_entry.set_margin_top(4);
         content.append(&search_entry);
         content.append(&scroller);
         content.append(&status_label);
@@ -241,7 +206,7 @@ impl FileTreeNode {
         title_label.set_max_width_chars(18);
         chrome.title_bar.append(&icon);
         chrome.title_bar.append(&title_label);
-        chrome.title_bar.append(&chrome.drag_handle);
+        chrome.title_bar.append(&spacer());
         let collapse = finish_chrome(&chrome, collapsed, on_collapse_toggle);
         chrome
             .container
@@ -253,20 +218,12 @@ impl FileTreeNode {
         aux_popover.set_parent(&title_label);
 
         let node = FileTreeNode {
+            drag_handle: chrome.title_bar.clone(),
             container: chrome.container,
-            drag_handle: chrome.drag_handle,
             close_button: chrome.close_button,
             resize_handle: chrome.resize_handle,
             collapse,
             title_label,
-            back_button,
-            forward_button,
-            up_button,
-            refresh_button,
-            collapse_all_button,
-            hidden_toggle,
-            gitignore_toggle,
-            commit_button,
             search_entry,
             status_label,
             list,
@@ -543,18 +500,6 @@ pub struct EditorNode {
     pub collapse: CollapseHandle,
     pub title_label: gtk4::Label,
     pub status_label: gtk4::Label,
-    pub save_button: gtk4::Button,
-    pub reload_button: gtk4::Button,
-    pub find_button: gtk4::Button,
-    pub goto_button: gtk4::Button,
-    pub actions_button: gtk4::MenuButton,
-    /// Buttons inside `actions_button`'s popover, wired by `app::files`.
-    pub copy_reference_button: gtk4::Button,
-    pub ask_agent_button: gtk4::Button,
-    pub diff_button: gtk4::Button,
-    pub source_button: gtk4::Button,
-    pub stage_button: gtk4::Button,
-    pub unstage_button: gtk4::Button,
     pub view: sourceview5::View,
     pub buffer: sourceview5::Buffer,
     search_bar: gtk4::Box,
@@ -692,94 +637,31 @@ impl EditorNode {
         let status_label = gtk4::Label::new(None);
         status_label.add_css_class("dim-label");
         status_label.add_css_class("caption");
-        let save_button = flat_button("document-save-symbolic", "Save (Ctrl+S)");
-        let reload_button = flat_button("view-refresh-symbolic", "Reload from disk");
-        let find_button = flat_button("edit-find-symbolic", "Find / replace (Ctrl+F, Ctrl+H)");
-        let goto_button = flat_button("go-jump-symbolic", "Go to line (Ctrl+G)");
-
         let goto_entry = gtk4::Entry::new();
         goto_entry.set_placeholder_text(Some("Line number"));
         goto_entry.set_input_purpose(gtk4::InputPurpose::Digits);
         let goto_popover = gtk4::Popover::new();
         goto_popover.set_child(Some(&goto_entry));
-        goto_popover.set_parent(&goto_button);
-
-        let copy_reference_button = gtk4::Button::with_label("Copy reference");
-        let ask_agent_button = gtk4::Button::with_label("Ask an agent about this…");
-        let diff_button = gtk4::Button::with_label("Show diff");
-        let source_button = gtk4::Button::with_label("Open source");
-        let stage_button = gtk4::Button::with_label("Stage file");
-        let unstage_button = gtk4::Button::with_label("Unstage file");
-        let actions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        for button in [
-            &copy_reference_button,
-            &ask_agent_button,
-            &diff_button,
-            &source_button,
-            &stage_button,
-            &unstage_button,
-        ] {
-            button.add_css_class("flat");
-            if let Some(label) = button.child().and_downcast::<gtk4::Label>() {
-                label.set_xalign(0.0);
-            }
-            actions_box.append(button);
-        }
-        let actions_popover = gtk4::Popover::new();
-        actions_popover.set_child(Some(&actions_box));
-        let actions_button = gtk4::MenuButton::new();
-        actions_button.set_icon_name("view-more-symbolic");
-        actions_button.add_css_class("flat");
-        actions_button.set_tooltip_text(Some("Reference, diff and Git actions"));
-        actions_button.set_popover(Some(&actions_popover));
-        for button in [
-            &copy_reference_button,
-            &ask_agent_button,
-            &diff_button,
-            &source_button,
-            &stage_button,
-            &unstage_button,
-        ] {
-            button.connect_clicked({
-                let popover = actions_popover.clone();
-                move |_| popover.popdown()
-            });
-        }
+        goto_popover.set_parent(&title_label);
 
         let icon = gtk4::Image::from_icon_name("text-x-generic-symbolic");
         chrome.title_bar.append(&icon);
         chrome.title_bar.append(&title_label);
-        chrome.title_bar.append(&chrome.drag_handle);
+        chrome.title_bar.append(&spacer());
         chrome.title_bar.append(&status_label);
-        chrome.title_bar.append(&save_button);
-        chrome.title_bar.append(&reload_button);
-        chrome.title_bar.append(&find_button);
-        chrome.title_bar.append(&goto_button);
-        chrome.title_bar.append(&actions_button);
         let collapse = finish_chrome(&chrome, collapsed, on_collapse_toggle);
         chrome.container.set_css_classes(&["card", "editor-node"]);
         let aux_popover = gtk4::Popover::new();
         aux_popover.set_parent(&title_label);
 
         let node = EditorNode {
+            drag_handle: chrome.title_bar.clone(),
             container: chrome.container,
-            drag_handle: chrome.drag_handle,
             close_button: chrome.close_button,
             resize_handle: chrome.resize_handle,
             collapse,
             title_label,
             status_label,
-            save_button,
-            reload_button,
-            find_button,
-            goto_button,
-            actions_button,
-            copy_reference_button,
-            ask_agent_button,
-            diff_button,
-            source_button,
-            stage_button,
-            unstage_button,
             view,
             buffer,
             search_bar,
@@ -812,23 +694,6 @@ impl EditorNode {
         );
         node.wire_goto();
         node.wire_keys();
-        node.save_button.connect_clicked({
-            let on_save = node.on_save.clone();
-            move |_| {
-                let callback = on_save.borrow().clone();
-                if let Some(callback) = callback {
-                    callback();
-                }
-            }
-        });
-        node.find_button.connect_clicked({
-            let node = node.clone();
-            move |_| node.show_search(false)
-        });
-        node.goto_button.connect_clicked({
-            let node = node.clone();
-            move |_| node.show_goto()
-        });
         node.buffer.connect_modified_changed({
             let title = node.title_label.clone();
             move |buffer| {
@@ -1028,7 +893,7 @@ impl EditorNode {
         });
     }
 
-    fn show_goto(&self) {
+    pub fn show_goto(&self) {
         self.goto_entry.set_text("");
         self.goto_popover.popup();
         self.goto_entry.grab_focus();
@@ -1056,12 +921,7 @@ impl EditorNode {
                     return gtk4::glib::Propagation::Proceed;
                 }
                 match key.to_lower() {
-                    gtk4::gdk::Key::s => {
-                        let callback = node.on_save.borrow().clone();
-                        if let Some(callback) = callback {
-                            callback();
-                        }
-                    }
+                    gtk4::gdk::Key::s => node.save(),
                     gtk4::gdk::Key::f => node.show_search(false),
                     gtk4::gdk::Key::h => node.show_search(true),
                     gtk4::gdk::Key::g => node.show_goto(),
@@ -1073,9 +933,21 @@ impl EditorNode {
         self.view.add_controller(keys);
     }
 
-    /// Ctrl+S or the save button.
+    /// Ctrl+S or the menu's Save.
     pub fn connect_save(&self, f: impl Fn() + 'static) {
         *self.on_save.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Runs the `connect_save` callback.
+    pub fn save(&self) {
+        let callback = self.on_save.borrow().clone();
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.get()
     }
 
     /// Replaces the buffer's content without making the replacement itself
@@ -1126,7 +998,6 @@ impl EditorNode {
     pub fn set_read_only(&self, read_only: bool) {
         self.read_only.set(read_only);
         self.view.set_editable(!read_only);
-        self.save_button.set_visible(!read_only);
     }
 
     pub fn display(&self) -> EditorDisplay {
@@ -1145,8 +1016,6 @@ impl EditorNode {
         self.picture.set_paintable(Some(&texture));
         self.stack.set_visible_child_name("image");
         self.set_read_only(true);
-        self.find_button.set_visible(false);
-        self.goto_button.set_visible(false);
         Ok(())
     }
 

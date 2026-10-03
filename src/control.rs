@@ -602,6 +602,7 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                     agent,
                     role_instructions: identity.role.map(|role| role.instructions),
                     connected_agents,
+                    connected_files: app_ref.connected_files(agent_id),
                 },
             }
         }
@@ -1368,6 +1369,14 @@ fn print_response(response: &ControlResponse) {
                 println!("\nconnected to:");
                 for agent in &info.connected_agents {
                     println!("  {}\t{}\t{}", agent.id, agent.name, agent.provider);
+                }
+            }
+            if !info.connected_files.is_empty() {
+                println!(
+                    "\nconnected files and folders (`duetctl file inspect <ref>`, then `file read` or `file list`):"
+                );
+                for reference in &info.connected_files {
+                    println!("  {reference}");
                 }
             }
         }

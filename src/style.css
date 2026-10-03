@@ -88,11 +88,9 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 }
 .resize-handle:hover { background-color: rgba(255, 255, 255, 0.85); }
 
-/* The card whose link button was clicked, while it waits for a target click
-   (`App::refresh_link_highlight`). Link mode is otherwise entirely invisible,
-   which is why clicking the chain icon looked like a no-op. `outline` rather
-   than `border` so the highlight doesn't reflow the card's contents. */
-.card.link-source { outline: 2px solid #3584e4; outline-offset: -2px; }
+/* The card being connected from, while "Connect to another card…" waits
+   for the target click. Dashed so it reads as "in progress", not selected. */
+.card.link-source { outline: 2px dashed #3584e4; outline-offset: 2px; }
 
 /* `App::set_selection` adds/removes the `selected` class on every node, but
    until this rule existed nothing styled it at all — single/multi/marquee
@@ -127,11 +125,11 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 .file-tree-node, .editor-node { background-color: @card_bg_color; }
 .file-tree-list { background: transparent; }
 .file-tree-list row { padding: 0; min-height: 22px; }
-.file-tree-toolbar button, .file-tree-toolbar togglebutton {
-    min-width: 22px;
-    min-height: 22px;
-    padding: 0 2px;
-}
+/* A card's right-click menu (`app::popup_menu`). */
+.card-menu { min-width: 200px; }
+.card-menu button { padding: 4px 10px; min-height: 26px; font-weight: normal; }
+.note-title { font-weight: bold; color: #1f1f1f; padding-left: 4px; }
+.card-menu separator { margin: 4px 0; }
 .git-marker { font-weight: bold; font-family: monospace; }
 .git-modified { color: #e5a50a; }
 .git-added { color: #2ec27e; }
