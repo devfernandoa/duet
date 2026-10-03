@@ -19,12 +19,13 @@
 use crate::agent::Agent;
 use crate::app::App;
 use crate::message::{
-    AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, WhoamiInfo, WorkspaceInfo,
+    AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, NoteDetail, NoteSummary,
+    WhoamiInfo, WorkspaceInfo,
 };
 use crate::store::default_control_socket_path;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -90,6 +91,51 @@ pub enum ControlRequest {
     Whoami {
         agent_id: Option<Uuid>,
     },
+    /// `duetctl notes list`: every note `requested_by` can discover — see
+    /// `App::list_notes`.
+    NotesList {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    /// `duetctl notes read <id>`: fails if `requested_by` lacks `ReadNote`
+    /// on an edge to this note.
+    NotesRead {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    },
+    /// `duetctl notes replace <id>`: an explicit whole-content overwrite.
+    /// Fails if `requested_by` lacks `WriteNote`.
+    NotesReplace {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        markdown: String,
+    },
+    /// `duetctl notes append <id>`: adds `addition` after the note's
+    /// current content. Fails if `requested_by` lacks `WriteNote`.
+    NotesAppend {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        addition: String,
+    },
+    /// `duetctl notes patch <id> --old ... --new ...`: replaces the one
+    /// occurrence of `old` with `new`, failing if `old` isn't found or
+    /// isn't unique — see `orchestration::notes::apply_patch`. Fails if
+    /// `requested_by` lacks `WriteNote`.
+    NotesPatch {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        old: String,
+        new: String,
+    },
+    /// `duetctl notes connections <id>`: every edge touching this note —
+    /// discovery, not itself capability-gated (see `App::note_connections`).
+    NotesConnections {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +167,15 @@ pub enum ControlResponse {
     RoleAssigned,
     Whoami {
         info: WhoamiInfo,
+    },
+    Notes {
+        notes: Vec<NoteSummary>,
+    },
+    Note {
+        note: NoteDetail,
+    },
+    NoteUpdated {
+        id: Uuid,
     },
     Error {
         error: String,
@@ -401,6 +456,50 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 },
             }
         }
+        ControlRequest::NotesList { requested_by } => ControlResponse::Notes {
+            notes: app.borrow().list_notes(requested_by),
+        },
+        ControlRequest::NotesRead { requested_by, id } => {
+            match app.borrow().read_note(requested_by, id) {
+                Ok(note) => ControlResponse::Note { note },
+                Err(error) => ControlResponse::Error { error },
+            }
+        }
+        ControlRequest::NotesReplace {
+            requested_by,
+            id,
+            markdown,
+        } => match App::replace_note(app, requested_by, id, markdown) {
+            Ok(()) => ControlResponse::NoteUpdated { id },
+            Err(error) => ControlResponse::Error {
+                error: error.to_string(),
+            },
+        },
+        ControlRequest::NotesAppend {
+            requested_by,
+            id,
+            addition,
+        } => match App::append_note(app, requested_by, id, addition) {
+            Ok(()) => ControlResponse::NoteUpdated { id },
+            Err(error) => ControlResponse::Error {
+                error: error.to_string(),
+            },
+        },
+        ControlRequest::NotesPatch {
+            requested_by,
+            id,
+            old,
+            new,
+        } => match App::patch_note(app, requested_by, id, old, new) {
+            Ok(()) => ControlResponse::NoteUpdated { id },
+            Err(error) => ControlResponse::Error {
+                error: error.to_string(),
+            },
+        },
+        ControlRequest::NotesConnections { id } => match app.borrow().note_connections(id) {
+            Ok(connections) => ControlResponse::Connections { connections },
+            Err(error) => ControlResponse::Error { error },
+        },
     }
 }
 
@@ -410,7 +509,7 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
 pub fn is_cli_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "agent" | "agents" | "send" | "connections" | "workspace" | "whoami"
+        "agent" | "agents" | "send" | "connections" | "workspace" | "whoami" | "notes"
     )
 }
 
@@ -481,6 +580,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [only] if only == "whoami" => Ok(ControlRequest::Whoami {
             agent_id: acting_agent_id(),
         }),
+        [cmd, rest @ ..] if cmd == "notes" => parse_notes(rest),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -494,7 +594,85 @@ const USAGE: &str = r#"usage:
   duetctl send --from <id> --to <id-or-name> "<message>"
   duetctl connections list
   duetctl workspace inspect
-  duetctl whoami"#;
+  duetctl whoami
+  duetctl notes list
+  duetctl notes read <id>
+  duetctl notes replace <id>            (new Markdown content read from stdin)
+  duetctl notes append <id>             (text to append read from stdin)
+  duetctl notes patch <id> --old <text> --new <text>
+  duetctl notes connections <id>"#;
+
+/// Reads standard input fully as UTF-8 — how `notes replace`/`notes append`
+/// take their (often multi-line) Markdown content, instead of joining argv
+/// words with spaces the way legacy `agent send` does: that would silently
+/// collapse newlines and indentation, destroying the very Markdown structure
+/// this content is supposed to carry.
+fn read_stdin_to_string() -> anyhow::Result<String> {
+    let mut content = String::new();
+    std::io::stdin()
+        .read_to_string(&mut content)
+        .map_err(|error| anyhow::anyhow!("couldn't read content from stdin: {error}"))?;
+    Ok(content)
+}
+
+const NOTES_USAGE: &str = r#"usage:
+  duetctl notes list
+  duetctl notes read <id>
+  duetctl notes replace <id>            (new Markdown content read from stdin)
+  duetctl notes append <id>             (text to append read from stdin)
+  duetctl notes patch <id> --old <text> --new <text>
+  duetctl notes connections <id>"#;
+
+fn parse_note_id(raw: &str) -> anyhow::Result<Uuid> {
+    Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("'{raw}' is not a valid note id"))
+}
+
+fn parse_notes(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [only] if only == "list" => Ok(ControlRequest::NotesList {
+            requested_by: acting_agent_id(),
+        }),
+        [cmd, id] if cmd == "read" => Ok(ControlRequest::NotesRead {
+            requested_by: acting_agent_id(),
+            id: parse_note_id(id)?,
+        }),
+        [cmd, id] if cmd == "replace" => Ok(ControlRequest::NotesReplace {
+            requested_by: acting_agent_id(),
+            id: parse_note_id(id)?,
+            markdown: read_stdin_to_string()?,
+        }),
+        [cmd, id] if cmd == "append" => Ok(ControlRequest::NotesAppend {
+            requested_by: acting_agent_id(),
+            id: parse_note_id(id)?,
+            addition: read_stdin_to_string()?,
+        }),
+        [cmd, id, rest @ ..] if cmd == "patch" => parse_notes_patch(parse_note_id(id)?, rest),
+        [cmd, id] if cmd == "connections" => Ok(ControlRequest::NotesConnections {
+            id: parse_note_id(id)?,
+        }),
+        _ => anyhow::bail!(NOTES_USAGE),
+    }
+}
+
+fn parse_notes_patch(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut old, mut new) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].clone());
+        match flag {
+            "--old" => old = Some(value),
+            "--new" => new = Some(value),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{NOTES_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::NotesPatch {
+        requested_by: acting_agent_id(),
+        id,
+        old: old.ok_or_else(|| anyhow::anyhow!("notes patch needs --old\n\n{NOTES_USAGE}"))?,
+        new: new.ok_or_else(|| anyhow::anyhow!("notes patch needs --new\n\n{NOTES_USAGE}"))?,
+    })
+}
 
 fn parse_legacy_agent(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
@@ -664,6 +842,21 @@ fn print_response(response: &ControlResponse) {
                 }
             }
         }
+        ControlResponse::Notes { notes } => {
+            if notes.is_empty() {
+                println!("no notes");
+            }
+            for note in notes {
+                println!("{}\t{}", note.id, note.title);
+            }
+        }
+        ControlResponse::Note { note } => {
+            println!("id:    {}", note.id);
+            println!("title: {}", note.title);
+            println!("color: {}", note.color);
+            println!("\n{}", note.markdown);
+        }
+        ControlResponse::NoteUpdated { id } => println!("updated note {id}"),
         ControlResponse::Error { error } => {
             eprintln!("duetctl: {error}");
         }
@@ -867,9 +1060,124 @@ mod tests {
 
     #[test]
     fn is_cli_verb_recognizes_every_dispatched_verb_and_nothing_else() {
-        for verb in ["agent", "agents", "send", "connections", "workspace"] {
+        for verb in [
+            "agent",
+            "agents",
+            "send",
+            "connections",
+            "workspace",
+            "notes",
+        ] {
             assert!(is_cli_verb(verb));
         }
         assert!(!is_cli_verb("--version"));
+    }
+
+    #[test]
+    fn notes_list_uses_the_acting_agent_id() {
+        assert!(matches!(
+            parse_cli_request(&["notes".to_string(), "list".to_string()]).unwrap(),
+            ControlRequest::NotesList { .. }
+        ));
+    }
+
+    #[test]
+    fn notes_read_parses_its_id() {
+        let id = Uuid::new_v4();
+        let ControlRequest::NotesRead { id: parsed_id, .. } =
+            parse_cli_request(&["notes".to_string(), "read".to_string(), id.to_string()]).unwrap()
+        else {
+            panic!("expected NotesRead");
+        };
+        assert_eq!(parsed_id, id);
+    }
+
+    #[test]
+    fn notes_read_rejects_a_non_uuid_id() {
+        assert!(
+            parse_cli_request(&[
+                "notes".to_string(),
+                "read".to_string(),
+                "not-a-uuid".to_string()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn notes_patch_parses_old_and_new_flags() {
+        let id = Uuid::new_v4();
+        let args = [
+            "notes".to_string(),
+            "patch".to_string(),
+            id.to_string(),
+            "--old".to_string(),
+            "not started".to_string(),
+            "--new".to_string(),
+            "done".to_string(),
+        ];
+        let ControlRequest::NotesPatch {
+            id: parsed_id,
+            old,
+            new,
+            ..
+        } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected NotesPatch");
+        };
+        assert_eq!(parsed_id, id);
+        assert_eq!(old, "not started");
+        assert_eq!(new, "done");
+    }
+
+    #[test]
+    fn notes_patch_without_new_flag_is_rejected() {
+        let id = Uuid::new_v4();
+        let args = [
+            "notes".to_string(),
+            "patch".to_string(),
+            id.to_string(),
+            "--old".to_string(),
+            "x".to_string(),
+        ];
+        assert!(parse_cli_request(&args).is_err());
+    }
+
+    #[test]
+    fn notes_connections_parses_its_id() {
+        let id = Uuid::new_v4();
+        let ControlRequest::NotesConnections { id: parsed_id } = parse_cli_request(&[
+            "notes".to_string(),
+            "connections".to_string(),
+            id.to_string(),
+        ])
+        .unwrap() else {
+            panic!("expected NotesConnections");
+        };
+        assert_eq!(parsed_id, id);
+    }
+
+    #[test]
+    fn notes_requests_round_trip_through_json() {
+        let id = Uuid::new_v4();
+        let request = ControlRequest::NotesReplace {
+            requested_by: Some(Uuid::nil()),
+            id,
+            markdown: "# hi\n\nbody".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlRequest::NotesReplace {
+                requested_by,
+                id: parsed_id,
+                markdown,
+            } => {
+                assert_eq!(requested_by, Some(Uuid::nil()));
+                assert_eq!(parsed_id, id);
+                assert_eq!(markdown, "# hi\n\nbody");
+            }
+            _ => panic!("expected NotesReplace"),
+        }
     }
 }

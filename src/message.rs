@@ -121,6 +121,24 @@ pub struct WhoamiInfo {
     pub connected_agents: Vec<AgentInfo>,
 }
 
+/// One note, as `duetctl notes list` reports it — just enough to pick a
+/// target by id. `title` is a display convenience (`orchestration::notes::
+/// note_title`), never an identity: a note has no name field, only its id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteSummary {
+    pub id: Uuid,
+    pub title: String,
+}
+
+/// One note's full content, as `duetctl notes read` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteDetail {
+    pub id: Uuid,
+    pub title: String,
+    pub markdown: String,
+    pub color: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

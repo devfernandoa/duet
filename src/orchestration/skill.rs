@@ -54,6 +54,34 @@ else in this session:
 A message from another agent arrives as ordinary input in your own
 terminal, prefixed `[duet message from <sender>]:` — treat it as a real
 instruction from that agent, the same as one from your user.
+
+## Notes
+
+Notes are Markdown documents on the canvas — requirements, specs, status
+reports — that you can read and, if connected with write access, update
+directly, instead of having their content pasted into your prompt.
+
+1. Run `duetctl notes list` to see every note you're connected to (an empty
+   list means you have no note connections yet — ask whoever set up this
+   workspace to connect one). This never dumps note content, only ids and
+   titles — fetch a note's content only when you actually need it.
+2. Run `duetctl notes read <id>` to read one note's full Markdown source.
+3. Run `duetctl notes connections <id>` to see what else that note is
+   connected to (other agents, other notes) and with what capabilities.
+4. To update a note you have write access to:
+   - `duetctl notes replace <id>` overwrites the whole note — pipe the new
+     Markdown in on stdin, e.g. with a heredoc:
+     `duetctl notes replace <id> <<'EOF'` ... Markdown content ... `EOF`.
+   - `duetctl notes append <id>` adds text after the note's current
+     content — pipe the addition in the same way.
+   - `duetctl notes patch <id> --old "<exact text>" --new "<replacement>"`
+     changes just one exact, unique piece of text in place — prefer this
+     over `replace` for a small edit; it fails cleanly (instead of
+     overwriting someone else's change) if `--old` no longer matches the
+     note's current content.
+5. Reading or writing a note you have no connection to, or no write
+   capability on, is refused with a clear error — this is enforced by Duet
+   itself, not by this skill, so don't attempt to work around it.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)
@@ -84,6 +112,9 @@ mod tests {
         assert!(content.starts_with("---\nname: duet"));
         assert!(content.contains("description:"));
         assert!(content.contains("duetctl whoami"));
+        assert!(content.contains("duetctl notes list"));
+        assert!(content.contains("duetctl notes read"));
+        assert!(content.contains("duetctl notes patch"));
     }
 
     #[test]

@@ -990,12 +990,10 @@ impl App {
         let label_of = |id: Uuid| {
             self.nodes
                 .get(&id)
-                .map(|entry| {
-                    entry
-                        .record
-                        .as_terminal()
-                        .map(|terminal| terminal.name.clone())
-                        .unwrap_or_else(|| entry.record.kind.label().to_string())
+                .map(|entry| match &entry.record.kind {
+                    NodeKind::Terminal(terminal) => terminal.name.clone(),
+                    NodeKind::Note(note) => orchestration::notes::note_title(&note.markdown),
+                    _ => entry.record.kind.label().to_string(),
                 })
                 .unwrap_or_else(|| "?".to_string())
         };
@@ -1069,6 +1067,212 @@ impl App {
                 Some(LinkSummary { source, target })
             })
             .collect()
+    }
+
+    /// `duetctl notes list`'s service: every note the active workspace has,
+    /// if `requested_by` is the human operator (`None`); only the notes
+    /// `requested_by` is directly connected to, if it names an agent — see
+    /// `orchestration::notes::notes_connected_to`'s doc comment for why this
+    /// is one hop, not a full graph walk. Listing itself is never
+    /// capability-gated (only `read_note`/`replace_note`/... are) — an
+    /// agent can see it's linked to a note it has no permission to open.
+    pub fn list_notes(&self, requested_by: Option<Uuid>) -> Vec<crate::message::NoteSummary> {
+        let nodes: Vec<NodeRecord> = self.nodes.values().map(|e| e.record.clone()).collect();
+        let ids = match requested_by {
+            Some(agent_id) => {
+                orchestration::notes::notes_connected_to(&nodes, &self.edges, agent_id)
+            }
+            None => orchestration::notes::all_note_ids(&nodes),
+        };
+        ids.into_iter()
+            .filter_map(|id| self.nodes.get(&id))
+            .filter_map(|entry| {
+                let note = entry.record.as_note()?;
+                Some(crate::message::NoteSummary {
+                    id: entry.record.id,
+                    title: orchestration::notes::note_title(&note.markdown),
+                })
+            })
+            .collect()
+    }
+
+    /// `duetctl notes read <id>`'s service: the note's full content, after
+    /// checking `requested_by` holds `ReadNote` on an edge to it (skipped
+    /// for the human operator, `None` — see `orchestration::notes::
+    /// authorize_note`).
+    pub fn read_note(
+        &self,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    ) -> Result<crate::message::NoteDetail, String> {
+        let note = self
+            .nodes
+            .get(&id)
+            .and_then(|entry| entry.record.as_note())
+            .ok_or_else(|| format!("no note with id {id}"))?;
+        orchestration::notes::authorize_note(
+            &self.edges,
+            requested_by,
+            id,
+            EdgeCapability::ReadNote,
+        )?;
+        Ok(crate::message::NoteDetail {
+            id,
+            title: orchestration::notes::note_title(&note.markdown),
+            markdown: note.markdown.clone(),
+            color: note.color.clone(),
+        })
+    }
+
+    /// `duetctl notes connections <id>`'s service: every edge touching this
+    /// note, the same shape `connection_infos` already reports — listing a
+    /// note's connections is informational, like `connections list` itself,
+    /// so this doesn't gate on `ReadNote`/`WriteNote` (an agent can discover
+    /// what it's linked to even before deciding whether to read it).
+    pub fn note_connections(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<crate::message::ConnectionInfo>, String> {
+        if self
+            .nodes
+            .get(&id)
+            .and_then(|entry| entry.record.as_note())
+            .is_none()
+        {
+            return Err(format!("no note with id {id}"));
+        }
+        Ok(self
+            .connection_infos()
+            .into_iter()
+            .filter(|connection| connection.source_id == id || connection.target_id == id)
+            .collect())
+    }
+
+    /// Writes `markdown` into both the note's domain record and (if the note
+    /// has a live widget, which every note reachable through `self.nodes`
+    /// does — see `runtime.rs`'s doc comment on why that map only ever holds
+    /// the active workspace's materialized entries) its `NoteNode::edit_view`
+    /// buffer, so a service-driven update is immediately visible on the
+    /// canvas exactly the way a human's own edit already is. Setting the
+    /// buffer text fires `edit_view`'s own `connect_changed` handler (wired
+    /// in `materialize_node`), which re-renders the Preview pane and
+    /// schedules its own persist — this only needs to touch the buffer, not
+    /// duplicate that handler's work. The borrow on `app` is dropped before
+    /// touching GTK specifically to avoid re-entering it from inside that
+    /// same handler (a `RefCell` double-borrow, the exact shape of the
+    /// regression `app::tests::typing_into_a_note_does_not_panic` pins).
+    fn set_note_markdown(app: &Rc<RefCell<App>>, id: Uuid, markdown: String) {
+        let mut app_mut = app.borrow_mut();
+        let Some(entry) = app_mut.nodes.get_mut(&id) else {
+            return;
+        };
+        if let Some(note) = entry.record.as_note_mut() {
+            note.markdown = markdown.clone();
+        }
+        let edit_view = match &entry.widget {
+            NodeWidget::Note(note_node) => Some(note_node.edit_view.clone()),
+            _ => None,
+        };
+        drop(app_mut);
+        if let Some(edit_view) = edit_view {
+            edit_view.buffer().set_text(&markdown);
+        }
+    }
+
+    /// `duetctl notes replace <id>`'s service: an explicit, unconditional
+    /// whole-content overwrite (see `.claude/steps.md`'s Milestone 4 entry:
+    /// "whole-file overwrite is explicit") after checking `WriteNote`.
+    pub fn replace_note(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        markdown: String,
+    ) -> anyhow::Result<()> {
+        {
+            let app_ref = app.borrow();
+            if app_ref
+                .nodes
+                .get(&id)
+                .and_then(|entry| entry.record.as_note())
+                .is_none()
+            {
+                anyhow::bail!("no note with id {id}");
+            }
+            orchestration::notes::authorize_note(
+                &app_ref.edges,
+                requested_by,
+                id,
+                EdgeCapability::WriteNote,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        App::set_note_markdown(app, id, markdown);
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// `duetctl notes append <id>`'s service: adds `addition` after the
+    /// note's current content (see `orchestration::notes::apply_append`),
+    /// after checking `WriteNote`.
+    pub fn append_note(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        addition: String,
+    ) -> anyhow::Result<()> {
+        let current = {
+            let app_ref = app.borrow();
+            let note = app_ref
+                .nodes
+                .get(&id)
+                .and_then(|entry| entry.record.as_note())
+                .ok_or_else(|| anyhow::anyhow!("no note with id {id}"))?;
+            orchestration::notes::authorize_note(
+                &app_ref.edges,
+                requested_by,
+                id,
+                EdgeCapability::WriteNote,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            note.markdown.clone()
+        };
+        let updated = orchestration::notes::apply_append(&current, &addition);
+        App::set_note_markdown(app, id, updated);
+        app.borrow().persist()?;
+        Ok(())
+    }
+
+    /// `duetctl notes patch <id>`'s service: replaces one occurrence of
+    /// `old` with `new` (see `orchestration::notes::apply_patch` for the
+    /// concurrency reasoning), after checking `WriteNote`.
+    pub fn patch_note(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        old: String,
+        new: String,
+    ) -> anyhow::Result<()> {
+        let current = {
+            let app_ref = app.borrow();
+            let note = app_ref
+                .nodes
+                .get(&id)
+                .and_then(|entry| entry.record.as_note())
+                .ok_or_else(|| anyhow::anyhow!("no note with id {id}"))?;
+            orchestration::notes::authorize_note(
+                &app_ref.edges,
+                requested_by,
+                id,
+                EdgeCapability::WriteNote,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            note.markdown.clone()
+        };
+        let updated = orchestration::notes::apply_patch(&current, &old, &new)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        App::set_note_markdown(app, id, updated);
+        app.borrow().persist()?;
+        Ok(())
     }
 
     /// Delivers a structured agent-to-agent message: routes it through
@@ -1404,14 +1608,22 @@ impl App {
     /// if the edge already exists, `source == target`, or either id no
     /// longer names a live node. Returns whether a new edge was recorded.
     ///
-    /// A connection between two `Terminal` nodes is granted `SendMessages`
-    /// by default: today's only GTK edge-creation gesture (the link button)
-    /// is Terminal-only (see CLAUDE.md's Milestone 1 note), so a freshly
-    /// drawn agent-to-agent link would otherwise be visually connected but
-    /// functionally inert — there's no capability-editing UI yet to grant it
-    /// any other way. A future pass can expose revoking/editing capabilities
-    /// explicitly; until then this is the one default that makes the
-    /// existing connect gesture actually do what it visually promises.
+    /// Two `Terminal` nodes get `SendMessages` by default; a `Terminal` and
+    /// a `Note` get both `ReadNote` and `WriteNote`; a `Note` and a `Note`
+    /// get neither (there's no agent on either side for a capability to be
+    /// granted *to* — the edge is still recorded and discoverable via
+    /// `App::note_connections`, just visual/structural rather than
+    /// permission-bearing). The Terminal/Terminal and Terminal/Note defaults
+    /// exist for the same reason: today's only edge-creation gesture (the
+    /// link button, now on both `SessionNode` and `NoteNode` — Milestone 4
+    /// generalized it per `model.rs`'s `EdgeRecord` doc comment) has no
+    /// capability-picker UI to grant anything more deliberately, so a
+    /// connection that didn't default to *some* capability would be visually
+    /// drawn but functionally inert, including for Milestone 4's own
+    /// acceptance test (an agent can't satisfy "update status" over a link
+    /// granting it no `WriteNote`). A future pass can expose revoking/editing
+    /// capabilities explicitly; until then these are the defaults that make
+    /// the connect gesture actually do what it visually promises.
     pub fn create_edge(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
         let mut app = app.borrow_mut();
         if source != target
@@ -1423,16 +1635,29 @@ impl App {
                 .any(|e| e.source == source && e.target == target)
         {
             let mut edge = EdgeRecord::visual(Uuid::new_v4(), source, target);
-            let both_terminals = app
+            let source_is_terminal = app
                 .nodes
                 .get(&source)
-                .is_some_and(|e| e.record.as_terminal().is_some())
-                && app
-                    .nodes
-                    .get(&target)
-                    .is_some_and(|e| e.record.as_terminal().is_some());
-            if both_terminals {
+                .is_some_and(|e| e.record.as_terminal().is_some());
+            let target_is_terminal = app
+                .nodes
+                .get(&target)
+                .is_some_and(|e| e.record.as_terminal().is_some());
+            let source_is_note = app
+                .nodes
+                .get(&source)
+                .is_some_and(|e| e.record.as_note().is_some());
+            let target_is_note = app
+                .nodes
+                .get(&target)
+                .is_some_and(|e| e.record.as_note().is_some());
+            if source_is_terminal && target_is_terminal {
                 edge.capabilities.insert(EdgeCapability::SendMessages);
+            } else if (source_is_terminal && target_is_note)
+                || (source_is_note && target_is_terminal)
+            {
+                edge.capabilities.insert(EdgeCapability::ReadNote);
+                edge.capabilities.insert(EdgeCapability::WriteNote);
             }
             app.edges.push(edge.clone());
             app.undo_stack.push(CanvasCommand::AddEdge { edge });
@@ -2802,11 +3027,11 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
 
 /// Wires a terminal node's link button (click to enter link mode, sourced
 /// from this node) and its terminal (click to complete a pending link,
-/// targeting this node). Edge-creation UI is deliberately `Terminal`-only
-/// for now, matching the pre-Milestone-1 behavior exactly (the `EdgeRecord`
-/// model itself is generic over any two node ids — `App::create_edge`
-/// doesn't care what kind either endpoint is — only the UI affordance to
-/// start one is scoped to sessions today).
+/// targeting this node). The `EdgeRecord` model itself is generic over any
+/// two node ids — `App::create_edge` doesn't care what kind either endpoint
+/// is — and as of Milestone 4 the UI affordance to start/complete a link is
+/// no longer Terminal-only either: see `wire_note_link_controls` below for
+/// the identical wiring onto `Note` cards.
 fn wire_link_controls(
     app: &Rc<RefCell<App>>,
     node: &SessionNode,
@@ -2845,6 +3070,39 @@ fn wire_link_controls(
         }
     });
     node.terminal.add_controller(click);
+}
+
+/// `wire_link_controls`'s Note-card counterpart: same link button, same
+/// click-to-complete behavior, just targeting `NoteNode::connect_link_target`
+/// (both text panes) instead of `SessionNode::terminal`. Letting a Note
+/// start *or* complete a link (not just be a target) is what makes Note↔Note
+/// connections (Milestone 4 section 7) reachable through the same one
+/// gesture, with no separate UI.
+fn wire_note_link_controls(
+    app: &Rc<RefCell<App>>,
+    node: &NoteNode,
+    id: Uuid,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    node.link_button.connect_clicked({
+        let app = Rc::clone(app);
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            App::start_link(&app, id);
+            toast_overlay.add_toast(adw::Toast::new(
+                "link mode: click another node to connect this note to it",
+            ));
+        }
+    });
+    node.connect_link_target({
+        let app = Rc::clone(app);
+        let toast_overlay = toast_overlay.clone();
+        move || {
+            if let Some(message) = App::complete_link_if_pending(&app, id) {
+                toast_overlay.add_toast(adw::Toast::new(&message));
+            }
+        }
+    });
 }
 
 /// Builds the right `NodeWidget` for `record.kind`, wires its change
@@ -2973,6 +3231,7 @@ fn materialize_node(
                     App::schedule_persist(&app);
                 }
             });
+            wire_note_link_controls(app, &node, id, toast_overlay);
             NodeWidget::Note(node)
         }
         NodeKind::Text(text) => {
@@ -3707,6 +3966,272 @@ mod tests {
         assert_eq!(
             app.borrow().workspace_runtime_state(Uuid::new_v4()),
             WorkspaceRuntimeState::Unloaded
+        );
+    }
+
+    fn note_with_markdown(markdown: &str) -> NodeRecord {
+        let mut record = note_record();
+        record.id = Uuid::new_v4();
+        if let NodeKind::Note(payload) = &mut record.kind {
+            payload.markdown = markdown.to_string();
+        }
+        record
+    }
+
+    fn new_test_app() -> Rc<RefCell<App>> {
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        )
+    }
+
+    /// Milestone 4 section 8: a service-driven write must be immediately
+    /// visible on the canvas, not just in the persisted record — reads back
+    /// both `NodeRecord::as_note` and the live `NoteNode::edit_view`
+    /// buffer's actual text to confirm `set_note_markdown` really does sync
+    /// both, not just the one a caller happens to check.
+    #[test]
+    #[ignore = "needs a display"]
+    fn replace_note_updates_both_the_record_and_the_live_widget_buffer() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let note = note_with_markdown("old content");
+        materialize_node(&app, note.clone(), &adw::ToastOverlay::new()).unwrap();
+
+        App::replace_note(&app, None, note.id, "new content".to_string()).unwrap();
+
+        let app_ref = app.borrow();
+        let entry = app_ref.nodes.get(&note.id).unwrap();
+        assert_eq!(entry.record.as_note().unwrap().markdown, "new content");
+        let NodeWidget::Note(note_node) = &entry.widget else {
+            panic!("expected a Note widget");
+        };
+        assert_eq!(
+            crate::node::buffer_text(&note_node.edit_view.buffer()),
+            "new content"
+        );
+    }
+
+    /// Milestone 4 section 6: `ReadNote` and `WriteNote` are independent —
+    /// holding one must not imply the other — and a connectionless agent is
+    /// refused with a useful error, not a panic or a silent no-op.
+    #[test]
+    #[ignore = "needs a display"]
+    fn note_write_and_read_require_their_own_capability() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let note = note_with_markdown("secret plan");
+        materialize_node(&app, note.clone(), &adw::ToastOverlay::new()).unwrap();
+        let agent_id = Uuid::new_v4();
+
+        // No edge at all: both refused.
+        assert!(App::replace_note(&app, Some(agent_id), note.id, "x".to_string()).is_err());
+        assert!(app.borrow().read_note(Some(agent_id), note.id).is_err());
+
+        // ReadNote only: read succeeds, write still refused.
+        app.borrow_mut().edges.push(EdgeRecord {
+            id: Uuid::new_v4(),
+            source: agent_id,
+            target: note.id,
+            capabilities: [EdgeCapability::ReadNote].into_iter().collect(),
+        });
+        assert!(app.borrow().read_note(Some(agent_id), note.id).is_ok());
+        assert!(App::replace_note(&app, Some(agent_id), note.id, "x".to_string()).is_err());
+
+        // Granting WriteNote too: write now succeeds.
+        app.borrow_mut()
+            .edges
+            .get_mut(0)
+            .unwrap()
+            .capabilities
+            .insert(EdgeCapability::WriteNote);
+        App::replace_note(&app, Some(agent_id), note.id, "updated".to_string()).unwrap();
+        assert_eq!(
+            app.borrow()
+                .nodes
+                .get(&note.id)
+                .unwrap()
+                .record
+                .as_note()
+                .unwrap()
+                .markdown,
+            "updated"
+        );
+    }
+
+    /// `create_edge`'s default-capability guessing, extended by Milestone 4:
+    /// Terminal-Terminal still gets `SendMessages` (pinning the pre-existing
+    /// Milestone 3 behavior so this change doesn't regress it); Terminal-Note
+    /// gets both `ReadNote` and `WriteNote` (the one default that makes the
+    /// generalized link gesture able to satisfy this same milestone's own
+    /// acceptance test, since there's no capability-picker UI to choose
+    /// otherwise); Note-Note gets neither (no agent on either side for a
+    /// capability to be granted to).
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_edge_defaults_capabilities_by_the_endpoints_kinds() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let toast = adw::ToastOverlay::new();
+        let agent_a = terminal_node(EnvironmentKind::LocalPty);
+        let agent_b = terminal_node(EnvironmentKind::LocalPty);
+        let note_a = note_with_markdown("a");
+        let note_b = note_with_markdown("b");
+        materialize_node(&app, agent_a.clone(), &toast).unwrap();
+        materialize_node(&app, agent_b.clone(), &toast).unwrap();
+        materialize_node(&app, note_a.clone(), &toast).unwrap();
+        materialize_node(&app, note_b.clone(), &toast).unwrap();
+
+        assert!(App::create_edge(&app, agent_a.id, agent_b.id));
+        assert!(App::create_edge(&app, agent_a.id, note_a.id));
+        assert!(App::create_edge(&app, note_a.id, note_b.id));
+
+        let capabilities_between =
+            |a: Uuid, b: Uuid| -> std::collections::BTreeSet<EdgeCapability> {
+                app.borrow()
+                    .edges
+                    .iter()
+                    .find(|e| e.source == a && e.target == b)
+                    .unwrap()
+                    .capabilities
+                    .clone()
+            };
+        assert_eq!(
+            capabilities_between(agent_a.id, agent_b.id),
+            [EdgeCapability::SendMessages].into_iter().collect()
+        );
+        assert_eq!(
+            capabilities_between(agent_a.id, note_a.id),
+            [EdgeCapability::ReadNote, EdgeCapability::WriteNote]
+                .into_iter()
+                .collect()
+        );
+        assert!(capabilities_between(note_a.id, note_b.id).is_empty());
+
+        app.borrow_mut().runtime.terminate(agent_a.id);
+        app.borrow_mut().runtime.terminate(agent_b.id);
+    }
+
+    /// Milestone 4's full acceptance scenario, exercised at the service
+    /// layer exactly as `control.rs`'s CLI dispatch would drive it (this
+    /// test calls the same `App::list_notes`/`read_note`/`patch_note`
+    /// methods `handle_request` calls, just without the socket round trip):
+    /// a Lead agent, connected to three notes with the capabilities a human
+    /// would grant by connecting each with the generalized link gesture,
+    /// discovers them, reads two read-only ones, and updates the one it has
+    /// write access to — without ever being handed their content directly.
+    #[test]
+    #[ignore = "needs a display"]
+    fn acceptance_lead_discovers_reads_and_updates_its_connected_notes() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let toast = adw::ToastOverlay::new();
+        let requirements = note_with_markdown("# Requirements\n\nShip a login form.");
+        let implementation = note_with_markdown("# Implementation\n\nUses the auth crate.");
+        let status = note_with_markdown("# Status\n\nnot started");
+        for note in [&requirements, &implementation, &status] {
+            materialize_node(&app, note.clone(), &toast).unwrap();
+        }
+        // The Lead is represented by a bare agent id here: `App::list_notes`/
+        // `read_note`/`patch_note` only ever check `requested_by` against
+        // edges, never require a materialized Terminal node for it — see
+        // `orchestration::notes::notes_connected_to`'s doc comment.
+        let lead_id = Uuid::new_v4();
+        {
+            let mut app_mut = app.borrow_mut();
+            // Read-only on requirements/implementation; read-write on status
+            // — exactly what the generalized Note link button would grant by
+            // default when connecting a Terminal to a Note (ReadNote AND
+            // WriteNote together, per `create_edge`'s doc comment) — pinned
+            // here as explicit edges so this test doesn't depend on reading
+            // through the GTK click gesture itself.
+            for note_id in [requirements.id, implementation.id] {
+                app_mut.edges.push(EdgeRecord {
+                    id: Uuid::new_v4(),
+                    source: lead_id,
+                    target: note_id,
+                    capabilities: [EdgeCapability::ReadNote].into_iter().collect(),
+                });
+            }
+            app_mut.edges.push(EdgeRecord {
+                id: Uuid::new_v4(),
+                source: lead_id,
+                target: status.id,
+                capabilities: [EdgeCapability::ReadNote, EdgeCapability::WriteNote]
+                    .into_iter()
+                    .collect(),
+            });
+        }
+
+        // 1. Discover.
+        let discovered = app.borrow().list_notes(Some(lead_id));
+        let mut discovered_ids: Vec<Uuid> = discovered.iter().map(|n| n.id).collect();
+        discovered_ids.sort();
+        let mut expected_ids = vec![requirements.id, implementation.id, status.id];
+        expected_ids.sort();
+        assert_eq!(discovered_ids, expected_ids);
+
+        // 2. Read requirements.
+        let requirements_read = app
+            .borrow()
+            .read_note(Some(lead_id), requirements.id)
+            .unwrap();
+        assert!(requirements_read.markdown.contains("login form"));
+
+        // 3. Read implementation.
+        let implementation_read = app
+            .borrow()
+            .read_note(Some(lead_id), implementation.id)
+            .unwrap();
+        assert!(implementation_read.markdown.contains("auth crate"));
+
+        // 4. Update status — without manual user editing, and preserving
+        // valid Markdown (a patch on exactly the text that needs to change,
+        // not a destructive whole-note overwrite).
+        App::patch_note(
+            &app,
+            Some(lead_id),
+            status.id,
+            "not started".to_string(),
+            "requirements and implementation reviewed; shipping".to_string(),
+        )
+        .unwrap();
+
+        // The visible status note updates immediately, with no manual edit.
+        let app_ref = app.borrow();
+        let entry = app_ref.nodes.get(&status.id).unwrap();
+        let updated_markdown = &entry.record.as_note().unwrap().markdown;
+        assert_eq!(
+            updated_markdown,
+            "# Status\n\nrequirements and implementation reviewed; shipping"
+        );
+        // Still valid Markdown: parses to the same heading structure as
+        // before the patch.
+        assert_eq!(
+            crate::markdown::parse(updated_markdown)[0].spans[0].styles,
+            vec![crate::markdown::SpanStyle::Heading(1)]
+        );
+        let NodeWidget::Note(status_node) = &entry.widget else {
+            panic!("expected a Note widget");
+        };
+        assert_eq!(
+            crate::node::buffer_text(&status_node.edit_view.buffer()),
+            *updated_markdown
+        );
+
+        // The Lead cannot write a note it only has ReadNote on.
+        drop(app_ref);
+        assert!(
+            App::replace_note(&app, Some(lead_id), requirements.id, "hacked".to_string()).is_err()
         );
     }
 }

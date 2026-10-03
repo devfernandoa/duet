@@ -121,6 +121,10 @@ pub fn parse(source: &str) -> Vec<Line> {
     let mut list_stack: Vec<Option<u64>> = Vec::new();
     let mut pending_marker: Option<LineMarker> = None;
     let mut in_code_block = false;
+    // How many cells have started on the current table row, so every cell
+    // after the first gets a `" | "` separator in front of it. Reset at the
+    // start of each `TableHead`/`TableRow`.
+    let mut table_cell_index: usize = 0;
 
     for event in parser {
         match event {
@@ -152,6 +156,23 @@ pub fn parse(source: &str) -> Vec<Line> {
                         // Fence line itself carries no text content worth
                         // showing (the language tag isn't rendered output).
                     }
+                }
+                // Rendered as plain `" | "`-separated rows, one `Line` per
+                // table row — see this module's doc comment for why an
+                // aligned-cell widget is out of scope for a `GtkTextView`.
+                Tag::TableHead | Tag::TableRow => {
+                    if !current_line(&mut lines).spans.is_empty()
+                        || current_line(&mut lines).marker.is_some()
+                    {
+                        new_line(&mut lines);
+                    }
+                    table_cell_index = 0;
+                }
+                Tag::TableCell => {
+                    if table_cell_index > 0 {
+                        current_line(&mut lines).push_text(" | ", &[]);
+                    }
+                    table_cell_index += 1;
                 }
                 Tag::List(start) => list_stack.push(start),
                 Tag::Item => {
@@ -198,6 +219,9 @@ pub fn parse(source: &str) -> Vec<Line> {
                 TagEnd::List(_) => {
                     list_stack.pop();
                 }
+                // Puts a blank line after the table so whatever follows it
+                // doesn't visually fuse with the last row.
+                TagEnd::Table => new_line(&mut lines),
                 TagEnd::Paragraph | TagEnd::Item => {
                     new_line(&mut lines);
                 }
@@ -620,5 +644,21 @@ mod tests {
     #[test]
     fn empty_source_parses_to_no_lines() {
         assert!(parse("").is_empty());
+    }
+
+    /// A table renders as one `Line` per row, cells joined with `" | "` —
+    /// not aligned columns (no table widget in a `GtkTextView`), but legible
+    /// and distinct per row, which bare `Event::Text`/`Event::Code` handling
+    /// alone does not produce (every cell of every row used to collapse onto
+    /// a single line with no separator at all).
+    #[test]
+    fn table_rows_render_as_separate_pipe_joined_lines() {
+        let lines = parse("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(line_text)
+            .filter(|text| !text.is_empty())
+            .collect();
+        assert_eq!(rows, vec!["a | b", "1 | 2", "3 | 4"]);
     }
 }
