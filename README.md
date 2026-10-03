@@ -1,3 +1,5 @@
+<p align="center"><img src="data/icons/hicolor/256x256/apps/dev.fernandoa.duet.png" width="128" alt="Duet logo"></p>
+
 # duet
 
 A GTK4/libadwaita desktop app for running multiple AI coding agents side by
@@ -40,6 +42,27 @@ cargo install --path . --root "$HOME/.local"
 # From any directory, launch duet and it reopens your last workspace.
 duet
 ```
+
+### Add Duet to your app launcher
+
+`install.sh` installs `duet`, `duetctl`, the launcher entry and the icon for
+your user only (into `~/.local`, no root):
+
+```sh
+# From a clone (builds from source):
+./install.sh
+
+# Or from a release download:
+tar xzf duet-v1.0.1-x86_64-linux.tar.gz
+cd duet-v1.0.1-x86_64-linux && ./install.sh
+```
+
+Duet then appears in your launcher (GNOME, KDE, rofi/wofi/fuzzel `drun`,
+...) with its icon; `./install.sh --uninstall` removes it again (your
+workspaces are kept). The launcher entry runs `~/.local/bin/duet` by its full
+path, and agent terminals get that directory on their `PATH` so they always
+find `duetctl` — adding `~/.local/bin` to your own `PATH` is only needed to
+run `duet`/`duetctl` from a terminal.
 
 Requires `claude`/`codex`/`opencode` on `PATH` for those providers; "Shell"
 runs `$SHELL`, and "Custom command" runs whatever program you configure when

@@ -41,7 +41,8 @@ jobs:
         run: |
           dir="duet-$TAG-x86_64-linux"
           mkdir "$dir"
-          cp target/release/duet target/release/duetctl README.md LICENSE "$dir/"
+          cp target/release/duet target/release/duetctl README.md LICENSE install.sh "$dir/"
+          cp -r data "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
       - uses: softprops/action-gh-release@v2

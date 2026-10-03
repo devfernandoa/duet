@@ -80,6 +80,17 @@ fn build_ui(application: &adw::Application) {
         }
     });
 
+    // The app icon (`data/icons`, installed by `install.sh` into the user's
+    // icon theme). A source checkout's own copy is also searched, so a
+    // `cargo run` shows the logo before anything is installed.
+    let icon_theme = gtk4::IconTheme::for_display(&gtk4::prelude::WidgetExt::display(&window));
+    let checkout_icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons");
+    if checkout_icons.is_dir() {
+        icon_theme.add_search_path(&checkout_icons);
+    }
+    gtk4::Window::set_default_icon_name(APP_ID);
+    window.set_icon_name(Some(APP_ID));
+
     let css = gtk4::CssProvider::new();
     css.load_from_data(include_str!("style.css"));
     gtk4::style_context_add_provider_for_display(
@@ -952,7 +963,7 @@ fn wire_help_actions(application: &adw::Application, window: &adw::ApplicationWi
                 .transient_for(&window)
                 .modal(true)
                 .application_name("Duet")
-                .application_icon("utilities-terminal-symbolic")
+                .application_icon(APP_ID)
                 .version(env!("CARGO_PKG_VERSION"))
                 .comments(
                     "A spatial canvas for running and orchestrating coding agents side by side, \
