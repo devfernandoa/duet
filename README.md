@@ -1,6 +1,6 @@
 <p align="center"><img src="data/icons/hicolor/256x256/apps/dev.fernandoa.duet.png" width="128" alt="Duet logo"></p>
 
-# duet
+# Duet
 
 A GTK4/libadwaita desktop app for running multiple AI coding agents side by
 side on an infinite, pannable/zoomable canvas — and having them talk to each
