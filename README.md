@@ -9,11 +9,10 @@ agent cards and they can message each other with `duetctl`, duet's local
 control CLI — the same service layer the GUI itself calls, so nothing an
 agent can do is a GUI-only trick.
 
-See [`.claude/steps.md`](.claude/steps.md) for the live roadmap and exactly
-which parts of the design below are implemented versus still planned —
 Milestones 0 through 3 (stabilization, the generic canvas, persistent
 workspaces, and agent orchestration) are done; floors, scores, the file tree,
-browser portals, and the prompt composer are not yet.
+browser portals, and the prompt composer are not yet — see
+[Known limitations](#known-limitations) below for the current gaps.
 
 ## Build
 
@@ -260,7 +259,5 @@ from.
 - No floors (git-isolated parallel work), reusable arrangements ("Scores"),
   or cross-workspace search yet.
 
-See [`.claude/steps.md`](.claude/steps.md) for the full milestone-by-milestone
-roadmap and what's explicitly deferred versus done. The original design
-rationale (predating the orchestration work above) is in
+The original design rationale (predating the orchestration work above) is in
 [`docs/superpowers/specs/`](docs/superpowers/specs/).
