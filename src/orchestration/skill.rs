@@ -19,7 +19,7 @@ pub const SKILL_NAME: &str = "duet";
 
 const SKILL_MD: &str = r#"---
 name: duet
-description: Use at the very start of every session, before responding to anything else. You are running inside Duet, a multi-agent orchestration workspace, and this skill explains how to find your role, talk to other agents, and use Duet resources — notes, project files and browser portals — including @references such as @portal:frontend.
+description: Use at the very start of every session, before responding to anything else. You are running inside Duet, a multi-agent orchestration workspace, and this skill explains how to find your role, talk to other agents, and use Duet resources — notes, project files, browser portals and drawings — including @references such as @portal:frontend.
 ---
 
 # Duet orchestration
@@ -183,6 +183,15 @@ your own browser automation, and never assume what a page shows.
 A typical loop: start the dev server in your terminal, `portal navigate` to
 it, `portal text` to check, `click`/`type` to exercise the UI, edit the
 source, `portal reload`, `portal text` again to verify.
+
+## Drawings
+
+The user may sketch on the canvas (architecture, flows, UI layouts) and
+connect a drawing to you; `duetctl whoami` then lists it. `duetctl drawing
+read <id>` renders it to a PNG and prints the image's path — open that image
+to see the sketch — plus each stroke's color and points in pixels.
+`duetctl drawing list` shows the drawings you can read. Drawings are the
+user's: you can read them, not draw on them.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)

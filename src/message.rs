@@ -128,6 +128,37 @@ pub struct WhoamiInfo {
     /// with whether the agent may control it.
     #[serde(default)]
     pub connected_portals: Vec<PortalSummary>,
+    /// Drawings connected to this agent, readable with `duetctl drawing
+    /// read <id>`.
+    #[serde(default)]
+    pub connected_drawings: Vec<DrawingSummary>,
+}
+
+/// One drawing, as `duetctl drawing list` reports it. Drawings have no
+/// name; the id is the identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrawingSummary {
+    pub id: Uuid,
+    pub strokes: usize,
+    pub readable: bool,
+}
+
+/// `duetctl drawing read`'s answer: the rendered PNG and the strokes in
+/// that image's pixel coordinates (origin top-left).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrawingExport {
+    pub id: Uuid,
+    pub path: std::path::PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub strokes: Vec<DrawingStrokeSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrawingStrokeSummary {
+    pub color: String,
+    pub width: f64,
+    pub points: Vec<(i32, i32)>,
 }
 
 /// One note, as `duetctl notes list` reports it — just enough to pick a
