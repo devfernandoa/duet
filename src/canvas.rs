@@ -289,13 +289,53 @@ impl Canvas {
         }
         fixed.add_controller(motion);
 
-        // Scrolling over empty canvas pans it (two-finger scroll or a wheel,
-        // both axes); Ctrl+scroll zooms around the pointer, by an amount
-        // proportional to the scroll — so a touchpad's stream of tiny
-        // deltas zooms smoothly instead of jumping a full step per event.
-        // Pinching on a touchpad zooms too (`GestureZoom` below). A card's
-        // own scrollable content (terminal scrollback, a tree, an editor)
-        // consumes its scrolls before this bubble-phase handler sees them.
+        // Ctrl+scroll zooms around the pointer anywhere on the canvas —
+        // over a card too. Capture phase, so it runs before a terminal,
+        // note or editor under the pointer can swallow the scroll; it only
+        // consumes the event when Ctrl is held. The zoom is proportional to
+        // the scroll, so a touchpad's stream of tiny deltas zooms smoothly
+        // instead of jumping a full step per event.
+        let zoom_scroll =
+            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        zoom_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        {
+            let state = Rc::clone(&state);
+            let nodes = Rc::clone(&nodes);
+            let fixed = fixed.clone();
+            let grid_area = grid_area.clone();
+            let pointer_position = Rc::clone(&pointer_position);
+            zoom_scroll.connect_scroll(move |controller, _dx, dy| {
+                if !controller
+                    .current_event_state()
+                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                let wheel = controller.unit() == gtk4::gdk::ScrollUnit::Wheel;
+                let mut state = state.borrow_mut();
+                // Keep the world-space point under the pointer fixed, so
+                // whatever the user is looking at stays under the cursor.
+                let cursor = *pointer_position.borrow();
+                let old_zoom = state.zoom;
+                let notches = if wheel {
+                    dy
+                } else {
+                    dy / SURFACE_PIXELS_PER_NOTCH
+                };
+                state.zoom *= ZOOM_STEP.powf(-notches);
+                state.clamp_zoom();
+                state.pan = pan_keeping_anchor_fixed(cursor, state.pan, old_zoom, state.zoom);
+                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+                glib::Propagation::Stop
+            });
+        }
+        fixed.add_controller(zoom_scroll);
+
+        // Plain scrolling over empty canvas: a mouse wheel zooms around the
+        // pointer; a touchpad's two-finger scroll (pixel-unit deltas) pans,
+        // and pinching zooms (`GestureZoom` below). A card's own scrollable
+        // content (terminal scrollback, a tree, an editor) consumes plain
+        // scrolls before this bubble-phase handler sees them.
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
         scroll.set_propagation_phase(gtk4::PropagationPhase::Bubble);
         {
@@ -306,30 +346,16 @@ impl Canvas {
             let pointer_position = Rc::clone(&pointer_position);
             scroll.connect_scroll(move |controller, dx, dy| {
                 let wheel = controller.unit() == gtk4::gdk::ScrollUnit::Wheel;
-                let zoom_requested = controller
-                    .current_event_state()
-                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let mut state = state.borrow_mut();
-                if zoom_requested {
-                    // Preserve the world-space point under the pointer, so
-                    // whatever the user is looking at stays under the cursor.
+                if wheel {
                     let cursor = *pointer_position.borrow();
                     let old_zoom = state.zoom;
-                    let notches = if wheel {
-                        dy
-                    } else {
-                        dy / SURFACE_PIXELS_PER_NOTCH
-                    };
-                    state.zoom *= ZOOM_STEP.powf(-notches);
+                    state.zoom *= ZOOM_STEP.powf(-dy);
                     state.clamp_zoom();
                     state.pan = pan_keeping_anchor_fixed(cursor, state.pan, old_zoom, state.zoom);
                 } else {
-                    let scale = if wheel { WHEEL_PAN_PIXELS } else { 1.0 };
                     let zoom = state.zoom;
-                    state.pan = (
-                        state.pan.0 - dx * scale / zoom,
-                        state.pan.1 - dy * scale / zoom,
-                    );
+                    state.pan = (state.pan.0 - dx / zoom, state.pan.1 - dy / zoom);
                 }
                 apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
                 glib::Propagation::Stop
@@ -502,6 +528,24 @@ impl Canvas {
     /// precisely so node clicks still work — turning that on would swallow
     /// every click meant for a card. The gesture never claims its sequence,
     /// so `Canvas`'s own pan drag on the same widget is unaffected.
+    /// A right-click anywhere on the canvas: `f` gets the click's screen
+    /// point (in `overlay`/`fixed` coordinates, for anchoring a popover) and
+    /// its world point. Cards claim right-clicks on their own title bars;
+    /// the caller decides what a right-click elsewhere on a card means.
+    pub fn connect_background_context_menu(&self, f: impl Fn((f64, f64), (f64, f64)) + 'static) {
+        let state = Rc::clone(&self.state);
+        let click = gtk4::GestureClick::new();
+        click.set_button(gtk4::gdk::BUTTON_SECONDARY);
+        click.connect_pressed(move |_gesture, _n_press, x, y| {
+            let world = {
+                let state = state.borrow();
+                screen_to_world((x, y), state.pan, state.zoom)
+            };
+            f((x, y), world);
+        });
+        self.fixed.add_controller(click);
+    }
+
     pub fn connect_background_click(&self, on_click: impl Fn((f64, f64)) + 'static) {
         let state = Rc::clone(&self.state);
         // The pan `GestureDrag` on this same widget never claims its
@@ -553,10 +597,6 @@ const GRID_MAJOR: f64 = 500.0;
 /// Multiplicative zoom per step, shared by Ctrl+scroll and Ctrl+Plus/Minus
 /// so the two agree on what "one notch" means.
 const ZOOM_STEP: f64 = 1.1;
-
-/// How far one mouse-wheel notch pans the canvas, in screen pixels. A
-/// touchpad already reports its scroll in pixels and isn't scaled.
-const WHEEL_PAN_PIXELS: f64 = 60.0;
 
 /// How many pixels of touchpad Ctrl+scroll count as one zoom notch.
 const SURFACE_PIXELS_PER_NOTCH: f64 = 25.0;

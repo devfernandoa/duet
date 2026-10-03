@@ -198,6 +198,63 @@ fn build_ui(application: &adw::Application) {
         }
     });
 
+    // Right-click on empty canvas: create a card right where you clicked.
+    // (A right-click on a card is the card's business — its title bar has
+    // its own menu, and a terminal or editor may use right-click itself.)
+    let canvas_menu = gtk4::Popover::new();
+    canvas_menu.set_has_arrow(false);
+    canvas_menu.set_position(gtk4::PositionType::Bottom);
+    canvas_menu.set_halign(gtk4::Align::Start);
+    canvas_menu.set_parent(&app.borrow().canvas.fixed);
+    app.borrow().canvas.connect_background_context_menu({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |screen, world| {
+            if app.borrow().covers_point(world) {
+                return;
+            }
+            App::cancel_link(&app);
+            canvas_menu.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                screen.0 as i32,
+                screen.1 as i32,
+                1,
+                1,
+            )));
+            let mut items: Vec<app::MenuItem> = Vec::new();
+            {
+                let (app, window, toast_overlay) =
+                    (app.clone(), window.clone(), toast_overlay.clone());
+                items.push((
+                    "New terminal…".to_string(),
+                    Box::new(move || {
+                        open_new_session_dialog(&app, &window, &toast_overlay, Some(world))
+                    }),
+                ));
+            }
+            let app_c = app.clone();
+            items.push((
+                "New note".to_string(),
+                Box::new(move || App::create_note(&app_c, world)),
+            ));
+            let app_c = app.clone();
+            items.push((
+                "New text".to_string(),
+                Box::new(move || App::create_text_node(&app_c, world)),
+            ));
+            let (app_c, toast_c) = (app.clone(), toast_overlay.clone());
+            items.push((
+                "New file tree".to_string(),
+                Box::new(move || {
+                    if let Err(error) = App::create_file_tree(&app_c, world) {
+                        toast_c.add_toast(adw::Toast::new(&error));
+                    }
+                }),
+            ));
+            app::popup_menu(&canvas_menu, items);
+        }
+    });
+
     // Shift-drag on empty canvas (see `canvas.rs`'s pan gesture) marks out a
     // marquee; releasing it selects every node the rectangle touches.
     app.borrow().canvas.connect_marquee_end({
@@ -253,7 +310,7 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
-        move |_| open_new_session_dialog(&app, &window, &toast_overlay)
+        move |_| open_new_session_dialog(&app, &window, &toast_overlay, None)
     });
 
     accounts_button.connect_clicked({
@@ -316,7 +373,7 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
-        move |_, _| open_new_session_dialog(&app, &window, &toast_overlay)
+        move |_, _| open_new_session_dialog(&app, &window, &toast_overlay, None)
     });
     application.add_action(&action);
     application.set_accels_for_action("app.new-session", &["<Ctrl>T"]);
@@ -743,10 +800,13 @@ fn wire_canvas_edit_actions(
     edit_menu_button.set_menu_model(Some(&menu));
 }
 
+/// `position`: where on the canvas (world coordinates) the new terminal
+/// goes; `None` for the middle of the current view.
 fn open_new_session_dialog(
     app: &Rc<RefCell<App>>,
     parent: &adw::ApplicationWindow,
     toast_overlay: &adw::ToastOverlay,
+    position: Option<(f64, f64)>,
 ) {
     let dialog = adw::Window::builder()
         .transient_for(parent)
@@ -986,7 +1046,7 @@ fn open_new_session_dialog(
                 .get(role_row.selected() as usize)
                 .copied()
                 .flatten();
-            let viewport_center = {
+            let viewport_center = position.unwrap_or_else(|| {
                 let (width, height) = (parent.width(), parent.height());
                 let screen_center = if width > 0 && height > 0 {
                     (width as f64 / 2.0, height as f64 / 2.0)
@@ -999,7 +1059,7 @@ fn open_new_session_dialog(
                 let app_ref = app.borrow();
                 let state = app_ref.canvas.state.borrow();
                 canvas::screen_to_world(screen_center, state.pan, state.zoom)
-            };
+            });
             let result = App::create_session(
                 &app,
                 name_row.text().to_string(),

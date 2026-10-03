@@ -23,21 +23,6 @@ pub fn run_and_capture(launch: &Launch, cwd: &Path) -> Result<String> {
     Ok(text)
 }
 
-pub fn summarize_claude(
-    session_id: uuid::Uuid,
-    config_dir: Option<&Path>,
-    cwd: &Path,
-) -> Result<String> {
-    run_and_capture(
-        &crate::agent::claude_summarize_launch(session_id, config_dir),
-        cwd,
-    )
-}
-
-pub fn summarize_codex(cwd: &Path) -> Result<String> {
-    run_and_capture(&crate::agent::codex_summarize_launch(), cwd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

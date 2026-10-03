@@ -252,7 +252,11 @@ pub fn claude_summarize_launch(session_id: Uuid, config_dir: Option<&Path>) -> L
     }
 }
 
-pub fn codex_summarize_launch() -> Launch {
+/// `codex_home` must be the terminal's own isolated `CODEX_HOME` (see
+/// `app::ensure_codex_home`): `resume --last` means "the last session in
+/// this home", so without it the summary would come from whatever Codex
+/// session the user ran last anywhere.
+pub fn codex_summarize_launch(codex_home: Option<&Path>) -> Launch {
     Launch {
         program: "codex".to_string(),
         args: vec![
@@ -261,7 +265,9 @@ pub fn codex_summarize_launch() -> Launch {
             "--last".to_string(),
             SUMMARY_PROMPT.to_string(),
         ],
-        envs: Vec::new(),
+        envs: codex_home
+            .map(|dir| vec![("CODEX_HOME".to_string(), dir.to_string_lossy().to_string())])
+            .unwrap_or_default(),
     }
 }
 
@@ -387,11 +393,15 @@ mod tests {
 
     #[test]
     fn codex_summarize_uses_exec_resume_last() {
-        let launch = codex_summarize_launch();
+        let launch = codex_summarize_launch(Some(Path::new("/tmp/codex-home")));
         assert_eq!(launch.program, "codex");
         assert_eq!(
             launch.args,
             vec!["exec", "resume", "--last", SUMMARY_PROMPT]
+        );
+        assert_eq!(
+            launch.envs,
+            vec![("CODEX_HOME".to_string(), "/tmp/codex-home".to_string())]
         );
     }
 

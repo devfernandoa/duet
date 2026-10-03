@@ -20,6 +20,12 @@
    `style->used->background_color` from the widget node, while the `text`
    node paints the view background — so the background is set on both nodes,
    and the color only on the widget node (where it is actually read). */
+/* Cards are opaque. libadwaita's own `.card` background is translucent in
+   the dark theme, so wherever two cards overlapped, the lower card's title
+   bar showed through the upper one. Declared before the `.note-*` colors
+   below, which override it at equal specificity. */
+.card { background-color: @view_bg_color; }
+
 textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 
 .note-yellow { background-color: #fff3a0; }
@@ -35,7 +41,11 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
    ~320px wide and 34px tall, which is a lot of chrome on a small card and
    sets a floor on how narrow a card can be dragged. Compact, evenly sized
    icon buttons across both node kinds. */
-.node-title-bar button, .note-title-bar button {
+/* `>`: only the title bar's own buttons. A card's right-click menu is a
+   popover parented to the title bar, so a descendant selector here also
+   restyled (and, for notes, recolored to unreadable dark-on-dark) every
+   button in that menu. */
+.node-title-bar > button, .note-title-bar > button {
     min-width: 22px;
     min-height: 22px;
     padding: 0 2px;
@@ -71,8 +81,8 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
    note card (Adwaita sets it explicitly on `button`), so it is set here --
    otherwise the x is drawn in the dark theme's near-white foreground on top
    of a pale title bar. */
-.note-title-bar button, .note-title-bar button image { color: #1f1f1f; }
-.note-title-bar button:hover { background-color: rgba(0, 0, 0, 0.12); }
+.note-title-bar > button, .note-title-bar > button image { color: #1f1f1f; }
+.note-title-bar > button:hover { background-color: rgba(0, 0, 0, 0.12); }
 
 /* The grip sits on top of a `vte4::Terminal`, whose background is black, so
    the old `rgba(0, 0, 0, 0.18)` fill was all but invisible there — the only
@@ -122,7 +132,6 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 }
 
 /* Milestone 6: FileTree / Editor cards and file-sync banners. */
-.file-tree-node, .editor-node { background-color: @card_bg_color; }
 .file-tree-list { background: transparent; }
 .file-tree-list row { padding: 0; min-height: 22px; }
 /* A card's right-click menu (`app::popup_menu`). */

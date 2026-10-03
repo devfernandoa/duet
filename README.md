@@ -79,9 +79,13 @@ Every card works the same way:
   restart, Edit/Preview, save, find, Git actions, "Connect to another
   card…", lock, duplicate, delete.
 
-Scroll (two-finger or mouse wheel) over empty canvas to pan; `Ctrl+scroll`
-or a touchpad pinch zooms around the pointer (the zoom buttons and
-`Ctrl +`/`Ctrl -`/`Ctrl 0` work too). The edit-menu button (no keyboard accelerator of its own, since a
+**Right-click empty canvas** to create a terminal, note, text or file tree
+right where you clicked.
+
+The mouse wheel over empty canvas zooms around the pointer (`Ctrl+wheel`
+zooms over cards too); on a touchpad, two-finger scroll pans and pinch
+zooms. Drag empty canvas to pan. (The zoom buttons and
+`Ctrl +`/`Ctrl -`/`Ctrl 0` work too.) The edit-menu button (no keyboard accelerator of its own, since a
 focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) holds
 selection, layout (align/distribute), duplicate/copy/paste, undo/redo,
 front/back ordering, lock/collapse, snap-to-grid, and node creation.
@@ -94,12 +98,13 @@ program and any arguments). The same dialog assigns a role (see
 [Roles](#roles-and-connections) below) and, for Claude, picks which isolated
 account to use.
 
-Only Claude and Codex support handing a session off to "the other" agent via
-"Hand off to the other agent" in the card's menu — summarize the outgoing conversation, then open
-the incoming agent with that summary as its first prompt. The other
-providers are plain interactive processes with no equivalent resumable
-session, so handing off reports that it's unsupported instead of doing
-something meaningless.
+Claude and Codex sessions can be handed off from the card's menu (**Hand off
+to another agent…**): pick Claude on any of your accounts, or Codex. Duet
+summarizes the outgoing conversation in the background and starts the
+chosen agent in the same card with that summary as its first prompt — the
+way to move a session to another account, too. OpenCode, Shell and custom
+commands have no resumable conversation to summarize, so their menu doesn't
+offer a handoff.
 
 A terminal's title bar shows its name (double-click to rename), role, and
 current activity (`starting`, `idle`, `working`, `awaiting reply`, `offline`,
@@ -270,7 +275,9 @@ conversation the way they used to.
 | Per-card close button | Remove this card (kills the process, for a terminal) |
 | Right-click a card's title bar | The card's menu (rename, connect, collapse, lock, duplicate, delete, ...) |
 | Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
-| Scroll / `Ctrl+scroll` / pinch | Pan / zoom around the pointer / zoom |
+| Right-click empty canvas | New terminal / note / text / file tree at that spot |
+| Wheel on empty canvas, `Ctrl+wheel` anywhere, pinch | Zoom around the pointer |
+| Two-finger scroll, drag on empty canvas | Pan |
 
 Errors (a failed restore, a failed create, account/role operations) surface
 as in-app toasts rather than being printed to the terminal duet was launched
