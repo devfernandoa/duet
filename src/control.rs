@@ -22,6 +22,7 @@ use crate::message::{
     AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, NoteDetail, NoteSummary,
     WhoamiInfo, WorkspaceInfo,
 };
+use crate::orchestration::resource::{ResolveOutcome, ResolvedResource, ResourceDetail};
 use crate::store::default_control_socket_path;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -136,6 +137,22 @@ pub enum ControlRequest {
     NotesConnections {
         id: Uuid,
     },
+    /// `duetctl resolve @ref` / `duetctl resolve @kind:ref`: Milestone 5's
+    /// universal resource addressing — see `orchestration::resource`.
+    /// `requested_by`, if the acting agent is live, narrows an otherwise
+    /// ambiguous match to its own workspace/floor (section 7); resolution
+    /// itself is never permission-gated (section 8).
+    Resolve {
+        reference: String,
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    /// `duetctl resource inspect <id>`: basic, non-gated metadata for any
+    /// resource kind the resolver knows about — see
+    /// `orchestration::resource::ResourceDetail`.
+    ResourceInspect {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +193,13 @@ pub enum ControlResponse {
     },
     NoteUpdated {
         id: Uuid,
+    },
+    Resolved {
+        outcome: ResolveOutcome,
+    },
+    ResourceInspected {
+        resource: ResolvedResource,
+        detail: ResourceDetail,
     },
     Error {
         error: String,
@@ -500,6 +524,17 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             Ok(connections) => ControlResponse::Connections { connections },
             Err(error) => ControlResponse::Error { error },
         },
+        ControlRequest::Resolve {
+            reference,
+            requested_by,
+        } => match app.borrow().resolve_resource(&reference, requested_by) {
+            Ok(outcome) => ControlResponse::Resolved { outcome },
+            Err(error) => ControlResponse::Error { error },
+        },
+        ControlRequest::ResourceInspect { id } => match app.borrow().inspect_resource(id) {
+            Ok((resource, detail)) => ControlResponse::ResourceInspected { resource, detail },
+            Err(error) => ControlResponse::Error { error },
+        },
     }
 }
 
@@ -509,7 +544,15 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
 pub fn is_cli_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "agent" | "agents" | "send" | "connections" | "workspace" | "whoami" | "notes"
+        "agent"
+            | "agents"
+            | "send"
+            | "connections"
+            | "workspace"
+            | "whoami"
+            | "notes"
+            | "resolve"
+            | "resource"
     )
 }
 
@@ -518,6 +561,15 @@ pub fn is_cli_verb(verb: &str) -> bool {
 /// returns whether it succeeded. Works from inside a headless agent shell —
 /// no display needed.
 pub fn run_cli(args: &[String]) -> bool {
+    // `--json` is a trailing output-format flag, applicable to any command
+    // (not just `resolve`/`resource inspect`, though those are why it
+    // exists — section 4's "also provide JSON/machine-readable output").
+    // Stripped here, before verb-specific parsing, so it's never mistaken
+    // for part of a reference or message body.
+    let (json, args) = match args.split_last() {
+        Some((last, rest)) if last == "--json" => (true, rest),
+        _ => (false, args),
+    };
     let request = match parse_cli_request(args) {
         Ok(request) => request,
         Err(error) => {
@@ -528,7 +580,14 @@ pub fn run_cli(args: &[String]) -> bool {
     match send_and_read(&request) {
         Ok(response) => {
             let ok = !matches!(response, ControlResponse::Error { .. });
-            print_response(&response);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                print_response(&response);
+            }
             ok
         }
         Err(error) => {
@@ -581,6 +640,11 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
             agent_id: acting_agent_id(),
         }),
         [cmd, rest @ ..] if cmd == "notes" => parse_notes(rest),
+        [cmd, reference] if cmd == "resolve" => Ok(ControlRequest::Resolve {
+            reference: reference.clone(),
+            requested_by: acting_agent_id(),
+        }),
+        [cmd, rest @ ..] if cmd == "resource" => parse_resource(rest),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -600,7 +664,22 @@ const USAGE: &str = r#"usage:
   duetctl notes replace <id>            (new Markdown content read from stdin)
   duetctl notes append <id>             (text to append read from stdin)
   duetctl notes patch <id> --old <text> --new <text>
-  duetctl notes connections <id>"#;
+  duetctl notes connections <id>
+  duetctl resolve @name                 (or @kind:name, e.g. @agent:backend)
+  duetctl resource inspect <id>
+  append --json to any command for machine-readable output"#;
+
+const RESOURCE_USAGE: &str = r#"usage:
+  duetctl resource inspect <id>"#;
+
+fn parse_resource(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [cmd, id] if cmd == "inspect" => Ok(ControlRequest::ResourceInspect {
+            id: parse_uuid_arg(id)?,
+        }),
+        _ => anyhow::bail!(RESOURCE_USAGE),
+    }
+}
 
 /// Reads standard input fully as UTF-8 — how `notes replace`/`notes append`
 /// take their (often multi-line) Markdown content, instead of joining argv
@@ -623,8 +702,8 @@ const NOTES_USAGE: &str = r#"usage:
   duetctl notes patch <id> --old <text> --new <text>
   duetctl notes connections <id>"#;
 
-fn parse_note_id(raw: &str) -> anyhow::Result<Uuid> {
-    Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("'{raw}' is not a valid note id"))
+fn parse_uuid_arg(raw: &str) -> anyhow::Result<Uuid> {
+    Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("'{raw}' is not a valid id"))
 }
 
 fn parse_notes(args: &[String]) -> anyhow::Result<ControlRequest> {
@@ -634,21 +713,21 @@ fn parse_notes(args: &[String]) -> anyhow::Result<ControlRequest> {
         }),
         [cmd, id] if cmd == "read" => Ok(ControlRequest::NotesRead {
             requested_by: acting_agent_id(),
-            id: parse_note_id(id)?,
+            id: parse_uuid_arg(id)?,
         }),
         [cmd, id] if cmd == "replace" => Ok(ControlRequest::NotesReplace {
             requested_by: acting_agent_id(),
-            id: parse_note_id(id)?,
+            id: parse_uuid_arg(id)?,
             markdown: read_stdin_to_string()?,
         }),
         [cmd, id] if cmd == "append" => Ok(ControlRequest::NotesAppend {
             requested_by: acting_agent_id(),
-            id: parse_note_id(id)?,
+            id: parse_uuid_arg(id)?,
             addition: read_stdin_to_string()?,
         }),
-        [cmd, id, rest @ ..] if cmd == "patch" => parse_notes_patch(parse_note_id(id)?, rest),
+        [cmd, id, rest @ ..] if cmd == "patch" => parse_notes_patch(parse_uuid_arg(id)?, rest),
         [cmd, id] if cmd == "connections" => Ok(ControlRequest::NotesConnections {
-            id: parse_note_id(id)?,
+            id: parse_uuid_arg(id)?,
         }),
         _ => anyhow::bail!(NOTES_USAGE),
     }
@@ -857,9 +936,56 @@ fn print_response(response: &ControlResponse) {
             println!("\n{}", note.markdown);
         }
         ControlResponse::NoteUpdated { id } => println!("updated note {id}"),
+        ControlResponse::Resolved { outcome } => print_resolve_outcome(outcome),
+        ControlResponse::ResourceInspected { resource, detail } => {
+            print_resolved_resource(resource);
+            match detail {
+                ResourceDetail::Agent(info) => {
+                    println!("provider:  {}", info.provider);
+                    println!("role:      {}", info.role.as_deref().unwrap_or("-"));
+                    println!("manager:   {}", info.manager);
+                    println!("activity:  {}", info.activity);
+                }
+                ResourceDetail::Note(note) => {
+                    println!("title:     {}", note.title);
+                }
+            }
+        }
         ControlResponse::Error { error } => {
             eprintln!("duetctl: {error}");
         }
+    }
+}
+
+fn print_resolved_resource(resource: &ResolvedResource) {
+    println!("kind:      {}", resource.kind.label());
+    println!("id:        {}", resource.id);
+    println!("name:      {}", resource.name);
+    println!(
+        "workspace: {} ({})",
+        resource.workspace_name, resource.workspace_id
+    );
+    println!("floor:     {:?}", resource.floor);
+}
+
+fn print_resolve_outcome(outcome: &ResolveOutcome) {
+    match outcome {
+        ResolveOutcome::Found { resource } => print_resolved_resource(resource),
+        ResolveOutcome::Ambiguous { candidates } => {
+            println!("ambiguous: {} resources match", candidates.len());
+            for candidate in candidates {
+                println!(
+                    "  {}\t{}\t{}\tworkspace={} ({})\tfloor={:?}",
+                    candidate.kind.label(),
+                    candidate.id,
+                    candidate.name,
+                    candidate.workspace_name,
+                    candidate.workspace_id,
+                    candidate.floor
+                );
+            }
+        }
+        ResolveOutcome::NotFound => println!("no resource found"),
     }
 }
 
@@ -1178,6 +1304,74 @@ mod tests {
                 assert_eq!(markdown, "# hi\n\nbody");
             }
             _ => panic!("expected NotesReplace"),
+        }
+    }
+
+    #[test]
+    fn resolve_parses_its_reference() {
+        let ControlRequest::Resolve { reference, .. } =
+            parse_cli_request(&["resolve".to_string(), "@backend".to_string()]).unwrap()
+        else {
+            panic!("expected Resolve");
+        };
+        assert_eq!(reference, "@backend");
+    }
+
+    #[test]
+    fn resource_inspect_parses_its_id() {
+        let id = Uuid::new_v4();
+        let ControlRequest::ResourceInspect { id: parsed_id } = parse_cli_request(&[
+            "resource".to_string(),
+            "inspect".to_string(),
+            id.to_string(),
+        ])
+        .unwrap() else {
+            panic!("expected ResourceInspect");
+        };
+        assert_eq!(parsed_id, id);
+    }
+
+    #[test]
+    fn resolve_and_resource_are_recognized_verbs() {
+        assert!(is_cli_verb("resolve"));
+        assert!(is_cli_verb("resource"));
+    }
+
+    #[test]
+    fn a_trailing_json_flag_is_stripped_before_parsing_and_recognized_elsewhere() {
+        let args = [
+            "resolve".to_string(),
+            "@backend".to_string(),
+            "--json".to_string(),
+        ];
+        let (json, stripped) = match args.split_last() {
+            Some((last, rest)) if last == "--json" => (true, rest),
+            _ => (false, &args[..]),
+        };
+        assert!(json);
+        let ControlRequest::Resolve { reference, .. } = parse_cli_request(stripped).unwrap() else {
+            panic!("expected Resolve");
+        };
+        assert_eq!(reference, "@backend");
+    }
+
+    #[test]
+    fn resolve_requests_round_trip_through_json() {
+        let request = ControlRequest::Resolve {
+            reference: "@backend".to_string(),
+            requested_by: Some(Uuid::nil()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlRequest::Resolve {
+                reference,
+                requested_by,
+            } => {
+                assert_eq!(reference, "@backend");
+                assert_eq!(requested_by, Some(Uuid::nil()));
+            }
+            _ => panic!("expected Resolve"),
         }
     }
 }

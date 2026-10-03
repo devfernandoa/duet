@@ -21,7 +21,9 @@ use std::path::Path;
 pub const DISCOVERY_INSTRUCTION: &str = "You are running inside Duet, a multi-agent workspace. \
 Run `duetctl whoami` to see your own role and who you're connected to, `duetctl agents list` \
 to see every agent, and `duetctl send --to <agent> \"message\"` to message one you're connected \
-to (your id is already in $DUET_AGENT_ID).";
+to (your id is already in $DUET_AGENT_ID). If an instruction contains an explicit @reference \
+(e.g. @backend, @agent:backend, @note:requirements), resolve it first with `duetctl resolve \
+@reference` rather than guessing its identity.";
 
 /// The `DUET_*` variables section 8 asks every launched agent to receive.
 /// `DUET_FLOOR_ID` is `"ground"` until Milestone 9 introduces real floors —

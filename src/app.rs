@@ -1027,6 +1027,133 @@ impl App {
         }
     }
 
+    /// Every workspace's addressable node/edge data, for the resource
+    /// resolver (section 1/5): the live workspace's actual `nodes`/`edges`,
+    /// plus every dormant workspace's own persisted records. Cloned rather
+    /// than borrowed — `self.nodes` is a `HashMap<Uuid, NodeEntry>`, not a
+    /// `Vec<NodeRecord>`, so there's no slice to hand out directly, and this
+    /// is control-plane-rate (CLI/agent requests), not a hot path, the same
+    /// reasoning `agent_registry()` already uses for its own per-call clone.
+    pub fn workspace_views(&self) -> Vec<orchestration::resource::WorkspaceView> {
+        let mut views = vec![orchestration::resource::WorkspaceView {
+            id: self.workspace_id,
+            name: self.workspace_name.clone(),
+            nodes: self
+                .nodes
+                .values()
+                .map(|entry| entry.record.clone())
+                .collect(),
+            edges: self.edges.clone(),
+        }];
+        views.extend(self.inactive_workspaces.iter().map(|workspace| {
+            orchestration::resource::WorkspaceView {
+                id: workspace.id,
+                name: workspace.name.clone(),
+                nodes: workspace.nodes.clone(),
+                edges: workspace.edges.clone(),
+            }
+        }));
+        views
+    }
+
+    /// `requested_by`'s own workspace/floor, for context-sensitive
+    /// resolution (section 7) — `None` for the human operator or an agent id
+    /// that isn't a live node in the active workspace, since there is no
+    /// other workspace an agent could actually be running in to have a
+    /// context at all.
+    fn resolve_context(
+        &self,
+        requested_by: Option<Uuid>,
+    ) -> Option<orchestration::resource::ResolveContext> {
+        let node = self.nodes.get(&requested_by?)?;
+        Some(orchestration::resource::ResolveContext {
+            workspace_id: self.workspace_id,
+            floor: node.record.floor,
+        })
+    }
+
+    /// `duetctl resolve <reference>`'s service: parses and resolves an `@`
+    /// reference against every known workspace. See `orchestration::resource`.
+    pub fn resolve_resource(
+        &self,
+        reference: &str,
+        requested_by: Option<Uuid>,
+    ) -> Result<orchestration::resource::ResolveOutcome, String> {
+        let reference = orchestration::resource::ResourceRef::parse(reference)?;
+        let views = self.workspace_views();
+        let context = self.resolve_context(requested_by);
+        Ok(orchestration::resource::resolve(
+            &reference,
+            &views,
+            &self.roles(),
+            context.as_ref(),
+        ))
+    }
+
+    /// `duetctl resource inspect <id>`'s service: resolves `id` (ids are
+    /// globally unique, so this is never itself ambiguous) to find its kind
+    /// and workspace, then asks that kind's own service for basic,
+    /// non-gated metadata — never the protected content a read capability
+    /// would be needed for (a note's title, not its Markdown; see
+    /// `orchestration::resource::ResourceDetail`'s doc comment). Only
+    /// resources in the *active* workspace can be inspected this way, the
+    /// same restriction every other `App` service already has (a dormant
+    /// workspace's agents have no live activity to report, and its notes'
+    /// content isn't loaded into memory at all).
+    pub fn inspect_resource(
+        &self,
+        id: Uuid,
+    ) -> Result<
+        (
+            orchestration::resource::ResolvedResource,
+            orchestration::resource::ResourceDetail,
+        ),
+        String,
+    > {
+        let reference = orchestration::resource::ResourceRef {
+            kind: None,
+            name: id.to_string(),
+        };
+        let views = self.workspace_views();
+        match orchestration::resource::resolve(&reference, &views, &self.roles(), None) {
+            orchestration::resource::ResolveOutcome::Found { resource } => {
+                if resource.workspace_id != self.workspace_id {
+                    return Err(format!(
+                        "{} '{}' lives in workspace '{}', which isn't currently active",
+                        resource.kind.label(),
+                        resource.name,
+                        resource.workspace_name
+                    ));
+                }
+                let detail = match resource.kind {
+                    orchestration::ResourceKind::Agent => self
+                        .agent_infos()
+                        .into_iter()
+                        .find(|info| info.id == id)
+                        .map(orchestration::resource::ResourceDetail::Agent)
+                        .ok_or_else(|| format!("no agent with id {id}"))?,
+                    orchestration::ResourceKind::Note => self
+                        .list_notes(None)
+                        .into_iter()
+                        .find(|note| note.id == id)
+                        .map(orchestration::resource::ResourceDetail::Note)
+                        .ok_or_else(|| format!("no note with id {id}"))?,
+                };
+                Ok((resource, detail))
+            }
+            orchestration::resource::ResolveOutcome::NotFound => {
+                Err(format!("no resource with id {id}"))
+            }
+            // Ids are unique across every workspace, so a bare-id reference
+            // (no name collision possible) can never actually come back
+            // ambiguous — this arm exists so the match stays exhaustive, not
+            // because it's reachable.
+            orchestration::resource::ResolveOutcome::Ambiguous { .. } => {
+                Err(format!("id {id} is ambiguous (unexpected: ids are unique)"))
+            }
+        }
+    }
+
     /// Every live `Terminal`, as `duet agent list` (via `control.rs`)
     /// reports it.
     pub fn agent_summaries(&self) -> Vec<AgentSummary> {
@@ -3850,6 +3977,55 @@ mod tests {
         }
     }
 
+    /// Milestone 5: resolution sees across workspaces (the active one is
+    /// never populated by this test — only `App::new`'s own `Canvas`
+    /// construction needs a display, not the resolve/inspect logic itself),
+    /// but actually acting on a resource stays restricted to the active
+    /// workspace, the same boundary every other `App` service already
+    /// enforces.
+    #[test]
+    #[ignore = "needs a display"]
+    fn resolve_resource_finds_a_dormant_workspace_agent_and_inspect_refuses_it() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut backend = terminal_node(EnvironmentKind::LocalPty);
+        backend.as_terminal_mut().unwrap().name = "Backend".to_string();
+        let backend_id = backend.id;
+        app.borrow_mut()
+            .inactive_workspaces
+            .push(dormant_workspace("other", vec![backend]));
+
+        let outcome = app.borrow().resolve_resource("@backend", None).unwrap();
+        let orchestration::ResolveOutcome::Found { resource } = outcome else {
+            panic!("expected Found");
+        };
+        assert_eq!(resource.id, backend_id);
+        assert_eq!(resource.kind, orchestration::ResourceKind::Agent);
+
+        let error = app.borrow().inspect_resource(backend_id).unwrap_err();
+        assert!(error.contains("isn't currently active"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn resolve_resource_rejects_a_reference_with_no_leading_at() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        assert!(app.borrow().resolve_resource("backend", None).is_err());
+    }
+
     /// Registry-level (no GTK canvas interaction) exercise of the exact
     /// scenario Milestone 2 exists for: a dormant workspace's terminal is
     /// genuinely running (`runtime.spawn` directly, standing in for what
@@ -4232,6 +4408,144 @@ mod tests {
         drop(app_ref);
         assert!(
             App::replace_note(&app, Some(lead_id), requirements.id, "hacked".to_string()).is_err()
+        );
+    }
+
+    /// Milestone 5's acceptance scenario, exercised at the service layer the
+    /// same way the Milestone 4 acceptance test above is: Lead, Backend and
+    /// Reviewer agents plus a Requirements note, connected the way the human
+    /// operator's own canvas link gesture already would (`SendMessages` for
+    /// agent-to-agent, `ReadNote` for Backend's edge to the note). Lead
+    /// resolves Backend/Requirements/Reviewer purely through
+    /// `App::resolve_resource` — the exact same service `duetctl resolve`
+    /// calls over the socket — instructs Backend, Backend reads the note
+    /// through `App::read_note`, and Backend delivers to Reviewer, all
+    /// through Duet's own services with no content ever hand-fed between
+    /// them by a human. This is the "LLM reasons, Duet resolves" split
+    /// section 11 describes; `duet`'s skill (`orchestration::skill`) is what
+    /// tells a real Claude/Codex agent to run exactly these commands.
+    #[test]
+    #[ignore = "needs a display"]
+    fn acceptance_lead_resolves_backend_requirements_and_reviewer_and_delegates() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let toast = adw::ToastOverlay::new();
+
+        let mut lead = terminal_node(EnvironmentKind::LocalPty);
+        lead.as_terminal_mut().unwrap().name = "Lead".to_string();
+        let mut backend = terminal_node(EnvironmentKind::LocalPty);
+        backend.as_terminal_mut().unwrap().name = "Backend".to_string();
+        let mut reviewer = terminal_node(EnvironmentKind::LocalPty);
+        reviewer.as_terminal_mut().unwrap().name = "Reviewer".to_string();
+        let requirements = note_with_markdown("# Requirements\n\nShip a login form.");
+
+        for node in [&lead, &backend, &reviewer, &requirements] {
+            materialize_node(&app, node.clone(), &toast).unwrap();
+        }
+        let (lead_id, backend_id, reviewer_id, requirements_id) =
+            (lead.id, backend.id, reviewer.id, requirements.id);
+
+        {
+            let mut app_mut = app.borrow_mut();
+            app_mut.edges.push(EdgeRecord {
+                id: Uuid::new_v4(),
+                source: lead_id,
+                target: backend_id,
+                capabilities: [EdgeCapability::SendMessages].into_iter().collect(),
+            });
+            app_mut.edges.push(EdgeRecord {
+                id: Uuid::new_v4(),
+                source: backend_id,
+                target: requirements_id,
+                capabilities: [EdgeCapability::ReadNote].into_iter().collect(),
+            });
+            app_mut.edges.push(EdgeRecord {
+                id: Uuid::new_v4(),
+                source: backend_id,
+                target: reviewer_id,
+                capabilities: [EdgeCapability::SendMessages].into_iter().collect(),
+            });
+        }
+
+        // "Ask @backend to read @requirements and send the conclusions to
+        // @reviewer" — Lead resolves every @ reference through Duet first,
+        // never guessing an id from the reference text.
+        let orchestration::ResolveOutcome::Found {
+            resource: backend_resource,
+        } = app
+            .borrow()
+            .resolve_resource("@backend", Some(lead_id))
+            .unwrap()
+        else {
+            panic!("expected to resolve @backend");
+        };
+        assert_eq!(backend_resource.id, backend_id);
+        assert_eq!(backend_resource.kind, orchestration::ResourceKind::Agent);
+
+        let orchestration::ResolveOutcome::Found {
+            resource: requirements_resource,
+        } = app
+            .borrow()
+            .resolve_resource("@requirements", Some(lead_id))
+            .unwrap()
+        else {
+            panic!("expected to resolve @requirements");
+        };
+        assert_eq!(requirements_resource.id, requirements_id);
+
+        let orchestration::ResolveOutcome::Found {
+            resource: reviewer_resource,
+        } = app
+            .borrow()
+            .resolve_resource("@reviewer", Some(lead_id))
+            .unwrap()
+        else {
+            panic!("expected to resolve @reviewer");
+        };
+        assert_eq!(reviewer_resource.id, reviewer_id);
+
+        // 1-2. Lead instructs Backend, addressing it by the stable id
+        // resolution just returned — never by guessing the target name's
+        // exact capitalization.
+        let instruction = App::send_message(
+            &app,
+            Some(lead_id),
+            &backend_resource.id.to_string(),
+            "Read the requirements note and send your conclusions to the reviewer.".to_string(),
+        )
+        .unwrap();
+        assert_ne!(instruction.status, crate::message::DeliveryStatus::Failed);
+
+        // 3. Backend reads the note through Duet, never pasted in by a human.
+        let note = app
+            .borrow()
+            .read_note(Some(backend_id), requirements_id)
+            .unwrap();
+        assert!(note.markdown.contains("login form"));
+
+        // 4. Backend delivers its conclusions to Reviewer, again by id.
+        let delivery = App::send_message(
+            &app,
+            Some(backend_id),
+            &reviewer_resource.id.to_string(),
+            format!("Reviewed: {}", note.markdown),
+        )
+        .unwrap();
+        assert_ne!(delivery.status, crate::message::DeliveryStatus::Failed);
+
+        // Resolving a name never grants permission on its own: Reviewer has
+        // no edge back to Lead, so this delivery is refused even though
+        // Reviewer could resolve "@lead" just fine.
+        assert!(
+            App::send_message(
+                &app,
+                Some(reviewer_id),
+                &lead_id.to_string(),
+                "hi".to_string()
+            )
+            .is_err()
         );
     }
 }
