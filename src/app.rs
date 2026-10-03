@@ -3080,14 +3080,47 @@ fn resolve_claude_account(
 /// Creates (if needed) and returns `id`'s isolated `CODEX_HOME`, for a
 /// Codex-kind agent; `None` for every other agent. See
 /// `store::default_codex_home_dir`'s doc comment for why Codex gets
-/// per-terminal isolation where Claude gets shared named accounts.
+/// per-terminal isolation where Claude gets shared named accounts — and
+/// why, despite that, logging in from one Codex terminal is enough for
+/// every other one too (`link_shared_codex_auth`, called here).
 fn ensure_codex_home(agent: &Agent, id: Uuid) -> anyhow::Result<Option<PathBuf>> {
     if !matches!(agent, Agent::Codex) {
         return Ok(None);
     }
     let dir = crate::store::default_codex_home_dir(id)?;
     std::fs::create_dir_all(&dir)?;
+    let shared_auth_dir = crate::store::default_codex_auth_dir()?;
+    if let Err(error) = link_codex_auth(&dir, &shared_auth_dir) {
+        // Worth knowing about, but not worth failing the launch over — an
+        // agent that still has to log in individually is a worse failure
+        // mode than one that launches but needs `codex login` once.
+        eprintln!(
+            "duet: couldn't link shared Codex auth for {}: {error}",
+            dir.display()
+        );
+    }
     Ok(Some(dir))
+}
+
+/// Makes `codex_home/auth.json` a symlink to `shared_auth_dir`'s
+/// `auth.json`, so a `codex login` run from any one duet-launched Codex
+/// terminal authenticates every other one too — only each terminal's
+/// daemon/session state is actually isolated, never its login. A no-op
+/// once the symlink already exists (every launch calls this, not just the
+/// first). `shared_auth_dir` is a parameter rather than looked up here so
+/// this stays pure, testable logic — `ensure_codex_home` is the one real
+/// call site, passing `store::default_codex_auth_dir()`.
+fn link_codex_auth(codex_home: &Path, shared_auth_dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(shared_auth_dir)?;
+    let link = codex_home.join("auth.json");
+    // `symlink_metadata` (not `metadata`) so an existing symlink is seen
+    // even if it's currently dangling (nothing has logged in yet) — such a
+    // link is already correct and must be left alone, not recreated.
+    if std::fs::symlink_metadata(&link).is_ok() {
+        return Ok(());
+    }
+    std::os::unix::fs::symlink(shared_auth_dir.join("auth.json"), &link)?;
+    Ok(())
 }
 
 /// Builds the `Launch` for (re)starting a `Terminal` node's process from its
@@ -3436,6 +3469,49 @@ mod tests {
         let mut terminal = claude_terminal(None, false);
         terminal.agent = Agent::Shell;
         assert!(claude_should_resume(&terminal));
+    }
+
+    /// The regression test for "every new Codex window asks me to login
+    /// again": a fresh isolated `CODEX_HOME` must get a real symlink to the
+    /// one shared auth location, not its own independent (and therefore
+    /// unauthenticated) `auth.json`.
+    #[test]
+    fn link_codex_auth_symlinks_a_fresh_codex_home_to_the_shared_auth_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let shared_auth_dir = tmp.path().join("shared-auth");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        link_codex_auth(&codex_home, &shared_auth_dir).unwrap();
+
+        let link = codex_home.join("auth.json");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            shared_auth_dir.join("auth.json")
+        );
+
+        // Logging in through this terminal writes through the symlink...
+        std::fs::write(&link, "fake credentials").unwrap();
+        // ...which a second terminal's own isolated CODEX_HOME sees too,
+        // once linked to the same shared directory.
+        let other_codex_home = tmp.path().join("other-codex-home");
+        std::fs::create_dir_all(&other_codex_home).unwrap();
+        link_codex_auth(&other_codex_home, &shared_auth_dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(other_codex_home.join("auth.json")).unwrap(),
+            "fake credentials"
+        );
+    }
+
+    #[test]
+    fn link_codex_auth_leaves_an_existing_link_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let shared_auth_dir = tmp.path().join("shared-auth");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        link_codex_auth(&codex_home, &shared_auth_dir).unwrap();
+        // A second call (every launch calls this, not just the first) must
+        // not error trying to recreate the already-existing symlink.
+        link_codex_auth(&codex_home, &shared_auth_dir).unwrap();
     }
 
     /// A duplicated Claude terminal gets a brand-new session id that has

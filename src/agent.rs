@@ -154,12 +154,28 @@ fn codex_home_env(home_dir: Option<&Path>) -> Vec<(String, String)> {
 /// local app-server daemon only tolerates one live interactive session per
 /// `CODEX_HOME`, so two concurrent Codex terminals sharing the real
 /// `~/.codex` fail with "already running in another app". Isolating by
-/// terminal (see `store::default_codex_home_dir`) fixes that at the cost of
-/// each new Codex terminal needing its own `codex login` — there is no
-/// `CLAUDE_CONFIG_DIR`-style "several concurrent sessions, one shared
-/// login" option for Codex today.
+/// terminal (see `store::default_codex_home_dir`) fixes that without
+/// costing a shared login: `app::ensure_codex_home` symlinks each
+/// terminal's own `auth.json` to one shared location, so only the
+/// daemon/session state is actually isolated, not the login itself.
+///
+/// Always passes `-s workspace-write` plus an explicit
+/// `sandbox_workspace_write.network_access=true` override: Codex's own
+/// built-in default (confirmed against a real install — nothing in a
+/// user's `config.toml` sets this) is the `read-only` sandbox, which
+/// blocks the agent from writing files *or* making any network/socket
+/// connection — including the one `duetctl` needs to reach Duet's control
+/// socket at all. A coding agent that can't write or run `duetctl` isn't
+/// usable as one, so Duet opts every launch it starts into the same
+/// baseline a human would pick for agentic work, the same way Claude
+/// Code's own Bash tool isn't read-only by default either.
 pub fn codex_launch(resume: bool, initial_prompt: Option<&str>, home_dir: Option<&Path>) -> Launch {
-    let mut args = Vec::new();
+    let mut args = vec![
+        "-s".to_string(),
+        "workspace-write".to_string(),
+        "-c".to_string(),
+        "sandbox_workspace_write.network_access=true".to_string(),
+    ];
     if resume {
         args.push("resume".to_string());
         args.push("--last".to_string());
@@ -296,24 +312,39 @@ mod tests {
         );
     }
 
+    /// Every launch always opts out of Codex's own `read-only` default —
+    /// see `codex_launch`'s doc comment for why.
+    const CODEX_SANDBOX_ARGS: [&str; 4] = [
+        "-s",
+        "workspace-write",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+    ];
+
     #[test]
     fn codex_fresh_launch_has_no_resume_flags() {
         let launch = codex_launch(false, Some("hi"), None);
         assert_eq!(launch.program, "codex");
-        assert_eq!(launch.args, vec!["--", "hi"]);
+        let mut expected: Vec<String> = CODEX_SANDBOX_ARGS.iter().map(|s| s.to_string()).collect();
+        expected.extend(["--".to_string(), "hi".to_string()]);
+        assert_eq!(launch.args, expected);
         assert!(launch.envs.is_empty());
     }
 
     #[test]
     fn codex_resume_launch_uses_resume_last() {
         let launch = codex_launch(true, Some("hi"), None);
-        assert_eq!(launch.args, vec!["resume", "--last", "--", "hi"]);
+        let mut expected: Vec<String> = CODEX_SANDBOX_ARGS.iter().map(|s| s.to_string()).collect();
+        expected.extend(["resume", "--last", "--", "hi"].map(String::from));
+        assert_eq!(launch.args, expected);
     }
 
     #[test]
     fn codex_resume_launch_without_prompt() {
         let launch = codex_launch(true, None, None);
-        assert_eq!(launch.args, vec!["resume", "--last"]);
+        let mut expected: Vec<String> = CODEX_SANDBOX_ARGS.iter().map(|s| s.to_string()).collect();
+        expected.extend(["resume", "--last"].map(String::from));
+        assert_eq!(launch.args, expected);
     }
 
     #[test]
@@ -468,7 +499,12 @@ mod tests {
             resume: true,
             ..Default::default()
         };
-        assert_eq!(Agent::Codex.launch(request).args, vec!["resume", "--last"]);
+        assert!(
+            Agent::Codex
+                .launch(request)
+                .args
+                .ends_with(&["resume".to_string(), "--last".to_string()])
+        );
 
         assert_eq!(
             Agent::OpenCode.launch(LaunchRequest::default()).program,
