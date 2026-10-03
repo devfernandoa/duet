@@ -7,13 +7,19 @@
 //! (`store.rs`) and migrated by `migration.rs`.
 //!
 //! This module intentionally does not implement orchestration permission
-//! behavior for edge capabilities, file-tree/portal/drawing functionality,
-//! or group containment — those are later milestones. The payload types
-//! here exist so the model is genuinely generic now, not because their
-//! owning features are built.
+//! behavior for edge capabilities, portal/drawing functionality, or group
+//! containment — those are later milestones. The payload types here exist
+//! so the model is genuinely generic now, not because their owning features
+//! are built. (`FileTree`, `Editor` and file-backed `Note`s became real in
+//! Milestone 6 — their payloads hold only persisted *view* state and
+//! project-relative paths; file contents, Git status and live watchers are
+//! runtime state owned by `app`/`project`, never serialized here.)
 
 use crate::agent::Agent;
+use crate::project::git::DiffScope;
+use crate::project::sync::FileRevision;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -101,6 +107,28 @@ pub struct NotePayload {
     /// others. `#[serde(default)]` so a migrated note opens in Preview.
     #[serde(default = "NoteViewMode::default_mode")]
     pub view_mode: NoteViewMode,
+    /// `Some` for a file-backed note (Milestone 6): `markdown` is then a
+    /// synced copy of a project file, kept in step with it by
+    /// `App::sync_project_files`. `None` (the default, and every note saved
+    /// before Milestone 6) is an ordinary internal note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<NoteFileBacking>,
+}
+
+/// Which project file a file-backed note mirrors, and the revision both
+/// last agreed on — persisted so an edit made to the file while Duet was
+/// closed (or while this note's workspace was dormant) is detected on the
+/// next sync instead of being overwritten. See `project::sync::reconcile`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteFileBacking {
+    /// Project-relative (`project::ProjectPath` syntax). Kept as a plain
+    /// string, parsed at use, so a path that somehow stopped being valid
+    /// can never make the whole store fail to load.
+    pub path: String,
+    /// The last revision synced in either direction; `None` until the
+    /// first successful sync.
+    #[serde(default)]
+    pub revision: Option<FileRevision>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,12 +151,62 @@ pub struct TextPayload {
     pub content: String,
 }
 
-/// Placeholder for Milestone 7's file tree node: enough to exist, round-trip
-/// through persistence, and render as a labeled placeholder. No filesystem
-/// access, no `ProjectFilesystem`, no real tree.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// A FileTree node's persisted view state (Milestone 6). Every field is
+/// `#[serde(default)]`, so a placeholder FileTree saved before Milestone 6
+/// (which only had `root_label`) loads as a real tree of its workspace's
+/// project root. Several FileTree nodes can coexist, each with its own
+/// state; directory listings and Git status are runtime-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileTreePayload {
+    /// Optional display label (the pre-Milestone-6 placeholder's only
+    /// field); the root path's own name is shown when empty.
+    #[serde(default)]
     pub root_label: String,
+    /// The directory this tree is rooted at, project-relative (`""` is the
+    /// project root). Strings rather than `ProjectPath`s for the same
+    /// reason as `NoteFileBacking::path`.
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub expanded: BTreeSet<String>,
+    #[serde(default)]
+    pub selected: Option<String>,
+    #[serde(default)]
+    pub show_hidden: bool,
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    #[serde(default = "default_true")]
+    pub show_git_status: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for FileTreePayload {
+    fn default() -> Self {
+        FileTreePayload {
+            root_label: String::new(),
+            root: String::new(),
+            expanded: BTreeSet::new(),
+            selected: None,
+            show_hidden: false,
+            respect_gitignore: true,
+            show_git_status: true,
+        }
+    }
+}
+
+/// An embedded editor (or read-only diff view) of one project file
+/// (Milestone 6). Only *which* file and view are persisted; the buffer is
+/// loaded from the file on open, and unsaved edits are runtime state the
+/// editor itself guards (explicit save, conflict-checked).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditorPayload {
+    pub path: String,
+    /// `Some` shows the file's Git diff in that scope instead of its source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffScope>,
 }
 
 /// Placeholder for Milestone 8's browser portal node.
@@ -164,6 +242,7 @@ pub enum NodeKind {
     Portal(PortalPayload),
     Drawing(DrawingPayload),
     Group(GroupPayload),
+    Editor(EditorPayload),
 }
 
 impl NodeKind {
@@ -179,6 +258,7 @@ impl NodeKind {
             NodeKind::Portal(_) => "Portal",
             NodeKind::Drawing(_) => "Drawing",
             NodeKind::Group(_) => "Group",
+            NodeKind::Editor(_) => "Editor",
         }
     }
 }
@@ -334,6 +414,7 @@ mod tests {
                 markdown: "hi".to_string(),
                 color: "yellow".to_string(),
                 view_mode: NoteViewMode::Preview,
+                file: None,
             }),
         };
         assert!(note.as_terminal().is_none());
@@ -370,6 +451,56 @@ mod tests {
         let json = serde_json::to_string(&node).unwrap();
         let back: NodeRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(node, back);
+    }
+
+    #[test]
+    fn a_pre_milestone_6_placeholder_file_tree_loads_with_real_defaults() {
+        let tree: FileTreePayload = serde_json::from_str(r#"{"root_label": "repo"}"#).unwrap();
+        assert_eq!(tree.root_label, "repo");
+        assert_eq!(tree.root, "");
+        assert!(tree.expanded.is_empty());
+        assert!(tree.respect_gitignore);
+        assert!(tree.show_git_status);
+        assert!(!tree.show_hidden);
+    }
+
+    #[test]
+    fn file_tree_editor_and_file_backed_note_round_trip_through_json() {
+        let tree = NodeKind::FileTree(FileTreePayload {
+            root_label: String::new(),
+            root: "src".to_string(),
+            expanded: ["src/auth".to_string()].into_iter().collect(),
+            selected: Some("src/auth/mod.rs".to_string()),
+            show_hidden: true,
+            respect_gitignore: false,
+            show_git_status: true,
+        });
+        let editor = NodeKind::Editor(EditorPayload {
+            path: "src/main.rs".to_string(),
+            diff: Some(DiffScope::Staged),
+        });
+        let note = NodeKind::Note(NotePayload {
+            markdown: "# Plan".to_string(),
+            color: "yellow".to_string(),
+            view_mode: NoteViewMode::Edit,
+            file: Some(NoteFileBacking {
+                path: "docs/plan.md".to_string(),
+                revision: Some(FileRevision::of(b"# Plan")),
+            }),
+        });
+        for kind in [tree, editor, note] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<NodeKind>(&json).unwrap(), kind);
+        }
+        // An internal note doesn't even mention `file`, keeping old readers happy.
+        let internal = serde_json::to_string(&NotePayload {
+            markdown: String::new(),
+            color: "yellow".to_string(),
+            view_mode: NoteViewMode::Edit,
+            file: None,
+        })
+        .unwrap();
+        assert!(!internal.contains("file"));
     }
 
     #[test]

@@ -21,7 +21,7 @@
 //!   `Note` node (its plain text becoming Markdown source unchanged — plain
 //!   text is already valid Markdown), and a link becomes a visual-only
 //!   (empty-capability) edge.
-//! - 5 (current): purely additive — Milestone 2's runtime-survival work adds
+//! - 5: purely additive — Milestone 2's runtime-survival work adds
 //!   `TerminalPayload::environment` and `WorkspaceRecord::{environment,
 //!   color, icon, created_at, last_opened}`. Every new field is
 //!   `#[serde(default)]`, so a schema-4 file (which has none of them)
@@ -29,6 +29,17 @@
 //!   conversion step — unlike schema 3 -> 4, the on-disk *shape* of a node
 //!   didn't change, only which optional fields a `WorkspaceRecord`/
 //!   `TerminalPayload` may carry.
+//! - 6 (current): purely additive again — Milestone 6's project filesystem
+//!   work. `FileTreePayload` gains real view state (`root`, `expanded`,
+//!   `selected`, `show_hidden`, `respect_gitignore`, `show_git_status`),
+//!   `NotePayload` gains an optional `file` backing, and `NodeKind` gains an
+//!   `Editor` variant. Every new field is `#[serde(default)]` (a schema-5
+//!   placeholder FileTree, which only had `root_label`, loads as a real tree
+//!   of the project root; every schema-5 note loads as an internal note), so
+//!   a schema-5 file deserializes directly with no conversion step. The
+//!   version still moves so a file that *uses* the new shape is never
+//!   silently half-read by an older binary: that binary sees version 6 and
+//!   takes the future-schema backup path below instead.
 //!
 //! A `schema_version` *greater* than [`CURRENT_SCHEMA_VERSION`] means the
 //! file was written by a newer duet. Rather than guess at a shape it has
@@ -49,7 +60,7 @@ use uuid::Uuid;
 
 /// The schema version this binary reads and writes. Bump this and add a
 /// migration step below whenever `Store`'s on-disk shape changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Plain-function form of [`CURRENT_SCHEMA_VERSION`], for serde's
 /// `#[serde(default = "...")]` attribute on `Store::schema_version` (which
@@ -198,6 +209,7 @@ fn convert_note(note: V3StickyNoteRecord) -> NodeRecord {
             markdown: note.text,
             color: note.color,
             view_mode: NoteViewMode::Preview,
+            file: None,
         }),
     }
 }
@@ -352,7 +364,7 @@ pub fn load(path: &Path, contents: &str) -> (Store, Option<String>) {
         return backup_corrupt_file(path, "JSON is not an object");
     };
 
-    // Schemas 3, 4 and 5 all have a top-level "workspaces" key; a missing
+    // Schemas 3 through 6 all have a top-level "workspaces" key; a missing
     // `schema_version` has only ever meant 3 (the shape before the field
     // existed), so that's the default rather than assuming "current".
     if obj.contains_key("workspaces") {
@@ -361,10 +373,10 @@ pub fn load(path: &Path, contents: &str) -> (Store, Option<String>) {
             return backup_future_schema_file(path, version);
         }
         if version >= 4 {
-            // Schema 4 and 5 share the same nodes/edges shape; 5 only adds
-            // new `WorkspaceRecord`/`TerminalPayload` fields, every one
-            // `#[serde(default)]`, so a schema-4 file deserializes directly
-            // as the current `Store` with no dedicated conversion step.
+            // Schemas 4, 5 and 6 share the same nodes/edges shape; 5 and 6
+            // only add new fields/variants, every field `#[serde(default)]`,
+            // so a schema-4 or -5 file deserializes directly as the current
+            // `Store` with no dedicated conversion step.
             return match serde_json::from_value::<Store>(value) {
                 Ok(store) => (store, None),
                 Err(error) => backup_corrupt_file(path, &error.to_string()),
@@ -483,6 +495,69 @@ mod tests {
             workspace.nodes[0].as_terminal().unwrap().environment,
             EnvironmentKind::LocalPty
         );
+    }
+
+    /// A schema-5 file (Milestone 5) with a placeholder FileTree (only
+    /// `root_label`) and an internal note loads directly: the FileTree gets
+    /// real default view state, the note stays internal, and nothing else
+    /// about either node is lost. Saving it again stamps schema 6.
+    #[test]
+    fn v5_shape_loads_with_milestone_6_defaults_and_saves_as_v6() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        write(
+            &path,
+            r##"{
+                "schema_version": 5,
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000000",
+                    "name": "web",
+                    "root_dir": "/home/fernando/web",
+                    "nodes": [
+                        {
+                            "id": "00000000-0000-0000-0000-000000000001",
+                            "position": [10.0, 20.0],
+                            "size": [220.0, 160.0],
+                            "kind": {"kind": "FileTree", "root_label": "web"}
+                        },
+                        {
+                            "id": "00000000-0000-0000-0000-000000000002",
+                            "position": [0.0, 0.0],
+                            "size": [220.0, 160.0],
+                            "kind": {
+                                "kind": "Note",
+                                "markdown": "# Plan",
+                                "color": "yellow",
+                                "view_mode": "Edit"
+                            }
+                        }
+                    ],
+                    "edges": [],
+                    "canvas": {"zoom": 1.0, "pan": [0.0, 0.0]}
+                }],
+                "active_workspace": "00000000-0000-0000-0000-000000000000"
+            }"##,
+        );
+        let (store, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
+        assert!(warning.is_none());
+        let nodes = &store.workspaces[0].nodes;
+        let NodeKind::FileTree(tree) = &nodes[0].kind else {
+            panic!("expected a FileTree");
+        };
+        assert_eq!(tree.root_label, "web");
+        assert_eq!(tree.root, "");
+        assert!(tree.respect_gitignore && tree.show_git_status && !tree.show_hidden);
+        assert_eq!(nodes[0].position, (10.0, 20.0));
+        let note = nodes[1].as_note().unwrap();
+        assert_eq!(note.markdown, "# Plan");
+        assert_eq!(note.file, None);
+
+        let resaved = Store::new(store.workspaces.clone(), store.active_workspace, Vec::new());
+        resaved.save(&path).unwrap();
+        let (reloaded, warning) = load(&path, &std::fs::read_to_string(&path).unwrap());
+        assert!(warning.is_none());
+        assert_eq!(reloaded.schema_version, 6);
+        assert_eq!(reloaded.workspaces[0].nodes, store.workspaces[0].nodes);
     }
 
     /// A schema-3 file saved by the pre-Milestone-1 binary has no

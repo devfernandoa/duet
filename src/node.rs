@@ -47,7 +47,7 @@ fn grid_size(width: f64, height: f64, char_width: i64, char_height: i64) -> Opti
 /// `GestureDrag` onto it (in `app.rs`, which owns canvas/position knowledge)
 /// and apply `nwse-resize` cursor affordance here, since that's purely
 /// cosmetic widget setup.
-fn resize_handle() -> gtk4::Box {
+pub(crate) fn resize_handle() -> gtk4::Box {
     let handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     // 16px rather than 14: this is the only way to resize a card, and at the
     // minimum card size it is the only chrome on the body at all, so it needs
@@ -124,7 +124,7 @@ impl CollapseHandle {
 /// bearing on the node's record, its runtime, or the store caller side —
 /// `app.rs` separately persists `NodeRecord::collapsed` so the state survives
 /// a restart; `on_toggle` is how a direct button click reports that back.
-fn wire_minimize(
+pub(crate) fn wire_minimize(
     button: &gtk4::Button,
     body: &gtk4::Overlay,
     initially_collapsed: bool,
@@ -432,6 +432,7 @@ impl SessionNode {
 /// skipping; toggling visibility on two permanently-parented children avoids
 /// that entirely. Plain Markdown source editing (Edit mode) is always
 /// available, satisfying that same requirement.
+#[derive(Clone)]
 pub struct NoteNode {
     pub container: gtk4::Box,
     pub edit_view: gtk4::TextView,
@@ -447,6 +448,23 @@ pub struct NoteNode {
     preview_scroller: gtk4::ScrolledWindow,
     pub mode_button: gtk4::Button,
     pub link_button: gtk4::Button,
+    /// Opens the "link this note to a project file" popover (wired in
+    /// `app::files`, which owns what linking means).
+    pub file_button: gtk4::Button,
+    /// `file_button`'s popover, parented once and reused (unparenting a
+    /// closed popover crashes GTK 4.14 — see `node_files::FileTreeNode`).
+    pub file_popover: gtk4::Popover,
+    /// The backing file's path, shown only for a file-backed note.
+    file_label: gtk4::Label,
+    /// A one-word sync state ("synced", "conflict", ...) for a file-backed
+    /// note.
+    sync_label: gtk4::Label,
+    /// Shown when the backing file and this note disagree in a way that
+    /// needs the user to choose (see `project::sync::reconcile`).
+    banner: gtk4::Box,
+    banner_label: gtk4::Label,
+    pub banner_primary: gtk4::Button,
+    pub banner_secondary: gtk4::Button,
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
@@ -490,11 +508,28 @@ impl NoteNode {
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
         close_button.set_tooltip_text(Some("Delete note"));
+        let file_button = gtk4::Button::from_icon_name("document-save-as-symbolic");
+        file_button.add_css_class("flat");
+        file_button.set_tooltip_text(Some("Link this note to a project file"));
+        let file_popover = gtk4::Popover::new();
+        file_popover.set_parent(&file_button);
+        let file_label = gtk4::Label::new(None);
+        file_label.add_css_class("note-file-label");
+        file_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        file_label.set_width_chars(8);
+        file_label.set_max_width_chars(18);
+        file_label.set_visible(false);
+        let sync_label = gtk4::Label::new(None);
+        sync_label.add_css_class("note-file-label");
+        sync_label.set_visible(false);
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("note-title-bar");
+        title_bar.append(&file_label);
         title_bar.append(&drag_handle);
+        title_bar.append(&sync_label);
         title_bar.append(&mode_button);
+        title_bar.append(&file_button);
         title_bar.append(&link_button);
         title_bar.append(&minimize_button);
         title_bar.append(&close_button);
@@ -561,9 +596,25 @@ impl NoteNode {
         paned.set_shrink_end_child(false);
         paned.set_size_request(220, 160);
 
+        let banner_label = gtk4::Label::new(None);
+        banner_label.set_wrap(true);
+        banner_label.set_xalign(0.0);
+        banner_label.set_hexpand(true);
+        let banner_primary = gtk4::Button::new();
+        let banner_secondary = gtk4::Button::new();
+        let banner = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        banner.add_css_class("file-banner");
+        banner.append(&banner_label);
+        banner.append(&banner_secondary);
+        banner.append(&banner_primary);
+        banner.set_visible(false);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content.append(&banner);
+        content.append(&paned);
+
         let resize_handle = resize_handle();
         let body = gtk4::Overlay::new();
-        body.set_child(Some(&paned));
+        body.set_child(Some(&content));
         body.add_overlay(&resize_handle);
 
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -582,6 +633,14 @@ impl NoteNode {
             preview_scroller,
             mode_button,
             link_button,
+            file_button,
+            file_popover,
+            file_label,
+            sync_label,
+            banner,
+            banner_label,
+            banner_primary,
+            banner_secondary,
             drag_handle,
             close_button,
             resize_handle,
@@ -589,6 +648,48 @@ impl NoteNode {
         };
         node.set_view_mode(initial_mode);
         node
+    }
+
+    /// Shows (or, with `None`, hides) the backing file's path in the title
+    /// bar.
+    pub fn set_file_backing(&self, path: Option<&str>) {
+        match path {
+            Some(path) => {
+                self.file_label.set_text(path);
+                self.file_label
+                    .set_tooltip_text(Some(&format!("Synced with project file {path}")));
+                self.file_label.set_visible(true);
+                self.sync_label.set_visible(true);
+                self.file_button
+                    .set_tooltip_text(Some("Linked to a project file"));
+            }
+            None => {
+                self.file_label.set_visible(false);
+                self.sync_label.set_visible(false);
+                self.file_button
+                    .set_tooltip_text(Some("Link this note to a project file"));
+                self.hide_banner();
+            }
+        }
+    }
+
+    pub fn set_sync_status(&self, status: &str) {
+        self.sync_label.set_text(status);
+    }
+
+    pub fn show_banner(&self, message: &str, primary: &str, secondary: &str) {
+        self.banner_label.set_text(message);
+        self.banner_primary.set_label(primary);
+        self.banner_secondary.set_label(secondary);
+        self.banner.set_visible(true);
+    }
+
+    pub fn hide_banner(&self) {
+        self.banner.set_visible(false);
+    }
+
+    pub fn banner_visible(&self) -> bool {
+        self.banner.is_visible()
     }
 
     /// Calls `f` on a plain click anywhere in either text pane (Edit or

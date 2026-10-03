@@ -90,6 +90,9 @@ fn build_ui(application: &adw::Application) {
     header.pack_start(&new_session_button);
     let new_note_button = gtk4::Button::from_icon_name("text-editor-symbolic");
     header.pack_start(&new_note_button);
+    let new_file_tree_button = gtk4::Button::from_icon_name("folder-symbolic");
+    new_file_tree_button.set_tooltip_text(Some("New file tree of the project"));
+    header.pack_start(&new_file_tree_button);
     let accounts_button = gtk4::Button::from_icon_name("system-users-symbolic");
     header.pack_start(&accounts_button);
     let roles_button = gtk4::Button::from_icon_name("preferences-system-symbolic");
@@ -199,6 +202,20 @@ fn build_ui(application: &adw::Application) {
     if let Err(error) = control::spawn_server(control_tx) {
         errors.push(format!("agent messaging is unavailable: {error}"));
     }
+    // Milestone 6: file-backed notes and editors follow their project files
+    // (and FileTrees their directories/Git status) by polling through
+    // `ProjectFilesystem` — cheap metadata checks, hashing only on change —
+    // rather than an inotify watcher, so the same loop works unchanged once a
+    // project lives behind SSH/Docker.
+    glib::timeout_add_local(Duration::from_millis(1000), {
+        let app = app.clone();
+        move || {
+            App::sync_project_files(&app);
+            glib::ControlFlow::Continue
+        }
+    });
+    app::install_canvas_drop(&app, &toast_overlay);
+
     glib::timeout_add_local(Duration::from_millis(150), {
         let app = app.clone();
         move || {
@@ -258,6 +275,17 @@ fn build_ui(application: &adw::Application) {
                 canvas::screen_to_world(screen_center, state.pan, state.zoom)
             };
             App::create_note(&app, position);
+        }
+    });
+
+    new_file_tree_button.connect_clicked({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            if let Err(error) = App::create_file_tree(&app, viewport_center_world(&app, &window)) {
+                toast_overlay.add_toast(adw::Toast::new(&error));
+            }
         }
     });
 
@@ -406,7 +434,7 @@ fn wire_canvas_edit_actions(
     toast_overlay: &adw::ToastOverlay,
     edit_menu_button: &gtk4::MenuButton,
 ) {
-    // `new-text-node` and the four placeholder-kind creators, which need a
+    // `new-text-node`, `new-file-tree` and the three placeholder-kind creators, which need a
     // spawn position, and `toggle-snap-to-grid`, which needs a toast
     // describing its new state, are registered separately below instead of
     // forced into this shape.
@@ -644,7 +672,24 @@ fn wire_canvas_edit_actions(
         Some("app.new-text-node"),
     ));
 
-    for kind_label in ["File Tree", "Portal", "Drawing", "Group"] {
+    let file_tree_action = gtk4::gio::SimpleAction::new("new-file-tree", None);
+    file_tree_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, _| {
+            if let Err(error) = App::create_file_tree(&app, viewport_center_world(&app, &window)) {
+                toast_overlay.add_toast(adw::Toast::new(&error));
+            }
+        }
+    });
+    application.add_action(&file_tree_action);
+    create_section.append_item(&gtk4::gio::MenuItem::new(
+        Some("New File Tree"),
+        Some("app.new-file-tree"),
+    ));
+
+    for kind_label in ["Portal", "Drawing", "Group"] {
         let action_name = format!(
             "new-placeholder-{}",
             kind_label.to_lowercase().replace(' ', "-")

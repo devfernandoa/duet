@@ -23,6 +23,12 @@ use crate::message::{
     WhoamiInfo, WorkspaceInfo,
 };
 use crate::orchestration::resource::{ResolveOutcome, ResolvedResource, ResourceDetail};
+use crate::project::fs::DirEntry;
+use crate::project::git::{DiffScope, GitLogEntry, GitStatus};
+use crate::project::path::LineRange;
+use crate::project::search::{ContentSearchResult, NameMatch};
+use crate::project::service::{FileContent, FileInfo};
+use crate::project::sync::FileRevision;
 use crate::store::default_control_socket_path;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -153,6 +159,90 @@ pub enum ControlRequest {
     ResourceInspect {
         id: Uuid,
     },
+    /// `duetctl notes attach <id> <path>`: makes a note file-backed (see
+    /// `App::attach_note_file`). Fails without `WriteNote`.
+    NotesAttach {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        path: String,
+    },
+    /// `duetctl notes detach <id>`: makes a file-backed note internal again.
+    NotesDetach {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    },
+    /// `duetctl file inspect <path|@file:ref>` — Milestone 6's project
+    /// filesystem; see `app::files`. `reference` is anything
+    /// `App::parse_file_argument` accepts.
+    FileInspect {
+        reference: String,
+    },
+    /// `duetctl file read <path|@file:ref> [--lines A-B]`.
+    FileRead {
+        reference: String,
+        #[serde(default)]
+        lines: Option<LineRange>,
+    },
+    /// `duetctl file list [dir] [--hidden]`.
+    FileList {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        hidden: bool,
+    },
+    /// `duetctl file search <query>` (fuzzy filenames) or
+    /// `duetctl file search --content <pattern>`.
+    FileSearch {
+        query: String,
+        #[serde(default)]
+        content: bool,
+        #[serde(default)]
+        fixed: bool,
+        #[serde(default)]
+        hidden: bool,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// `duetctl file write <path> (--revision <rev> | --create)`, content
+    /// on stdin — a conflict-checked write (see `App::write_file`).
+    FileWrite {
+        reference: String,
+        content: String,
+        #[serde(default)]
+        revision: Option<FileRevision>,
+        #[serde(default)]
+        create: bool,
+    },
+    GitStatus,
+    GitDiff {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        scope: DiffScope,
+    },
+    GitLog {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    GitStage {
+        paths: Vec<String>,
+    },
+    GitUnstage {
+        paths: Vec<String>,
+    },
+    /// Destructive: refused unless `confirmed` (`--confirm` on the CLI).
+    GitDiscard {
+        paths: Vec<String>,
+        #[serde(default)]
+        confirmed: bool,
+    },
+    GitCommit {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +290,41 @@ pub enum ControlResponse {
     ResourceInspected {
         resource: ResolvedResource,
         detail: ResourceDetail,
+    },
+    NoteAttached {
+        id: Uuid,
+        path: String,
+    },
+    FileInfo {
+        info: FileInfo,
+    },
+    FileContent {
+        file: FileContent,
+    },
+    FileEntries {
+        entries: Vec<DirEntry>,
+    },
+    FileMatches {
+        matches: Vec<NameMatch>,
+    },
+    ContentMatches {
+        search: ContentSearchResult,
+    },
+    FileWritten {
+        path: String,
+        revision: FileRevision,
+    },
+    GitStatus {
+        status: GitStatus,
+    },
+    GitDiff {
+        diff: String,
+    },
+    GitLog {
+        entries: Vec<GitLogEntry>,
+    },
+    GitDone {
+        message: String,
     },
     Error {
         error: String,
@@ -535,6 +660,108 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             Ok((resource, detail)) => ControlResponse::ResourceInspected { resource, detail },
             Err(error) => ControlResponse::Error { error },
         },
+        ControlRequest::NotesAttach {
+            requested_by,
+            id,
+            path,
+        } => match App::attach_note_file(app, requested_by, id, &path) {
+            Ok(path) => ControlResponse::NoteAttached { id, path },
+            Err(error) => ControlResponse::Error { error },
+        },
+        ControlRequest::NotesDetach { requested_by, id } => {
+            match App::detach_note_file(app, requested_by, id) {
+                Ok(()) => ControlResponse::NoteUpdated { id },
+                Err(error) => ControlResponse::Error { error },
+            }
+        }
+        ControlRequest::FileInspect { reference } => {
+            respond(app.borrow().inspect_file(&reference), |info| {
+                ControlResponse::FileInfo { info }
+            })
+        }
+        ControlRequest::FileRead { reference, lines } => {
+            respond(app.borrow().read_file(&reference, lines), |file| {
+                ControlResponse::FileContent { file }
+            })
+        }
+        ControlRequest::FileList { path, hidden } => respond(
+            app.borrow().list_directory(path.as_deref(), hidden),
+            |entries| ControlResponse::FileEntries { entries },
+        ),
+        ControlRequest::FileSearch {
+            query,
+            content,
+            fixed,
+            hidden,
+            limit,
+        } => {
+            if content {
+                respond(
+                    app.borrow()
+                        .search_files(&query, fixed, limit.unwrap_or(200), hidden),
+                    |search| ControlResponse::ContentMatches { search },
+                )
+            } else {
+                respond(
+                    app.borrow().find_files(&query, limit.unwrap_or(30), hidden),
+                    |matches| ControlResponse::FileMatches { matches },
+                )
+            }
+        }
+        ControlRequest::FileWrite {
+            reference,
+            content,
+            revision,
+            create,
+        } => respond(
+            App::write_file(app, &reference, revision, create, &content),
+            |revision| ControlResponse::FileWritten {
+                path: reference.clone(),
+                revision,
+            },
+        ),
+        ControlRequest::GitStatus => respond(app.borrow().git_status(), |status| {
+            ControlResponse::GitStatus { status }
+        }),
+        ControlRequest::GitDiff { path, scope } => {
+            respond(app.borrow().git_diff(path.as_deref(), scope), |diff| {
+                ControlResponse::GitDiff { diff }
+            })
+        }
+        ControlRequest::GitLog { path, limit } => respond(
+            app.borrow().git_log(path.as_deref(), limit.unwrap_or(20)),
+            |entries| ControlResponse::GitLog { entries },
+        ),
+        ControlRequest::GitStage { paths } => {
+            respond(App::git_stage(app, &paths), |()| ControlResponse::GitDone {
+                message: format!("staged {}", paths.join(", ")),
+            })
+        }
+        ControlRequest::GitUnstage { paths } => respond(App::git_unstage(app, &paths), |()| {
+            ControlResponse::GitDone {
+                message: format!("unstaged {}", paths.join(", ")),
+            }
+        }),
+        ControlRequest::GitDiscard { paths, confirmed } => {
+            respond(App::git_discard(app, &paths, confirmed), |()| {
+                ControlResponse::GitDone {
+                    message: format!("discarded changes to {}", paths.join(", ")),
+                }
+            })
+        }
+        ControlRequest::GitCommit { message } => respond(App::git_commit(app, &message), |hash| {
+            ControlResponse::GitDone {
+                message: format!("committed {hash}"),
+            }
+        }),
+    }
+}
+
+/// `Ok(value)` → `ok(value)`, `Err(error)` → `ControlResponse::Error`.
+fn respond<T>(result: Result<T, String>, ok: impl FnOnce(T) -> ControlResponse) -> ControlResponse {
+    match result {
+        Ok(value) => ok(value),
+        Err(error) => ControlResponse::Error { error },
     }
 }
 
@@ -553,6 +780,8 @@ pub fn is_cli_verb(verb: &str) -> bool {
             | "notes"
             | "resolve"
             | "resource"
+            | "file"
+            | "git"
     )
 }
 
@@ -645,6 +874,8 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
             requested_by: acting_agent_id(),
         }),
         [cmd, rest @ ..] if cmd == "resource" => parse_resource(rest),
+        [cmd, rest @ ..] if cmd == "file" => parse_file(rest),
+        [cmd, rest @ ..] if cmd == "git" => parse_git(rest),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -665,8 +896,23 @@ const USAGE: &str = r#"usage:
   duetctl notes append <id>             (text to append read from stdin)
   duetctl notes patch <id> --old <text> --new <text>
   duetctl notes connections <id>
-  duetctl resolve @name                 (or @kind:name, e.g. @agent:backend)
+  duetctl notes attach <id> <path>      (sync the note with a project file)
+  duetctl notes detach <id>
+  duetctl resolve @name                 (or @kind:name, e.g. @agent:backend, @file:src/a.rs#L1-9)
   duetctl resource inspect <id>
+  duetctl file inspect <path|@file:path>
+  duetctl file read <path|@file:path[#L1-20]> [--lines 1-20]
+  duetctl file list [dir] [--hidden]
+  duetctl file search <query> [--hidden] [--limit N]            (fuzzy file names)
+  duetctl file search --content <pattern> [--fixed] [--hidden] [--limit N]
+  duetctl file write <path> (--revision <rev> | --create)       (content read from stdin)
+  duetctl git status
+  duetctl git diff [path|@diff:path] [--staged | --unstaged]   (default: all uncommitted)
+  duetctl git log [path] [-n N]
+  duetctl git stage <path>...
+  duetctl git unstage <path>...
+  duetctl git discard <path>... --confirm
+  duetctl git commit -m "<message>"
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -700,7 +946,202 @@ const NOTES_USAGE: &str = r#"usage:
   duetctl notes replace <id>            (new Markdown content read from stdin)
   duetctl notes append <id>             (text to append read from stdin)
   duetctl notes patch <id> --old <text> --new <text>
-  duetctl notes connections <id>"#;
+  duetctl notes connections <id>
+  duetctl notes attach <id> <path>
+  duetctl notes detach <id>"#;
+
+const FILE_USAGE: &str = r#"usage:
+  duetctl file inspect <path|@file:path>
+  duetctl file read <path|@file:path[#L1-20]> [--lines 1-20]
+  duetctl file list [dir] [--hidden]
+  duetctl file search <query> [--hidden] [--limit N]
+  duetctl file search --content <pattern> [--fixed] [--hidden] [--limit N]
+  duetctl file write <path> (--revision <rev> | --create)   (content read from stdin)"#;
+
+const GIT_USAGE: &str = r#"usage:
+  duetctl git status
+  duetctl git diff [path|@diff:path] [--staged | --unstaged]
+  duetctl git log [path] [-n N]
+  duetctl git stage <path>...
+  duetctl git unstage <path>...
+  duetctl git discard <path>... --confirm
+  duetctl git commit -m "<message>""#;
+
+/// `split_flags`' result: positional arguments, then `(flag, value)` pairs.
+type SplitArgs<'a> = (Vec<&'a str>, Vec<(&'a str, Option<&'a str>)>);
+
+/// Splits `args` into positional arguments and `--flag [value]` options;
+/// `with_value` names the flags that take a value.
+fn split_flags<'a>(
+    args: &'a [String],
+    with_value: &[&str],
+    usage: &str,
+) -> anyhow::Result<SplitArgs<'a>> {
+    let mut positional = Vec::new();
+    let mut flags = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.starts_with('-') && arg.len() > 1 {
+            if with_value.contains(&arg) {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("{arg} needs a value\n\n{usage}"))?;
+                flags.push((arg, Some(value.as_str())));
+                i += 2;
+            } else {
+                flags.push((arg, None));
+                i += 1;
+            }
+        } else {
+            positional.push(arg);
+            i += 1;
+        }
+    }
+    Ok((positional, flags))
+}
+
+fn parse_limit(value: Option<&str>) -> anyhow::Result<Option<usize>> {
+    value
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("'{raw}' is not a number"))
+        })
+        .transpose()
+}
+
+fn parse_file(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let Some((cmd, rest)) = args.split_first() else {
+        anyhow::bail!(FILE_USAGE);
+    };
+    let (positional, flags) = split_flags(rest, &["--lines", "--limit", "--revision"], FILE_USAGE)?;
+    let flag = |name: &str| flags.iter().any(|(flag, _)| *flag == name);
+    let value = |name: &str| {
+        flags
+            .iter()
+            .find(|(flag, _)| *flag == name)
+            .and_then(|(_, value)| *value)
+    };
+    for (name, _) in &flags {
+        let known = match cmd.as_str() {
+            "read" => ["--lines"].contains(name),
+            "list" => ["--hidden"].contains(name),
+            "search" => ["--content", "--fixed", "--hidden", "--limit"].contains(name),
+            "write" => ["--revision", "--create"].contains(name),
+            _ => false,
+        };
+        if !known {
+            anyhow::bail!("unknown flag '{name}'\n\n{FILE_USAGE}");
+        }
+    }
+    match (cmd.as_str(), positional.as_slice()) {
+        ("inspect", [reference]) => Ok(ControlRequest::FileInspect {
+            reference: reference.to_string(),
+        }),
+        ("read", [reference]) => Ok(ControlRequest::FileRead {
+            reference: reference.to_string(),
+            lines: value("--lines")
+                .map(LineRange::parse)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!(error))?,
+        }),
+        ("list", []) | ("list", [_]) => Ok(ControlRequest::FileList {
+            path: positional.first().map(|path| path.to_string()),
+            hidden: flag("--hidden"),
+        }),
+        ("search", query) if !query.is_empty() => Ok(ControlRequest::FileSearch {
+            query: query.join(" "),
+            content: flag("--content"),
+            fixed: flag("--fixed"),
+            hidden: flag("--hidden"),
+            limit: parse_limit(value("--limit"))?,
+        }),
+        ("write", [reference]) => {
+            let revision = value("--revision").map(|raw| FileRevision(raw.to_string()));
+            let create = flag("--create");
+            if revision.is_none() && !create {
+                anyhow::bail!(
+                    "file write needs --revision <rev> (from `file read`/`file inspect`) or --create\n\n{FILE_USAGE}"
+                );
+            }
+            Ok(ControlRequest::FileWrite {
+                reference: reference.to_string(),
+                content: read_stdin_to_string()?,
+                revision,
+                create,
+            })
+        }
+        _ => anyhow::bail!(FILE_USAGE),
+    }
+}
+
+fn parse_git(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let Some((cmd, rest)) = args.split_first() else {
+        anyhow::bail!(GIT_USAGE);
+    };
+    let (positional, flags) = split_flags(rest, &["-n", "-m", "--message"], GIT_USAGE)?;
+    let flag = |name: &str| flags.iter().any(|(flag, _)| *flag == name);
+    let value = |name: &str| {
+        flags
+            .iter()
+            .find(|(flag, _)| *flag == name)
+            .and_then(|(_, value)| *value)
+    };
+    for (name, _) in &flags {
+        let known = match cmd.as_str() {
+            "diff" => ["--staged", "--cached", "--unstaged"].contains(name),
+            "log" => ["-n"].contains(name),
+            "discard" | "restore" => ["--confirm"].contains(name),
+            "commit" => ["-m", "--message"].contains(name),
+            _ => false,
+        };
+        if !known {
+            anyhow::bail!("unknown flag '{name}'\n\n{GIT_USAGE}");
+        }
+    }
+    let paths = || {
+        positional
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>()
+    };
+    match (cmd.as_str(), positional.as_slice()) {
+        ("status", []) => Ok(ControlRequest::GitStatus),
+        ("diff", [] | [_]) => Ok(ControlRequest::GitDiff {
+            path: positional.first().map(|path| path.to_string()),
+            scope: if flag("--staged") || flag("--cached") {
+                DiffScope::Staged
+            } else if flag("--unstaged") {
+                DiffScope::Unstaged
+            } else {
+                DiffScope::Head
+            },
+        }),
+        ("log", [] | [_]) => Ok(ControlRequest::GitLog {
+            path: positional.first().map(|path| path.to_string()),
+            limit: parse_limit(value("-n"))?,
+        }),
+        ("stage" | "add", paths_given) if !paths_given.is_empty() => {
+            Ok(ControlRequest::GitStage { paths: paths() })
+        }
+        ("unstage", paths_given) if !paths_given.is_empty() => {
+            Ok(ControlRequest::GitUnstage { paths: paths() })
+        }
+        ("discard" | "restore", paths_given) if !paths_given.is_empty() => {
+            Ok(ControlRequest::GitDiscard {
+                paths: paths(),
+                confirmed: flag("--confirm"),
+            })
+        }
+        ("commit", []) => Ok(ControlRequest::GitCommit {
+            message: value("-m")
+                .or_else(|| value("--message"))
+                .ok_or_else(|| anyhow::anyhow!("git commit needs -m \"<message>\"\n\n{GIT_USAGE}"))?
+                .to_string(),
+        }),
+        _ => anyhow::bail!(GIT_USAGE),
+    }
+}
 
 fn parse_uuid_arg(raw: &str) -> anyhow::Result<Uuid> {
     Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("'{raw}' is not a valid id"))
@@ -727,6 +1168,15 @@ fn parse_notes(args: &[String]) -> anyhow::Result<ControlRequest> {
         }),
         [cmd, id, rest @ ..] if cmd == "patch" => parse_notes_patch(parse_uuid_arg(id)?, rest),
         [cmd, id] if cmd == "connections" => Ok(ControlRequest::NotesConnections {
+            id: parse_uuid_arg(id)?,
+        }),
+        [cmd, id, path] if cmd == "attach" => Ok(ControlRequest::NotesAttach {
+            requested_by: acting_agent_id(),
+            id: parse_uuid_arg(id)?,
+            path: path.clone(),
+        }),
+        [cmd, id] if cmd == "detach" => Ok(ControlRequest::NotesDetach {
+            requested_by: acting_agent_id(),
             id: parse_uuid_arg(id)?,
         }),
         _ => anyhow::bail!(NOTES_USAGE),
@@ -933,8 +1383,97 @@ fn print_response(response: &ControlResponse) {
             println!("id:    {}", note.id);
             println!("title: {}", note.title);
             println!("color: {}", note.color);
+            if let Some(file) = &note.file {
+                println!("file:  {file}");
+            }
             println!("\n{}", note.markdown);
         }
+        ControlResponse::NoteAttached { id, path } => {
+            println!("note {id} is now synced with {path}")
+        }
+        ControlResponse::FileInfo { info } => {
+            println!("path:      {}", info.path);
+            println!("reference: {}", info.reference);
+            println!("kind:      {:?}", info.kind);
+            println!("size:      {} bytes", info.size);
+            if let Some(class) = info.class {
+                println!("class:     {class:?}");
+            }
+            if let Some(lines) = info.line_count {
+                println!("lines:     {lines}");
+            }
+            if let Some(revision) = &info.revision {
+                println!("revision:  {revision}");
+            }
+            if let Some(status) = info.git_status {
+                println!("git:       {status}");
+            }
+        }
+        ControlResponse::FileContent { file } => {
+            // Raw content only, so `duetctl file read x > copy` works; the
+            // revision and line count are on `--json` / `file inspect`.
+            print!("{}", file.content);
+            if !file.content.is_empty() && !file.content.ends_with('\n') {
+                println!();
+            }
+        }
+        ControlResponse::FileEntries { entries } => {
+            for entry in entries {
+                let suffix = if entry.kind == crate::project::fs::EntryKind::Directory {
+                    "/"
+                } else {
+                    ""
+                };
+                println!("{}{suffix}", entry.path);
+            }
+        }
+        ControlResponse::FileMatches { matches } => {
+            if matches.is_empty() {
+                println!("no matching files");
+            }
+            for hit in matches {
+                println!("{}", hit.path);
+            }
+        }
+        ControlResponse::ContentMatches { search } => {
+            if search.matches.is_empty() {
+                println!("no matches");
+            }
+            for hit in &search.matches {
+                println!("{}:{}:{}: {}", hit.path, hit.line, hit.column, hit.text);
+            }
+            if search.truncated {
+                println!("(more matches not shown; narrow the pattern or raise --limit)");
+            }
+        }
+        ControlResponse::FileWritten { path, revision } => {
+            println!("wrote {path} (revision {revision})")
+        }
+        ControlResponse::GitStatus { status } => {
+            println!(
+                "branch: {}",
+                status.branch.as_deref().unwrap_or("(detached)")
+            );
+            if status.entries.is_empty() {
+                println!("clean");
+            }
+            for entry in &status.entries {
+                match &entry.original_path {
+                    Some(original) => println!(
+                        "{}{} {} -> {}",
+                        entry.index, entry.worktree, original, entry.path
+                    ),
+                    None => println!("{}{} {}", entry.index, entry.worktree, entry.path),
+                }
+            }
+        }
+        ControlResponse::GitDiff { diff } => print!("{diff}"),
+        ControlResponse::GitLog { entries } => {
+            for entry in entries {
+                println!("{} {} ({})", entry.short_hash, entry.subject, entry.author);
+            }
+        }
+        ControlResponse::GitDone { message } => println!("{message}"),
         ControlResponse::NoteUpdated { id } => println!("updated note {id}"),
         ControlResponse::Resolved { outcome } => print_resolve_outcome(outcome),
         ControlResponse::ResourceInspected { resource, detail } => {
@@ -961,6 +1500,12 @@ fn print_resolved_resource(resource: &ResolvedResource) {
     println!("kind:      {}", resource.kind.label());
     println!("id:        {}", resource.id);
     println!("name:      {}", resource.name);
+    if resource.path.is_some() {
+        println!("reference: {}", resource.reference());
+    }
+    if let Some(lines) = resource.lines {
+        println!("lines:     {}-{}", lines.start, lines.end);
+    }
     println!(
         "workspace: {} ({})",
         resource.workspace_name, resource.workspace_id
@@ -1373,5 +1918,152 @@ mod tests {
             }
             _ => panic!("expected Resolve"),
         }
+    }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn file_and_git_are_recognized_verbs() {
+        assert!(is_cli_verb("file"));
+        assert!(is_cli_verb("git"));
+    }
+
+    #[test]
+    fn file_commands_parse() {
+        assert!(matches!(
+            parse_cli_request(&args(&["file", "inspect", "@file:src/a.rs"])).unwrap(),
+            ControlRequest::FileInspect { reference } if reference == "@file:src/a.rs"
+        ));
+        let ControlRequest::FileRead { reference, lines } =
+            parse_cli_request(&args(&["file", "read", "src/a.rs", "--lines", "3-9"])).unwrap()
+        else {
+            panic!("expected FileRead");
+        };
+        assert_eq!(reference, "src/a.rs");
+        assert_eq!(lines, Some(LineRange { start: 3, end: 9 }));
+        assert!(matches!(
+            parse_cli_request(&args(&["file", "list", "src", "--hidden"])).unwrap(),
+            ControlRequest::FileList { path: Some(path), hidden: true } if path == "src"
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["file", "list"])).unwrap(),
+            ControlRequest::FileList {
+                path: None,
+                hidden: false
+            }
+        ));
+        let ControlRequest::FileSearch {
+            query,
+            content,
+            limit,
+            ..
+        } = parse_cli_request(&args(&[
+            "file",
+            "search",
+            "--content",
+            "fn login",
+            "--limit",
+            "5",
+        ]))
+        .unwrap()
+        else {
+            panic!("expected FileSearch");
+        };
+        assert_eq!(query, "fn login");
+        assert!(content);
+        assert_eq!(limit, Some(5));
+        assert!(parse_cli_request(&args(&["file", "read", "a", "--bogus"])).is_err());
+        assert!(parse_cli_request(&args(&["file", "read", "a", "--lines", "x"])).is_err());
+        // A write must say what it's based on (or that it's creating).
+        assert!(parse_cli_request(&args(&["file", "write", "a.rs"])).is_err());
+        assert!(parse_cli_request(&args(&["file", "search"])).is_err());
+    }
+
+    #[test]
+    fn git_commands_parse() {
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "status"])).unwrap(),
+            ControlRequest::GitStatus
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "diff"])).unwrap(),
+            ControlRequest::GitDiff {
+                path: None,
+                scope: DiffScope::Head
+            }
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "diff", "@diff:src/a.rs", "--staged"])).unwrap(),
+            ControlRequest::GitDiff {
+                path: Some(_),
+                scope: DiffScope::Staged
+            }
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "log", "-n", "3"])).unwrap(),
+            ControlRequest::GitLog {
+                path: None,
+                limit: Some(3)
+            }
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "stage", "a", "b"])).unwrap(),
+            ControlRequest::GitStage { paths } if paths == vec!["a", "b"]
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "discard", "a"])).unwrap(),
+            ControlRequest::GitDiscard {
+                confirmed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "discard", "a", "--confirm"])).unwrap(),
+            ControlRequest::GitDiscard {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "commit", "-m", "feat: x"])).unwrap(),
+            ControlRequest::GitCommit { message } if message == "feat: x"
+        ));
+        assert!(parse_cli_request(&args(&["git", "commit"])).is_err());
+        assert!(parse_cli_request(&args(&["git", "stage"])).is_err());
+        assert!(parse_cli_request(&args(&["git", "push"])).is_err());
+    }
+
+    #[test]
+    fn notes_attach_and_detach_parse() {
+        let id = Uuid::new_v4();
+        assert!(matches!(
+            parse_cli_request(&args(&["notes", "attach", &id.to_string(), "docs/plan.md"])).unwrap(),
+            ControlRequest::NotesAttach { path, .. } if path == "docs/plan.md"
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["notes", "detach", &id.to_string()])).unwrap(),
+            ControlRequest::NotesDetach { .. }
+        ));
+    }
+
+    #[test]
+    fn file_requests_round_trip_through_json() {
+        let request = ControlRequest::FileWrite {
+            reference: "src/a.rs".to_string(),
+            content: "fn a() {}\n".to_string(),
+            revision: Some(FileRevision("abc".to_string())),
+            create: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let ControlRequest::FileWrite {
+            revision, content, ..
+        } = serde_json::from_str(&json).unwrap()
+        else {
+            panic!("expected FileWrite");
+        };
+        assert_eq!(revision, Some(FileRevision("abc".to_string())));
+        assert_eq!(content, "fn a() {}\n");
     }
 }

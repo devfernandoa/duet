@@ -148,6 +148,7 @@ mod tests {
                 markdown: markdown.to_string(),
                 color: "yellow".to_string(),
                 view_mode: NoteViewMode::Preview,
+                file: None,
             }),
         }
     }

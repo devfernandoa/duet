@@ -280,6 +280,7 @@ mod tests {
             markdown: "# hello".to_string(),
             color: "yellow".to_string(),
             view_mode: NoteViewMode::Edit,
+            file: None,
         });
         let workspace = sample_workspace(vec![sample_terminal_node(), note]);
         let role = Role {

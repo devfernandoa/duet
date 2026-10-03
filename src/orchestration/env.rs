@@ -22,8 +22,9 @@ pub const DISCOVERY_INSTRUCTION: &str = "You are running inside Duet, a multi-ag
 Run `duetctl whoami` to see your own role and who you're connected to, `duetctl agents list` \
 to see every agent, and `duetctl send --to <agent> \"message\"` to message one you're connected \
 to (your id is already in $DUET_AGENT_ID). If an instruction contains an explicit @reference \
-(e.g. @backend, @agent:backend, @note:requirements), resolve it first with `duetctl resolve \
-@reference` rather than guessing its identity.";
+(e.g. @backend, @agent:backend, @note:requirements, @file:src/main.rs#L1-20, @diff:.), resolve \
+it first with `duetctl resolve @reference` rather than guessing its identity; read files with \
+`duetctl file read` and diffs with `duetctl git diff`.";
 
 /// The `DUET_*` variables section 8 asks every launched agent to receive.
 /// `DUET_FLOOR_ID` is `"ground"` until Milestone 9 introduces real floors —

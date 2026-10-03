@@ -128,6 +128,7 @@ mod tests {
                 markdown: String::new(),
                 color: "yellow".to_string(),
                 view_mode: NoteViewMode::Preview,
+                file: None,
             }),
         };
         assert!(agent_identities(&[note], Uuid::new_v4(), &[]).is_empty());

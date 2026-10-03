@@ -108,6 +108,37 @@ You may also recognize an Agent or Note described in plain words (without
 `@`) by inspecting `duetctl agents list` / `duetctl notes list` — but an
 explicit `@reference` is the deterministic signal and always takes priority
 over a guess from plain language.
+
+## Project files (@file:, @diff:)
+
+`@file:<path>` names a file in *your* workspace's project root (Duet scopes it
+for you — never guess which checkout or workspace a path belongs to).
+`@file:src/auth.rs#L10-20` names lines 10-20 of it. `@diff:<path>` names that
+path's uncommitted Git changes (`@diff:.` for the whole project). A
+path-shaped reference without a qualifier, like `@src/auth.rs` or
+`@README.md`, may also mean a file.
+
+1. Resolve the reference first: `duetctl resolve @file:src/auth.rs`. If an
+   unqualified `@name.md` is ambiguous (a note and a file), use the
+   qualified form. Paths outside the project root are refused by design.
+2. Then use the file-specific command:
+   - `duetctl file read <path>` (or the full `@file:...#L10-20` reference;
+     `--lines 10-20` also works) prints the content;
+     `duetctl file inspect <path>` shows size, revision and Git status.
+   - `duetctl file search <query>` finds files by fuzzy name;
+     `duetctl file search --content <pattern>` searches inside files.
+   - `duetctl git diff <path|@diff:path>` shows uncommitted changes
+     (`--staged`/`--unstaged` to narrow), `duetctl git status`, `git log`.
+3. To change a file through Duet, read it first (`file read --json` or
+   `file inspect` gives its `revision`), then
+   `duetctl file write <path> --revision <rev>` with the new content on
+   stdin (`--create` for a new file). A write based on a stale revision is
+   refused — re-read and retry instead of overwriting someone else's change.
+   Your normal editing tools are fine too; Duet notices changes either way.
+4. When delegating or asking for review, pass the reference
+   (`@file:src/auth.rs#L10-20`, `@diff:src/auth.rs`), not pasted content —
+   the receiving agent resolves it itself.
+5. `duetctl notes attach <note-id> <path>` syncs a note with a Markdown file.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)
@@ -144,6 +175,10 @@ mod tests {
         assert!(content.contains("duetctl resolve"));
         assert!(content.contains("duetctl resource inspect"));
         assert!(content.contains("@agent:backend"));
+        assert!(content.contains("@file:src/auth.rs#L10-20"));
+        assert!(content.contains("duetctl file read"));
+        assert!(content.contains("duetctl git diff"));
+        assert!(content.contains("--revision"));
     }
 
     #[test]
