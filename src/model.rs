@@ -6,11 +6,9 @@
 //! data — no GTK, no runtime handles — persisted inside a `WorkspaceRecord`
 //! (`store.rs`) and migrated by `migration.rs`.
 //!
-//! This module intentionally does not implement orchestration permission
-//! behavior for edge capabilities, drawing functionality, or group
-//! containment — those are later milestones. The payload types here exist
-//! so the model is genuinely generic now, not because their owning features
-//! are built. (`FileTree`, `Editor` and file-backed `Note`s became real in
+//! This module holds data only: permission behavior for edge capabilities
+//! lives in `orchestration`, drawing geometry in `drawing.rs`. Groups are
+//! deliberately *not* containers — see `GroupPayload`. (`FileTree`, `Editor` and file-backed `Note`s became real in
 //! Milestone 6 — their payloads hold only persisted *view* state and
 //! project-relative paths; file contents, Git status and live watchers are
 //! runtime state owned by `app`/`project`, never serialized here. `Portal`
@@ -291,17 +289,79 @@ pub enum PortalStorage {
     Ephemeral,
 }
 
-/// Placeholder for a future freehand drawing node. No strokes yet.
+/// A freehand sketch on the canvas (Milestone 7.5): a list of vector
+/// strokes, never a bitmap or a GTK object. Points are *normalized* to the
+/// drawing surface (0..1 on both axes), so resizing the node scales the
+/// sketch with it and can never cut a stroke off or corrupt it — see
+/// `drawing.rs` for the geometry.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct DrawingPayload {}
+pub struct DrawingPayload {
+    #[serde(default)]
+    pub strokes: Vec<Stroke>,
+}
 
-/// Placeholder for a future visual grouping node. Multi-select-and-move
-/// (this milestone's selection system) already covers "move several nodes
-/// together"; this type exists only so `Group` is a representable node kind,
-/// not because grouping/containment semantics are implemented.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// One pen stroke: a polyline through normalized points, drawn `width`
+/// pixels wide (at 100% zoom) in `color` (`#rrggbb`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stroke {
+    pub color: String,
+    pub width: f64,
+    pub points: Vec<(f64, f64)>,
+}
+
+/// A visual canvas section (Milestone 7.5): a titled, tinted region drawn
+/// *behind* every other node. Purely visual — it owns nothing: nodes over
+/// it are not its children, moving or deleting it never moves or deletes
+/// them, and it is not an addressable resource.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupPayload {
+    /// The section's title. A pre-7.5 placeholder group may have it empty;
+    /// the canvas then shows "Group".
+    #[serde(default)]
     pub label: String,
+    /// One of [`GROUP_COLORS`].
+    #[serde(default = "default_group_color")]
+    pub color: String,
+}
+
+/// The preset group tints, by name (styled as `.group-<name>` in
+/// `style.css`). A small, fixed palette keeps sections subtle and legible
+/// over terminals and pages.
+pub const GROUP_COLORS: [&str; 6] = ["blue", "green", "yellow", "orange", "purple", "gray"];
+
+fn default_group_color() -> String {
+    GROUP_COLORS[0].to_string()
+}
+
+impl Default for GroupPayload {
+    fn default() -> Self {
+        GroupPayload {
+            label: "Group".to_string(),
+            color: default_group_color(),
+        }
+    }
+}
+
+impl GroupPayload {
+    /// The title to show: the label, or "Group" when it is blank.
+    pub fn title(&self) -> &str {
+        if self.label.trim().is_empty() {
+            "Group"
+        } else {
+            self.label.as_str()
+        }
+    }
+
+    /// The color to paint with: the stored one if it is a known preset,
+    /// else the default — an unknown name (hand-edited, or from a newer
+    /// version) degrades to blue instead of an unstyled box.
+    pub fn color_name(&self) -> &str {
+        GROUP_COLORS
+            .iter()
+            .find(|name| **name == self.color)
+            .copied()
+            .unwrap_or(GROUP_COLORS[0])
+    }
 }
 
 /// What kind of object a `NodeRecord` is, and that kind's own data. Matching
@@ -336,6 +396,13 @@ impl NodeKind {
             NodeKind::Group(_) => "Group",
             NodeKind::Editor(_) => "Editor",
         }
+    }
+
+    /// Whether this kind lives on the canvas's background layer — always
+    /// painted (and hit-tested) beneath every ordinary node, whatever its
+    /// `z_order`. Only a Group does.
+    pub fn is_background(&self) -> bool {
+        matches!(self, NodeKind::Group(_))
     }
 }
 
@@ -488,6 +555,52 @@ mod tests {
             "Terminal"
         );
         assert_eq!(NodeKind::Group(GroupPayload::default()).label(), "Group");
+    }
+
+    #[test]
+    fn only_groups_live_on_the_background_layer() {
+        assert!(NodeKind::Group(GroupPayload::default()).is_background());
+        assert!(!NodeKind::Drawing(DrawingPayload::default()).is_background());
+        assert!(
+            !NodeKind::Text(TextPayload {
+                content: String::new()
+            })
+            .is_background()
+        );
+    }
+
+    #[test]
+    fn group_title_and_color_persist_and_degrade_gracefully() {
+        let group = NodeKind::Group(GroupPayload {
+            label: "Backend".to_string(),
+            color: "green".to_string(),
+        });
+        let json = serde_json::to_string(&group).unwrap();
+        assert_eq!(serde_json::from_str::<NodeKind>(&json).unwrap(), group);
+        // A pre-7.5 placeholder: only an (empty) label.
+        let old: GroupPayload = serde_json::from_str(r#"{"label": ""}"#).unwrap();
+        assert_eq!(old.title(), "Group");
+        assert_eq!(old.color_name(), "blue");
+        let odd = GroupPayload {
+            label: "x".to_string(),
+            color: "chartreuse".to_string(),
+        };
+        assert_eq!(odd.color_name(), "blue");
+    }
+
+    #[test]
+    fn drawing_strokes_round_trip_and_old_placeholders_load_empty() {
+        let drawing = NodeKind::Drawing(DrawingPayload {
+            strokes: vec![Stroke {
+                color: "#1c71d8".to_string(),
+                width: 3.0,
+                points: vec![(0.1, 0.2), (0.5, 0.5), (0.9, 0.25)],
+            }],
+        });
+        let json = serde_json::to_string(&drawing).unwrap();
+        assert_eq!(serde_json::from_str::<NodeKind>(&json).unwrap(), drawing);
+        let old: NodeKind = serde_json::from_str(r#"{"kind": "Drawing"}"#).unwrap();
+        assert_eq!(old, NodeKind::Drawing(DrawingPayload::default()));
     }
 
     #[test]

@@ -252,6 +252,26 @@ pub enum ControlRequest {
     GitCommit {
         message: String,
     },
+    /// `duetctl git stage --all` / `unstage --all`.
+    GitStageAll,
+    GitUnstageAll,
+    GitBranches,
+    /// Switch to an existing local branch; never forced.
+    GitSwitch {
+        branch: String,
+    },
+    /// Create a branch from `HEAD` and switch to it.
+    GitCreateBranch {
+        branch: String,
+    },
+    /// Remote operations — answered asynchronously (they run on a worker
+    /// thread; see `app::scm`).
+    GitFetch,
+    GitPull,
+    GitPush {
+        #[serde(default)]
+        set_upstream: bool,
+    },
     /// `duetctl portal list` — Milestone 8's browser portals; see
     /// `app::portals`. Every portal request names its portal as `portal`:
     /// an id, `@portal:name`, `@name` or a bare name, resolved app-side by
@@ -348,6 +368,9 @@ impl ControlRequest {
                 | ControlRequest::PortalEvaluate { .. }
                 | ControlRequest::PortalClick { .. }
                 | ControlRequest::PortalType { .. }
+                | ControlRequest::GitFetch
+                | ControlRequest::GitPull
+                | ControlRequest::GitPush { .. }
         )
     }
 
@@ -355,7 +378,13 @@ impl ControlRequest {
     /// may legitimately wait for a page to load (`LOAD_TIMEOUT`), so they
     /// get longer than the snappy default.
     fn reply_timeout(&self) -> Duration {
-        if self.is_async() {
+        if matches!(
+            self,
+            ControlRequest::GitFetch | ControlRequest::GitPull | ControlRequest::GitPush { .. }
+        ) {
+            // A remote may be slow; git itself gives up on a dead one.
+            Duration::from_secs(180)
+        } else if self.is_async() {
             crate::portal_runtime::LOAD_TIMEOUT * 2 + Duration::from_secs(5)
         } else {
             REPLY_TIMEOUT
@@ -443,6 +472,9 @@ pub enum ControlResponse {
     },
     GitDone {
         message: String,
+    },
+    GitBranches {
+        branches: Vec<crate::project::git::GitBranch>,
     },
     Portals {
         portals: Vec<PortalSummary>,
@@ -620,6 +652,38 @@ pub fn dispatch(app: &Rc<RefCell<App>>, event: ControlEvent) {
         };
     }
     match request {
+        ControlRequest::GitFetch | ControlRequest::GitPull | ControlRequest::GitPush { .. } => {
+            let op = match request {
+                ControlRequest::GitFetch => crate::app::scm::RemoteOp::Fetch,
+                ControlRequest::GitPull => crate::app::scm::RemoteOp::Pull,
+                ControlRequest::GitPush { set_upstream } => {
+                    crate::app::scm::RemoteOp::Push { set_upstream }
+                }
+                _ => unreachable!("matched above"),
+            };
+            App::git_remote(
+                app,
+                op,
+                Box::new(move |outcome| {
+                    answer(match outcome {
+                        Ok(outcome) => ControlResponse::GitDone {
+                            message: outcome.message,
+                        },
+                        Err(crate::project::git::GitError::UpstreamRequired(target)) => {
+                            ControlResponse::Error {
+                                error: format!(
+                                    "{} has no upstream yet; run `duetctl git push --set-upstream` to publish it to {}/{}",
+                                    target.branch, target.remote, target.branch
+                                ),
+                            }
+                        }
+                        Err(error) => ControlResponse::Error {
+                            error: error.to_string(),
+                        },
+                    })
+                }),
+            );
+        }
         ControlRequest::PortalNavigate {
             requested_by,
             portal,
@@ -725,7 +789,7 @@ pub fn dispatch(app: &Rc<RefCell<App>>, event: ControlEvent) {
 
 /// Answers one synchronous request against the live `App` — see
 /// `dispatch`, which routes every request here except the asynchronous
-/// portal operations.
+/// portal operations and Git remote operations.
 pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> ControlResponse {
     match request {
         ControlRequest::List => {
@@ -1026,6 +1090,33 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 }
             })
         }
+        ControlRequest::GitStageAll => {
+            respond(App::git_stage_all(app), |()| ControlResponse::GitDone {
+                message: "staged all changes".to_string(),
+            })
+        }
+        ControlRequest::GitUnstageAll => {
+            respond(App::git_unstage_all(app), |()| ControlResponse::GitDone {
+                message: "unstaged everything".to_string(),
+            })
+        }
+        ControlRequest::GitBranches => respond(app.borrow().git_branches(), |branches| {
+            ControlResponse::GitBranches { branches }
+        }),
+        ControlRequest::GitSwitch { branch } => {
+            respond(App::git_switch_branch(app, &branch), |()| {
+                ControlResponse::GitDone {
+                    message: format!("switched to {branch}"),
+                }
+            })
+        }
+        ControlRequest::GitCreateBranch { branch } => {
+            respond(App::git_create_branch(app, &branch), |()| {
+                ControlResponse::GitDone {
+                    message: format!("created and switched to {branch}"),
+                }
+            })
+        }
         ControlRequest::GitCommit { message } => respond(App::git_commit(app, &message), |hash| {
             ControlResponse::GitDone {
                 message: format!("committed {hash}"),
@@ -1055,8 +1146,12 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
         | ControlRequest::PortalScreenshot { .. }
         | ControlRequest::PortalEvaluate { .. }
         | ControlRequest::PortalClick { .. }
-        | ControlRequest::PortalType { .. } => ControlResponse::Error {
-            error: "internal: portal page operations must go through control::dispatch".to_string(),
+        | ControlRequest::PortalType { .. }
+        | ControlRequest::GitFetch
+        | ControlRequest::GitPull
+        | ControlRequest::GitPush { .. } => ControlResponse::Error {
+            error: "internal: asynchronous operations must go through control::dispatch"
+                .to_string(),
         },
     }
 }
@@ -1227,10 +1322,16 @@ const USAGE: &str = r#"usage:
   duetctl git status
   duetctl git diff [path|@diff:path] [--staged | --unstaged]   (default: all uncommitted)
   duetctl git log [path] [-n N]
-  duetctl git stage <path>...
-  duetctl git unstage <path>...
+  duetctl git stage <path>... | --all
+  duetctl git unstage <path>... | --all
   duetctl git discard <path>... --confirm
   duetctl git commit -m "<message>"
+  duetctl git branches
+  duetctl git branch <new-branch>        (create from HEAD and switch to it)
+  duetctl git switch <branch>            (existing local branch; never forced)
+  duetctl git fetch
+  duetctl git pull                       (fast-forward only)
+  duetctl git push [--set-upstream]      (never forced)
   duetctl portal list
   duetctl portal inspect|url|title <portal>      (<portal>: id, @portal:name, @name or name)
   duetctl portal navigate <portal> <url>
@@ -1290,10 +1391,16 @@ const GIT_USAGE: &str = r#"usage:
   duetctl git status
   duetctl git diff [path|@diff:path] [--staged | --unstaged]
   duetctl git log [path] [-n N]
-  duetctl git stage <path>...
-  duetctl git unstage <path>...
+  duetctl git stage <path>... | --all
+  duetctl git unstage <path>... | --all
   duetctl git discard <path>... --confirm
-  duetctl git commit -m "<message>""#;
+  duetctl git commit -m "<message>"
+  duetctl git branches
+  duetctl git branch <new-branch>        (create from HEAD and switch to it)
+  duetctl git switch <branch>            (existing local branch; never forced)
+  duetctl git fetch
+  duetctl git pull                       (fast-forward only)
+  duetctl git push [--set-upstream]      (never forced)"#;
 
 const PORTAL_USAGE: &str = r#"usage:
   duetctl portal list
@@ -1574,6 +1681,8 @@ fn parse_git(args: &[String]) -> anyhow::Result<ControlRequest> {
             "log" => ["-n"].contains(name),
             "discard" | "restore" => ["--confirm"].contains(name),
             "commit" => ["-m", "--message"].contains(name),
+            "stage" | "add" | "unstage" => ["--all"].contains(name),
+            "push" => ["--set-upstream", "-u"].contains(name),
             _ => false,
         };
         if !known {
@@ -1601,6 +1710,20 @@ fn parse_git(args: &[String]) -> anyhow::Result<ControlRequest> {
         ("log", [] | [_]) => Ok(ControlRequest::GitLog {
             path: positional.first().map(|path| path.to_string()),
             limit: parse_limit(value("-n"))?,
+        }),
+        ("stage" | "add", []) if flag("--all") => Ok(ControlRequest::GitStageAll),
+        ("unstage", []) if flag("--all") => Ok(ControlRequest::GitUnstageAll),
+        ("branches" | "branch", []) => Ok(ControlRequest::GitBranches),
+        ("branch", [name]) => Ok(ControlRequest::GitCreateBranch {
+            branch: name.to_string(),
+        }),
+        ("switch" | "checkout", [name]) => Ok(ControlRequest::GitSwitch {
+            branch: name.to_string(),
+        }),
+        ("fetch", []) => Ok(ControlRequest::GitFetch),
+        ("pull", []) => Ok(ControlRequest::GitPull),
+        ("push", []) => Ok(ControlRequest::GitPush {
+            set_upstream: flag("--set-upstream") || flag("-u"),
         }),
         ("stage" | "add", paths_given) if !paths_given.is_empty() => {
             Ok(ControlRequest::GitStage { paths: paths() })
@@ -1958,6 +2081,16 @@ fn print_response(response: &ControlResponse) {
                 "branch: {}",
                 status.branch.as_deref().unwrap_or("(detached)")
             );
+            match &status.upstream {
+                Some(upstream) if status.upstream_gone => {
+                    println!("upstream: {upstream} (gone)")
+                }
+                Some(upstream) => println!(
+                    "upstream: {upstream} (ahead {}, behind {})",
+                    status.ahead, status.behind
+                ),
+                None => println!("upstream: none"),
+            }
             if status.entries.is_empty() {
                 println!("clean");
             }
@@ -1978,6 +2111,15 @@ fn print_response(response: &ControlResponse) {
             }
         }
         ControlResponse::GitDone { message } => println!("{message}"),
+        ControlResponse::GitBranches { branches } => {
+            for branch in branches {
+                let marker = if branch.current { "*" } else { " " };
+                match &branch.upstream {
+                    Some(upstream) => println!("{marker} {} -> {upstream}", branch.name),
+                    None => println!("{marker} {}", branch.name),
+                }
+            }
+        }
         ControlResponse::NoteUpdated { id } => println!("updated note {id}"),
         ControlResponse::Resolved { outcome } => print_resolve_outcome(outcome),
         ControlResponse::ResourceInspected { resource, detail } => {
@@ -2725,6 +2867,54 @@ mod tests {
     }
 
     #[test]
+    fn git_branch_and_remote_commands_parse() {
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "stage", "--all"])).unwrap(),
+            ControlRequest::GitStageAll
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "unstage", "--all"])).unwrap(),
+            ControlRequest::GitUnstageAll
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "branches"])).unwrap(),
+            ControlRequest::GitBranches
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "branch", "feature/x"])).unwrap(),
+            ControlRequest::GitCreateBranch { branch } if branch == "feature/x"
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "switch", "main"])).unwrap(),
+            ControlRequest::GitSwitch { branch } if branch == "main"
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "fetch"])).unwrap(),
+            ControlRequest::GitFetch
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "pull"])).unwrap(),
+            ControlRequest::GitPull
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "push"])).unwrap(),
+            ControlRequest::GitPush {
+                set_upstream: false
+            }
+        ));
+        assert!(matches!(
+            parse_cli_request(&args(&["git", "push", "--set-upstream"])).unwrap(),
+            ControlRequest::GitPush { set_upstream: true }
+        ));
+        // No force push, no stray flags.
+        assert!(parse_cli_request(&args(&["git", "push", "--force"])).is_err());
+        assert!(parse_cli_request(&args(&["git", "pull", "--rebase"])).is_err());
+        let fetch = parse_cli_request(&args(&["git", "fetch"])).unwrap();
+        assert!(fetch.is_async());
+        assert!(fetch.reply_timeout() > REPLY_TIMEOUT);
+    }
+
+    #[test]
     fn git_commands_parse() {
         assert!(matches!(
             parse_cli_request(&args(&["git", "status"])).unwrap(),
@@ -2775,7 +2965,8 @@ mod tests {
         ));
         assert!(parse_cli_request(&args(&["git", "commit"])).is_err());
         assert!(parse_cli_request(&args(&["git", "stage"])).is_err());
-        assert!(parse_cli_request(&args(&["git", "push"])).is_err());
+        assert!(parse_cli_request(&args(&["git", "rebase"])).is_err());
+        assert!(parse_cli_request(&args(&["git", "branch", "a", "b"])).is_err());
     }
 
     #[test]

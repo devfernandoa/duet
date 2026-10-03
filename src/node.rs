@@ -849,79 +849,90 @@ impl TextNode {
     }
 }
 
-/// A stand-in widget for a node kind whose real behavior doesn't exist yet
-/// (`FileTree`, `Portal`, `Drawing`, `Group` — see `model.rs`'s doc comment).
-/// Shows only a kind label and a short detail string so the node is visible,
-/// selectable, movable and persistable on the canvas without pretending to
-/// implement the feature it stands in for.
-pub struct PlaceholderNode {
+/// A Group (Milestone 7.5): a titled, tinted canvas section that always
+/// sits behind every other card. Only its title strip and resize grip
+/// react to the pointer; a press anywhere else on its body falls through
+/// to the canvas (pan, marquee, right-click menu, deselect), so the cards
+/// placed over it — and the canvas itself — behave exactly as without it.
+/// Purely visual: it knows nothing about the cards visually inside it.
+pub struct GroupNode {
     pub container: gtk4::Box,
+    pub title_label: gtk4::Label,
+    /// Swapped in for `title_label` while renaming (see `set_renaming`).
+    pub title_entry: gtk4::Entry,
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     pub resize_handle: gtk4::Box,
+    /// Groups don't collapse (their minimize button is never shown), but
+    /// every node carries a handle so the generic commands stay uniform.
     pub collapse: CollapseHandle,
+    color: Rc<std::cell::RefCell<String>>,
 }
 
-impl PlaceholderNode {
-    pub fn new(
-        kind_label: &str,
-        detail: &str,
-        collapsed: bool,
-        on_collapse_toggle: impl Fn(bool) + 'static,
-    ) -> PlaceholderNode {
-        let kind_title = gtk4::Label::new(Some(kind_label));
-        kind_title.add_css_class("heading");
+impl GroupNode {
+    pub fn new(title: &str, color: &str) -> GroupNode {
+        let title_label = gtk4::Label::new(Some(title));
+        title_label.add_css_class("group-title");
+        title_label.set_xalign(0.0);
+        title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title_label.set_tooltip_text(Some("Double-click to rename"));
+        let title_entry = gtk4::Entry::new();
+        title_entry.set_visible(false);
+        title_entry.set_max_width_chars(24);
 
-        let (minimize_button, close_button) = title_buttons("Remove node");
+        let (minimize_button, close_button) = title_buttons("Remove group (cards on it stay)");
+        minimize_button.set_visible(false);
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-        title_bar.add_css_class("node-title-bar");
-        title_bar.append(&kind_title);
+        title_bar.add_css_class("group-title-bar");
+        title_bar.append(&title_label);
+        title_bar.append(&title_entry);
         title_bar.append(&spacer());
         title_bar.append(&minimize_button);
         title_bar.append(&close_button);
         as_drag_handle(&title_bar);
         let drag_handle = title_bar.clone();
 
-        let detail_label = gtk4::Label::new(Some(detail));
-        detail_label.add_css_class("dim-label");
-        detail_label.set_wrap(true);
-        let placeholder_icon = gtk4::Image::from_icon_name("content-loading-symbolic");
-        placeholder_icon.set_pixel_size(32);
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        content.set_valign(gtk4::Align::Center);
-        content.set_halign(gtk4::Align::Center);
-        content.set_vexpand(true);
-        content.set_hexpand(true);
-        content.append(&placeholder_icon);
-        content.append(&detail_label);
-        content.set_size_request(220, 160);
-
+        // The body is an empty region: nothing in it claims a press, so
+        // presses bubble to the canvas.
+        let area = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        area.set_hexpand(true);
+        area.set_vexpand(true);
         let resize_handle = resize_handle();
         let body = gtk4::Overlay::new();
-        body.set_child(Some(&content));
+        body.set_child(Some(&area));
         body.add_overlay(&resize_handle);
 
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.append(&title_bar);
         container.append(&body);
-        container.set_css_classes(&["card", "placeholder-node"]);
+        container.add_css_class("group-node");
+        container.add_css_class(&format!("group-{color}"));
 
-        let collapse = wire_minimize(
-            &minimize_button,
-            &body,
-            &container,
-            collapsed,
-            on_collapse_toggle,
-        );
+        let collapse = wire_minimize(&minimize_button, &body, &container, false, |_| {});
 
-        PlaceholderNode {
+        GroupNode {
             container,
+            title_label,
+            title_entry,
             drag_handle,
             close_button,
             resize_handle,
             collapse,
+            color: Rc::new(std::cell::RefCell::new(color.to_string())),
         }
+    }
+
+    pub fn set_title(&self, title: &str) {
+        self.title_label.set_text(title);
+    }
+
+    /// Swaps the `group-<color>` style class.
+    pub fn set_color(&self, color: &str) {
+        let previous = self.color.replace(color.to_string());
+        self.container
+            .remove_css_class(&format!("group-{previous}"));
+        self.container.add_css_class(&format!("group-{color}"));
     }
 }
 

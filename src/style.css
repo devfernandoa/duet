@@ -35,7 +35,10 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 .note-blue textview, .note-blue textview text { background-color: #cfe8ff; }
 .note-green textview, .note-green textview text { background-color: #d7f5d0; }
 
-.node-title-bar { padding: 2px 4px; }
+/* Every card's title bar is the same height, so cards line up and the
+   link anchor (`canvas::TITLE_BAR_HEIGHT`) sits where it should. */
+.node-title-bar, .note-title-bar { padding: 2px 4px; min-height: 24px; }
+.node-title-bar > image { margin-left: 2px; }
 
 /* Adwaita's default button metrics (34x34) made a card's title bar alone
    ~320px wide and 34px tall, which is a lot of chrome on a small card and
@@ -72,9 +75,9 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 
 /* Tinted to a slightly darker shade of the note's own color rather than a
    flat dark overlay, so the title bar reads as part of the same card. */
-.note-yellow .note-title-bar { background-color: #f2e48f; min-height: 20px; }
-.note-blue .note-title-bar { background-color: #b9dcf2; min-height: 20px; }
-.note-green .note-title-bar { background-color: #c4ecba; min-height: 20px; }
+.note-yellow .note-title-bar { background-color: #f2e48f; }
+.note-blue .note-title-bar { background-color: #b9dcf2; }
+.note-green .note-title-bar { background-color: #c4ecba; }
 
 /* The close "x" is a symbolic icon, recolored from the `color` of the
    GtkImage inside the button. A button does not inherit `color` from the
@@ -155,3 +158,54 @@ textview.note-text { color: #1f1f1f; caret-color: #1f1f1f; }
 .file-banner button { min-height: 22px; padding: 0 6px; }
 .editor-search-bar { padding: 2px 4px; }
 .note-file-label { font-size: 0.8em; color: #3d3d3d; }
+
+/* Milestone 7.5 ------------------------------------------------------- */
+
+/* A card-menu entry that destroys something (`! ` prefix in `MenuItem`). */
+.card-menu button.destructive-item label { color: @destructive_color; }
+
+/* Group sections: a low-opacity tint with a subtle border, painted behind
+   every card (see `canvas::Canvas::add_background_node`). Kept faint so
+   terminals, notes and pages over them stay easy to read. */
+.group-node {
+    border-radius: 14px;
+    border-width: 2px;
+    border-style: solid;
+}
+.group-title-bar {
+    padding: 4px 6px 4px 12px;
+    min-height: 26px;
+    border-radius: 12px 12px 0 0;
+}
+.group-title { font-weight: 800; font-size: 1.15em; }
+.group-title-bar > button { min-width: 22px; min-height: 22px; padding: 0 2px; }
+.group-node.selected {
+    border-color: #3584e4;
+    box-shadow: 0 0 0 4px rgba(53, 132, 228, 0.25);
+}
+.group-blue { border-color: alpha(#3584e4, 0.55); background-color: alpha(#3584e4, 0.08); }
+.group-blue .group-title-bar { background-color: alpha(#3584e4, 0.22); }
+.group-green { border-color: alpha(#2ec27e, 0.55); background-color: alpha(#2ec27e, 0.08); }
+.group-green .group-title-bar { background-color: alpha(#2ec27e, 0.22); }
+.group-yellow { border-color: alpha(#e5a50a, 0.60); background-color: alpha(#f6d32d, 0.10); }
+.group-yellow .group-title-bar { background-color: alpha(#f6d32d, 0.28); }
+.group-orange { border-color: alpha(#ff7800, 0.55); background-color: alpha(#ff7800, 0.08); }
+.group-orange .group-title-bar { background-color: alpha(#ff7800, 0.22); }
+.group-purple { border-color: alpha(#9141ac, 0.55); background-color: alpha(#9141ac, 0.08); }
+.group-purple .group-title-bar { background-color: alpha(#9141ac, 0.22); }
+.group-gray { border-color: alpha(#77767b, 0.55); background-color: alpha(#77767b, 0.08); }
+.group-gray .group-title-bar { background-color: alpha(#77767b, 0.22); }
+
+/* Drawing cards: a light "paper" surface in both themes, so ink reads. */
+.drawing-toolbar { padding: 2px 4px; border-bottom: 1px solid alpha(currentColor, 0.12); }
+.drawing-toolbar button { min-width: 24px; min-height: 24px; padding: 0 3px; }
+.drawing-toolbar button.drawing-swatch:checked { box-shadow: inset 0 0 0 2px alpha(currentColor, 0.5); }
+.drawing-surface { background-color: #fbfbf9; }
+.drawing-hint { color: #8a8a8a; }
+
+/* The header's Git control. */
+.git-status-button label { font-feature-settings: "tnum"; }
+
+/* The empty-workspace hint over the canvas. */
+.canvas-empty-hint { opacity: 0.55; }
+.portal-empty-hint { opacity: 0.6; padding: 12px; }

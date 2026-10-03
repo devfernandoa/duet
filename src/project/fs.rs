@@ -358,7 +358,22 @@ impl ProjectCommands for LocalProject {
         stdin: Option<&[u8]>,
     ) -> std::io::Result<CommandOutput> {
         use std::process::{Command, Stdio};
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        if program == "git" {
+            // Never block on a credential prompt: there is no terminal to
+            // answer it, so a fetch/push that needs one fails with git's
+            // own message instead of hanging.
+            command.env("GIT_TERMINAL_PROMPT", "0");
+            // Same for ssh (a passphrase or host-key prompt): fail instead
+            // of hanging; an ssh-agent still works. A user's own
+            // GIT_SSH_COMMAND/GIT_SSH is respected.
+            if std::env::var_os("GIT_SSH_COMMAND").is_none()
+                && std::env::var_os("GIT_SSH").is_none()
+            {
+                command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+            }
+        }
+        let mut child = command
             .args(args)
             .current_dir(&self.root)
             .stdin(if stdin.is_some() {

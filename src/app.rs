@@ -29,6 +29,7 @@
 
 mod files;
 mod portals;
+pub mod scm;
 
 pub use files::install_canvas_drop;
 pub use portals::PortalStep;
@@ -46,7 +47,8 @@ use crate::model::{
     EdgeCapability, EdgeRecord, EnvironmentKind, FloorRef, GroupPayload, NodeKind, NodeRecord,
     NotePayload, NoteViewMode, TerminalPayload, TextPayload,
 };
-use crate::node::{NoteNode, PlaceholderNode, SessionNode, TextNode};
+use crate::node::{GroupNode, NoteNode, SessionNode, TextNode};
+use crate::node_drawing::DrawingNode;
 use crate::node_files::{EditorNode, FileTreeNode};
 use crate::node_portal::PortalNode;
 use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
@@ -104,6 +106,10 @@ const MESSAGE_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 /// before the press becomes a move.
 const DRAG_THRESHOLD: f64 = 4.0;
 
+/// Height of a Group's title strip (its only card-like surface), in world
+/// units — see `style.css`'s `.group-title-bar`.
+const GROUP_TITLE_HEIGHT: f64 = 36.0;
+
 /// Offset applied to a duplicated or pasted node so it doesn't land exactly
 /// on top of its source.
 const DUPLICATE_OFFSET: (f64, f64) = (32.0, 32.0);
@@ -119,9 +125,9 @@ pub enum NodeWidget {
     FileTree(FileTreeNode),
     Editor(EditorNode),
     Portal(PortalNode),
-    /// `Drawing`/`Group` both render as the same placeholder today — see
-    /// `model.rs`'s doc comment for why.
-    Placeholder(PlaceholderNode),
+    Drawing(DrawingNode),
+    /// A background canvas section (see `node::GroupNode`).
+    Group(GroupNode),
 }
 
 impl NodeWidget {
@@ -133,7 +139,8 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => &node.container,
             NodeWidget::Editor(node) => &node.container,
             NodeWidget::Portal(node) => &node.container,
-            NodeWidget::Placeholder(node) => &node.container,
+            NodeWidget::Drawing(node) => &node.container,
+            NodeWidget::Group(node) => &node.container,
         }
     }
 
@@ -145,7 +152,8 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => &node.drag_handle,
             NodeWidget::Editor(node) => &node.drag_handle,
             NodeWidget::Portal(node) => &node.drag_handle,
-            NodeWidget::Placeholder(node) => &node.drag_handle,
+            NodeWidget::Drawing(node) => &node.drag_handle,
+            NodeWidget::Group(node) => &node.drag_handle,
         }
     }
 
@@ -157,7 +165,8 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => &node.resize_handle,
             NodeWidget::Editor(node) => &node.resize_handle,
             NodeWidget::Portal(node) => &node.resize_handle,
-            NodeWidget::Placeholder(node) => &node.resize_handle,
+            NodeWidget::Drawing(node) => &node.resize_handle,
+            NodeWidget::Group(node) => &node.resize_handle,
         }
     }
 
@@ -169,7 +178,8 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => &node.close_button,
             NodeWidget::Editor(node) => &node.close_button,
             NodeWidget::Portal(node) => &node.close_button,
-            NodeWidget::Placeholder(node) => &node.close_button,
+            NodeWidget::Drawing(node) => &node.close_button,
+            NodeWidget::Group(node) => &node.close_button,
         }
     }
 
@@ -184,7 +194,8 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => node.container.clone().upcast(),
             NodeWidget::Editor(node) => node.container.clone().upcast(),
             NodeWidget::Portal(node) => node.container.clone().upcast(),
-            NodeWidget::Placeholder(node) => node.container.clone().upcast(),
+            NodeWidget::Drawing(node) => node.container.clone().upcast(),
+            NodeWidget::Group(node) => node.container.clone().upcast(),
         }
     }
 
@@ -208,7 +219,8 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => node.collapse.set_card_size(width, height),
             NodeWidget::Editor(node) => node.collapse.set_card_size(width, height),
             NodeWidget::Portal(node) => node.collapse.set_card_size(width, height),
-            NodeWidget::Placeholder(node) => node.collapse.set_card_size(width, height),
+            NodeWidget::Drawing(node) => node.collapse.set_card_size(width, height),
+            NodeWidget::Group(node) => node.collapse.set_card_size(width, height),
         }
     }
 
@@ -227,7 +239,25 @@ impl NodeWidget {
             NodeWidget::FileTree(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Editor(node) => node.collapse.set_collapsed(collapsed),
             NodeWidget::Portal(node) => node.collapse.set_collapsed(collapsed),
-            NodeWidget::Placeholder(node) => node.collapse.set_collapsed(collapsed),
+            NodeWidget::Drawing(node) => node.collapse.set_collapsed(collapsed),
+            // A group never collapses (it has no button for it).
+            NodeWidget::Group(_) => {}
+        }
+    }
+
+    /// Brings the widget in line with a record's payload after an undo or
+    /// redo replaced it (`CanvasCommand::SetProperties`). Only kinds whose
+    /// payload can change through an undoable edit need anything here.
+    fn sync_payload(&self, kind: &NodeKind) {
+        match (self, kind) {
+            (NodeWidget::Group(node), NodeKind::Group(group)) => {
+                node.set_title(group.title());
+                node.set_color(group.color_name());
+            }
+            (NodeWidget::Drawing(node), NodeKind::Drawing(drawing)) => {
+                node.set_strokes(drawing.strokes.clone());
+            }
+            _ => {}
         }
     }
 }
@@ -405,6 +435,13 @@ pub struct App {
     /// A detached overlay until `main.rs` hands over the window's real one
     /// (`set_toast_overlay`), so tests and headless paths can still toast.
     toast_overlay: adw::ToastOverlay,
+    /// The Git remote operation (fetch/pull/push) running on a worker
+    /// thread, if any — see `scm::App::git_remote`. Runtime only.
+    git_busy: Option<scm::RemoteOp>,
+    /// Who to tell when Git state may have changed (`scm`). Runtime only.
+    git_listeners: Vec<Rc<dyn Fn()>>,
+    /// The last save failure already shown to the user (see `persist`).
+    last_save_error: RefCell<Option<String>>,
 }
 
 impl App {
@@ -447,6 +484,9 @@ impl App {
             dev_urls: HashMap::new(),
             pending_dev_urls: Vec::new(),
             toast_overlay: adw::ToastOverlay::new(),
+            git_busy: None,
+            git_listeners: Vec::new(),
+            last_save_error: RefCell::new(None),
         }))
     }
 
@@ -457,6 +497,11 @@ impl App {
     /// The window's toast overlay (see `set_toast_overlay`).
     pub fn toaster(app: &Rc<RefCell<App>>) -> adw::ToastOverlay {
         app.borrow().toast_overlay.clone()
+    }
+
+    /// Shows the canvas's "this workspace is empty" hint exactly when it is.
+    pub fn refresh_empty_hint(&self) {
+        self.canvas.set_empty_hint_visible(self.nodes.is_empty());
     }
 
     /// Shows `message` as a toast.
@@ -513,6 +558,10 @@ impl App {
         errors
     }
 
+    /// Writes every workspace to disk. A failure is also shown to the user
+    /// (once per distinct error, so a full disk doesn't toast on every
+    /// keystroke) — workspaces are high-value data, and most callers can do
+    /// nothing better with the error than make sure someone sees it.
     pub fn persist(&self) -> std::io::Result<()> {
         let mut workspaces = self.inactive_workspaces.clone();
         workspaces.push(self.snapshot_active_workspace());
@@ -521,7 +570,24 @@ impl App {
             Some(self.workspace_id),
             self.custom_roles.clone(),
         );
-        store.save(&self.store_path)
+        let result = store.save(&self.store_path);
+        match &result {
+            Ok(()) => {
+                self.last_save_error.replace(None);
+            }
+            Err(error) => {
+                let message = format!(
+                    "Couldn't save your workspaces to {}: {error}",
+                    self.store_path.display()
+                );
+                if self.last_save_error.borrow().as_deref() != Some(message.as_str()) {
+                    eprintln!("duet: {message}");
+                    self.toast_overlay.add_toast(adw::Toast::new(&message));
+                    self.last_save_error.replace(Some(message));
+                }
+            }
+        }
+        result
     }
 
     /// Every role available to assign to a session: built-ins first, then
@@ -789,9 +855,14 @@ impl App {
         // Bumped to now, not copied from `record.last_opened` — this call is
         // itself the moment the workspace is being opened.
         app_mut.workspace_last_opened = now_epoch_secs();
-        let mut state = app_mut.canvas.state.borrow_mut();
-        state.zoom = record.canvas.zoom;
-        state.pan = record.canvas.pan;
+        {
+            let mut state = app_mut.canvas.state.borrow_mut();
+            state.zoom = record.canvas.zoom;
+            state.pan = record.canvas.pan;
+        }
+        drop(app_mut);
+        // A different workspace may be a different repository.
+        App::git_state_changed(app);
     }
 
     /// Makes `target_id` the active workspace. A no-op if already active.
@@ -1874,21 +1945,25 @@ impl App {
         let _ = app.borrow().persist();
     }
 
-    /// Spawns a placeholder node of the given kind (`FileTree`/`Portal`/
-    /// `Drawing`/`Group`) at `position`. `kind` builds its own default,
-    /// empty payload — see `model.rs`'s placeholder payload types.
-    pub fn create_placeholder_node(app: &Rc<RefCell<App>>, kind: NodeKind, position: (f64, f64)) {
+    /// Adds a node of `kind` at `position` as one undo step and persists.
+    fn add_simple_node(
+        app: &Rc<RefCell<App>>,
+        kind: NodeKind,
+        position: (f64, f64),
+        size: (f64, f64),
+    ) -> Uuid {
         let record = NodeRecord {
             id: Uuid::new_v4(),
             floor: FloorRef::Ground,
             position,
-            size: (220.0, 160.0),
+            size,
             z_order: next_z_order(&app.borrow()),
             collapsed: false,
             locked: false,
             kind,
         };
-        let _ = materialize_node(app, record.clone(), &adw::ToastOverlay::new());
+        let id = record.id;
+        let _ = materialize_node(app, record.clone(), &App::toaster(app));
         App::push_undo(
             app,
             CanvasCommand::AddNodes {
@@ -1897,6 +1972,135 @@ impl App {
             },
         );
         let _ = app.borrow().persist();
+        id
+    }
+
+    /// A blank Drawing at `position`.
+    pub fn create_drawing(app: &Rc<RefCell<App>>, position: (f64, f64)) -> Uuid {
+        App::add_simple_node(
+            app,
+            NodeKind::Drawing(Default::default()),
+            position,
+            (420.0, 300.0),
+        )
+    }
+
+    /// A Group section with its top-left at `position`. It goes to the
+    /// background layer whatever its `z_order`.
+    pub fn create_group(app: &Rc<RefCell<App>>, position: (f64, f64)) -> Uuid {
+        App::add_simple_node(
+            app,
+            NodeKind::Group(GroupPayload::default()),
+            position,
+            (720.0, 460.0),
+        )
+    }
+
+    /// Edits a Group's title and/or color as one undoable change.
+    pub fn update_group(
+        app: &Rc<RefCell<App>>,
+        id: Uuid,
+        label: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(color) = color
+            && !crate::model::GROUP_COLORS.contains(&color)
+        {
+            return Err(format!("unknown group color '{color}'"));
+        }
+        let (before, after) = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return Err("that group no longer exists".to_string());
+            };
+            let before = entry.record.clone();
+            let NodeKind::Group(group) = &mut entry.record.kind else {
+                return Err("that card is not a group".to_string());
+            };
+            if let Some(label) = label {
+                group.label = label.trim().to_string();
+            }
+            if let Some(color) = color {
+                group.color = color.to_string();
+            }
+            entry.widget.sync_payload(&entry.record.kind);
+            (before, entry.record.clone())
+        };
+        if before != after {
+            App::push_undo(
+                app,
+                CanvasCommand::SetProperties {
+                    before: vec![before],
+                    after: vec![after],
+                },
+            );
+            App::schedule_persist(app);
+        }
+        Ok(())
+    }
+
+    /// Selects a Group together with every card lying wholly inside it —
+    /// a one-off convenience for moving a section and its contents
+    /// together. Nothing is remembered: Groups own nothing.
+    pub fn select_group_with_contents(app: &Rc<RefCell<App>>, id: Uuid) {
+        let ids: HashSet<Uuid> = {
+            let app_ref = app.borrow();
+            let Some(group) = app_ref.nodes.get(&id) else {
+                return;
+            };
+            let bounds = crate::canvas::card_rect((group.record.position, group.record.size));
+            app_ref
+                .nodes
+                .iter()
+                .filter(|(other, entry)| {
+                    **other == id
+                        || (!entry.record.kind.is_background()
+                            && rect_contains(
+                                bounds,
+                                crate::canvas::card_rect((
+                                    entry.record.position,
+                                    entry.record.size,
+                                )),
+                            ))
+                })
+                .map(|(other, _)| *other)
+                .collect()
+        };
+        App::set_selection(app, ids);
+    }
+
+    /// Clears a Drawing as one undoable change.
+    pub fn clear_drawing(app: &Rc<RefCell<App>>, id: Uuid) {
+        let (before, after, node) = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return;
+            };
+            let before = entry.record.clone();
+            let NodeKind::Drawing(drawing) = &mut entry.record.kind else {
+                return;
+            };
+            if drawing.strokes.is_empty() {
+                return;
+            }
+            drawing.strokes.clear();
+            let node = match &entry.widget {
+                NodeWidget::Drawing(node) => Some(node.clone()),
+                _ => None,
+            };
+            (before, entry.record.clone(), node)
+        };
+        if let Some(node) = node {
+            node.set_strokes(Vec::new());
+        }
+        App::push_undo(
+            app,
+            CanvasCommand::SetProperties {
+                before: vec![before],
+                after: vec![after],
+            },
+        );
+        App::schedule_persist(app);
     }
 
     /// Records a logical connection between `source` and `target`. A no-op
@@ -1923,6 +2127,15 @@ impl App {
     /// the connect gesture actually do what it visually promises.
     pub fn create_edge(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
         let mut app = app.borrow_mut();
+        // Groups are visual sections: never an endpoint of a connection.
+        let is_group = |id: &Uuid| {
+            app.nodes
+                .get(id)
+                .is_some_and(|e| e.record.kind.is_background())
+        };
+        if is_group(&source) || is_group(&target) {
+            return false;
+        }
         if source != target
             && app.nodes.contains_key(&source)
             && app.nodes.contains_key(&target)
@@ -2043,12 +2256,20 @@ impl App {
     /// click, a drag-to-move, or a click into a note's text view, none of
     /// which should discard whatever was selected).
     pub fn covers_point(&self, world: (f64, f64)) -> bool {
+        // A Group's body is canvas, not a card: clicks there act on the
+        // canvas (deselect, link hit-test, right-click create menu). Its
+        // title strip is the group's own surface, like a card's.
         self.nodes.values().any(|entry| {
             let (position, size) = (entry.record.position, entry.record.size);
+            let bottom = if entry.record.kind.is_background() {
+                position.1 + GROUP_TITLE_HEIGHT
+            } else {
+                position.1 + size.1 + TITLE_BAR_HEIGHT
+            };
             world.0 >= position.0
                 && world.0 <= position.0 + size.0
                 && world.1 >= position.1
-                && world.1 <= position.1 + size.1 + TITLE_BAR_HEIGHT
+                && world.1 <= bottom
         })
     }
 
@@ -2195,6 +2416,16 @@ impl App {
     pub fn complete_link_if_pending(app: &Rc<RefCell<App>>, target: Uuid) -> Option<String> {
         let source = app.borrow_mut().pending_edge_source.take()?;
         App::dismiss_link_hint(app);
+        let involves_group = [source, target].iter().any(|id| {
+            app.borrow()
+                .nodes
+                .get(id)
+                .is_some_and(|e| e.record.kind.is_background())
+        });
+        if involves_group {
+            app.borrow().refresh_link_highlight();
+            return Some("Groups are visual sections and can't be connected".to_string());
+        }
         let created = App::create_edge(app, source, target);
         let app_ref = app.borrow();
         app_ref.refresh_link_highlight();
@@ -2533,6 +2764,7 @@ impl App {
         if let Some(entry) = removed {
             canvas.remove_node(entry.widget.container());
         }
+        app.borrow().refresh_empty_hint();
         let _ = app.borrow().persist();
     }
 
@@ -2714,6 +2946,14 @@ impl App {
                 let (node_left, node_top) = position;
                 let (node_right, node_bottom) =
                     (position.0 + size.0, position.1 + size.1 + TITLE_BAR_HEIGHT);
+                if entry.record.kind.is_background() {
+                    // A Group is usually *around* what you're marqueeing;
+                    // it joins the selection only when wholly enclosed.
+                    return node_left >= left
+                        && node_right <= right
+                        && node_top >= top
+                        && node_bottom <= bottom;
+                }
                 node_left <= right && node_right >= left && node_top <= bottom && node_bottom >= top
             })
             .map(|(&id, _)| id)
@@ -2737,6 +2977,73 @@ impl App {
         let mut app_mut = app.borrow_mut();
         app_mut.undo_stack.push(command);
         app_mut.redo_stack.clear();
+    }
+
+    /// Deletes `ids` (as one undo step), asking first when any of them is a
+    /// terminal whose process is still running — undo can bring the card
+    /// back, but not the live process or its unsaved shell state. Every
+    /// other deletion is immediate (and undoable).
+    pub fn request_delete(app: &Rc<RefCell<App>>, ids: Vec<Uuid>) {
+        use adw::prelude::MessageDialogExt;
+        if ids.is_empty() {
+            return;
+        }
+        let running: Vec<String> = {
+            let app_ref = app.borrow();
+            ids.iter()
+                .filter_map(|id| {
+                    let terminal = app_ref.nodes.get(id)?.record.as_terminal()?;
+                    app_ref.runtime.is_alive(*id).then(|| terminal.name.clone())
+                })
+                .collect()
+        };
+        let delete = {
+            let app = Rc::clone(app);
+            let ids = ids.clone();
+            move || {
+                App::set_selection(&app, ids.iter().copied().collect());
+                App::delete_selected(&app);
+            }
+        };
+        if running.is_empty() {
+            delete();
+            return;
+        }
+        let parent = app
+            .borrow()
+            .canvas
+            .overlay
+            .root()
+            .and_downcast::<gtk4::Window>();
+        let (title, body) = if running.len() == 1 {
+            (
+                format!("Close {}?", running[0]),
+                "Its process will be stopped. Undo brings the card back and restarts it, \
+                 but anything only in the running process is lost."
+                    .to_string(),
+            )
+        } else {
+            (
+                format!("Close {} running terminals?", running.len()),
+                format!(
+                    "{} will be stopped. Undo brings the cards back and restarts them, but \
+                     anything only in the running processes is lost.",
+                    running.join(", ")
+                ),
+            )
+        };
+        let dialog = adw::MessageDialog::new(parent.as_ref(), Some(&title), Some(&body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("close", "Close");
+        dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, move |_, response| {
+            if response == "close" {
+                delete();
+            }
+        });
+        dialog.present();
     }
 
     /// Deletes every selected node as one undo step.
@@ -3169,13 +3476,32 @@ impl App {
                 }
             }
             CanvasCommand::SetProperties { before, after } => {
-                let records = if inverse { before } else { after };
+                let (records, others) = if inverse {
+                    (before, after)
+                } else {
+                    (after, before)
+                };
                 let mut app_mut = app.borrow_mut();
                 for record in records {
-                    if let Some(entry) = app_mut.nodes.get_mut(&record.id) {
-                        entry.record = record.clone();
-                        entry.widget.set_collapsed(entry.record.collapsed);
+                    let Some(entry) = app_mut.nodes.get_mut(&record.id) else {
+                        continue;
+                    };
+                    // Only what this command changed: restoring the whole
+                    // snapshot would also roll back everything edited since
+                    // (a drawing's later strokes, a note's later text).
+                    let other = others.iter().find(|o| o.id == record.id);
+                    let changed = |same: bool| other.is_none() || !same;
+                    if changed(other.is_some_and(|o| o.collapsed == record.collapsed)) {
+                        entry.record.collapsed = record.collapsed;
                     }
+                    if changed(other.is_some_and(|o| o.locked == record.locked)) {
+                        entry.record.locked = record.locked;
+                    }
+                    if changed(other.is_some_and(|o| o.kind == record.kind)) {
+                        entry.record.kind = record.kind.clone();
+                        entry.widget.sync_payload(&entry.record.kind);
+                    }
+                    entry.widget.set_collapsed(entry.record.collapsed);
                 }
             }
         }
@@ -3184,8 +3510,8 @@ impl App {
 
 /// One card-menu entry: its label and what it does. `"Save\tCtrl+S"` shows
 /// a shortcut hint on the right; a `"[x] "`/`"[ ] "` prefix makes it a
-/// checked/unchecked toggle (see `check_label`); an empty label is a
-/// separator.
+/// checked/unchecked toggle (see `check_label`); a `"! "` prefix styles it
+/// as destructive; an empty label is a separator.
 pub type MenuItem = (String, Box<dyn Fn()>);
 
 pub fn separator() -> MenuItem {
@@ -3214,6 +3540,10 @@ pub fn popup_menu(popover: &gtk4::Popover, items: Vec<MenuItem>) {
         }
         last_was_separator = false;
         let (text, hint) = label.split_once('\t').unwrap_or((label.as_str(), ""));
+        let (destructive, text) = match text.strip_prefix("! ") {
+            Some(text) => (true, text),
+            None => (false, text),
+        };
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let (checked, text) = match (text.strip_prefix("[x] "), text.strip_prefix("[ ] ")) {
             (Some(text), _) => (Some(true), text),
@@ -3237,6 +3567,9 @@ pub fn popup_menu(popover: &gtk4::Popover, items: Vec<MenuItem>) {
         let button = gtk4::Button::new();
         button.set_child(Some(&row));
         button.add_css_class("flat");
+        if destructive {
+            button.add_css_class("destructive-item");
+        }
         let action: Rc<dyn Fn()> = Rc::from(action);
         button.connect_clicked({
             let popover = popover.clone();
@@ -3371,7 +3704,7 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
             ));
             let app_c = Rc::clone(app);
             items.push((
-                "Stop process".to_string(),
+                "! Stop process".to_string(),
                 Box::new(move || on_this_card(&app_c, id, App::terminate_selected_terminals)),
             ));
             let open_in_portal = portals::terminal_portal_menu_items(app, id);
@@ -3402,14 +3735,59 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
         NodeKind::Editor(_) => files::editor_menu_items(app, id),
         NodeKind::FileTree(_) => files::tree_menu_items(app, id),
         NodeKind::Portal(_) => portals::portal_menu_items(app, id),
-        NodeKind::Text(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => Vec::new(),
+        NodeKind::Drawing(_) => {
+            let app_c = Rc::clone(app);
+            vec![(
+                "! Clear drawing…".to_string(),
+                Box::new(move || confirm_clear_drawing(&app_c, id)) as Box<dyn Fn()>,
+            )]
+        }
+        NodeKind::Group(group) => {
+            let mut items: Vec<MenuItem> = Vec::new();
+            let app_c = Rc::clone(app);
+            items.push((
+                "Rename…\tdouble-click".to_string(),
+                Box::new(move || {
+                    if let Some(entry) = app_c.borrow().nodes.get(&id)
+                        && let NodeWidget::Group(node) = &entry.widget
+                    {
+                        crate::node::set_renaming(&node.title_label, &node.title_entry, true);
+                    }
+                }),
+            ));
+            items.push(separator());
+            for color in crate::model::GROUP_COLORS {
+                let app_c = Rc::clone(app);
+                let mut name = color.to_string();
+                name[..1].make_ascii_uppercase();
+                items.push((
+                    check_label(&name, group.color_name() == color),
+                    Box::new(move || {
+                        if let Err(error) = App::update_group(&app_c, id, None, Some(color)) {
+                            App::notify(&app_c, &error);
+                        }
+                    }),
+                ));
+            }
+            items.push(separator());
+            let app_c = Rc::clone(app);
+            items.push((
+                "Select with the cards on it".to_string(),
+                Box::new(move || App::select_group_with_contents(&app_c, id)),
+            ));
+            items
+        }
+        NodeKind::Text(_) => Vec::new(),
     };
+    let is_group = kind.is_background();
     items.push(separator());
-    let app_c = Rc::clone(app);
-    items.push((
-        "Connect to another card…".to_string(),
-        Box::new(move || App::start_link_with_hint(&app_c, id)),
-    ));
+    if !is_group {
+        let app_c = Rc::clone(app);
+        items.push((
+            "Connect to another card…".to_string(),
+            Box::new(move || App::start_link_with_hint(&app_c, id)),
+        ));
+    }
     let connected = app
         .borrow()
         .edges
@@ -3433,15 +3811,17 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
         ));
     }
     items.push(separator());
-    let app_c = Rc::clone(app);
-    items.push((
-        if collapsed { "Expand" } else { "Collapse" }.to_string(),
-        Box::new(move || {
-            on_this_card(&app_c, id, |app| {
-                App::set_selected_collapsed(app, !collapsed)
-            })
-        }),
-    ));
+    if !is_group {
+        let app_c = Rc::clone(app);
+        items.push((
+            if collapsed { "Expand" } else { "Collapse" }.to_string(),
+            Box::new(move || {
+                on_this_card(&app_c, id, |app| {
+                    App::set_selected_collapsed(app, !collapsed)
+                })
+            }),
+        ));
+    }
     let app_c = Rc::clone(app);
     items.push((
         if locked {
@@ -3463,8 +3843,8 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
     ));
     let app_c = Rc::clone(app);
     items.push((
-        "Delete".to_string(),
-        Box::new(move || on_this_card(&app_c, id, App::delete_selected)),
+        "! Delete".to_string(),
+        Box::new(move || App::request_delete(&app_c, vec![id])),
     ));
     items
 }
@@ -3546,53 +3926,61 @@ fn wire_rename(
     id: Uuid,
     toast_overlay: &adw::ToastOverlay,
 ) {
-    // Double-click, not single: a single press on the title starts a drag
-    // of the card (the whole title bar is its handle).
+    let app = Rc::clone(app);
+    let toast_overlay = toast_overlay.clone();
+    wire_inline_rename(&node.title_label, &node.title_entry, move |name| {
+        App::rename_session(&app, id, name).map_err(|error| {
+            toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+        })
+    });
+}
+
+/// The shared inline-rename gesture for a card title: double-click the
+/// label (a single press starts a drag of the card — the whole title bar is
+/// its handle) to edit it in `entry`; Enter calls `commit` and closes the
+/// field when it succeeds (on failure it stays open — `commit` reports why);
+/// Escape closes it without saving.
+fn wire_inline_rename(
+    label: &gtk4::Label,
+    entry: &gtk4::Entry,
+    commit: impl Fn(&str) -> Result<(), ()> + 'static,
+) {
     let click = gtk4::GestureClick::new();
     click.connect_pressed({
-        let label = node.title_label.clone();
-        let entry = node.title_entry.clone();
+        let label = label.clone();
+        let entry = entry.clone();
         move |_gesture, n_press, _x, _y| {
             if n_press == 2 {
                 crate::node::set_renaming(&label, &entry, true);
             }
         }
     });
-    node.title_label.add_controller(click);
+    label.add_controller(click);
 
     let finish = {
-        let label = node.title_label.clone();
-        let entry = node.title_entry.clone();
+        let label = label.clone();
+        let entry = entry.clone();
         move || crate::node::set_renaming(&label, &entry, false)
     };
-
-    node.title_entry.connect_activate({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
+    entry.connect_activate({
         let finish = finish.clone();
         move |entry| {
-            if let Err(error) = App::rename_session(&app, id, &entry.text()) {
-                toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
-                return;
+            if commit(&entry.text()).is_ok() {
+                finish();
             }
-            finish();
         }
     });
-
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    keys.connect_key_pressed({
-        let finish = finish.clone();
-        move |_controller, key, _code, _modifiers| {
-            if key == gtk4::gdk::Key::Escape {
-                finish();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
+    keys.connect_key_pressed(move |_controller, key, _code, _modifiers| {
+        if key == gtk4::gdk::Key::Escape {
+            finish();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
         }
     });
-    node.title_entry.add_controller(keys);
+    entry.add_controller(keys);
 }
 
 /// Whether Ctrl or Shift is held in a gesture's current event — the
@@ -3621,7 +4009,7 @@ fn additive_modifier_held(gesture: &impl IsA<gtk4::Gesture>) -> bool {
 /// together, not just the one pressed. A locked node (`record.locked`) is
 /// skipped by both move and resize.
 fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
-    let (container, drag_handle, resize_handle, close_button, resizable_widget) = {
+    let (container, drag_handle, resize_handle, close_button, resizable_widget, background) = {
         let app_ref = app.borrow();
         let entry = app_ref.nodes.get(&id).expect("just inserted");
         (
@@ -3630,12 +4018,15 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
             entry.widget.resize_handle().clone(),
             entry.widget.close_button().clone(),
             entry.widget.resizable_widget(),
+            entry.record.kind.is_background(),
         )
     };
 
+    // The ✕ removes just this card, as an undoable delete (with a question
+    // first when that stops a running process).
     close_button.connect_clicked({
         let app = Rc::clone(app);
-        move |_| App::close_node(&app, id)
+        move |_| App::request_delete(&app, vec![id])
     });
 
     // Any press anywhere on the card — title bar, terminal, text, tree —
@@ -3670,7 +4061,13 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
             glib::idle_add_local_once(move || App::bring_to_front(&app, id));
         }
     });
-    container.add_controller(press);
+    // A Group is selected from its title strip (and grip) only: a press on
+    // its body is a press on the canvas.
+    if background {
+        drag_handle.add_controller(press);
+    } else {
+        container.add_controller(press);
+    }
 
     // Right-click on the title bar: the card's menu. The popover is
     // parented once and reused — see `node_files::FileTreeNode::
@@ -3888,7 +4285,7 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
 /// tracking (persist on edit) plus the shared chrome (`wire_node_chrome`),
 /// adds it to the canvas, and inserts the resulting `NodeEntry` into
 /// `app.nodes`. The single creation pathway used by `create_session`/
-/// `create_note`/`create_text_node`/`create_placeholder_node`,
+/// `create_note`/`create_text_node`/`create_drawing`/`create_group`,
 /// `spawn_workspace_contents` (restore/switch), and undo/redo re-adding a
 /// removed node — so "what it takes to make a `NodeRecord` live" is written
 /// once instead of five times.
@@ -4029,12 +4426,8 @@ fn materialize_node(
         NodeKind::Portal(payload) => {
             portals::materialize_portal(app, id, payload, record.collapsed, toast_overlay)?
         }
-        NodeKind::Drawing(_) | NodeKind::Group(_) => {
-            let detail = match &record.kind {
-                NodeKind::Group(payload) if !payload.label.is_empty() => payload.label.clone(),
-                _ => "Not implemented yet".to_string(),
-            };
-            let node = PlaceholderNode::new(record.kind.label(), &detail, record.collapsed, {
+        NodeKind::Drawing(payload) => {
+            let node = DrawingNode::new(payload.strokes.clone(), record.collapsed, {
                 let app = Rc::clone(app);
                 move |collapsed| {
                     if let Some(entry) = app.borrow_mut().nodes.get_mut(&id) {
@@ -4043,7 +4436,27 @@ fn materialize_node(
                     App::schedule_persist(&app);
                 }
             });
-            NodeWidget::Placeholder(node)
+            node.connect_changed({
+                let app = Rc::clone(app);
+                move |strokes| {
+                    if let Some(entry) = app.borrow_mut().nodes.get_mut(&id)
+                        && let NodeKind::Drawing(drawing) = &mut entry.record.kind
+                    {
+                        drawing.strokes = strokes;
+                    }
+                    App::schedule_persist(&app);
+                }
+            });
+            node.clear_button.connect_clicked({
+                let app = Rc::clone(app);
+                move |_| confirm_clear_drawing(&app, id)
+            });
+            NodeWidget::Drawing(node)
+        }
+        NodeKind::Group(payload) => {
+            let node = GroupNode::new(payload.title(), payload.color_name());
+            wire_group_rename(app, &node, id);
+            NodeWidget::Group(node)
         }
     };
 
@@ -4060,7 +4473,13 @@ fn materialize_node(
 
     {
         let app_ref = app.borrow();
-        app_ref.canvas.add_node(widget.container(), position);
+        if record.kind.is_background() {
+            app_ref
+                .canvas
+                .add_background_node(widget.container(), position);
+        } else {
+            app_ref.canvas.add_node(widget.container(), position);
+        }
     }
     // Inserted before wiring chrome, not after: `wire_node_chrome` looks
     // `id` up in `app.nodes` (to read its widget handles) the moment it's
@@ -4077,6 +4496,7 @@ fn materialize_node(
         },
     );
     wire_node_chrome(app, id);
+    app.borrow().refresh_empty_hint();
     Ok(())
 }
 
@@ -4106,6 +4526,7 @@ fn spawn_workspace_contents(
         }
     }
     app.borrow_mut().edges = edges;
+    app.borrow().refresh_empty_hint();
     errors
 }
 
@@ -4335,16 +4756,59 @@ fn portal_data_dir(store_path: &Path) -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// The placeholder node kinds `main.rs`'s "New node" picker offers
-/// (FileTree stopped being a placeholder in Milestone 6 — see
-/// `App::create_file_tree` — and Portal in Milestone 8 — see
-/// `App::create_portal`), each with an empty default payload.
-pub fn placeholder_kind(label: &str) -> Option<NodeKind> {
-    match label {
-        "Drawing" => Some(NodeKind::Drawing(Default::default())),
-        "Group" => Some(NodeKind::Group(GroupPayload::default())),
-        _ => None,
+/// Whether `outer` (x, y, width, height) wholly contains `inner`.
+fn rect_contains(outer: (f64, f64, f64, f64), inner: (f64, f64, f64, f64)) -> bool {
+    inner.0 >= outer.0
+        && inner.1 >= outer.1
+        && inner.0 + inner.2 <= outer.0 + outer.2
+        && inner.1 + inner.3 <= outer.1 + outer.3
+}
+
+/// "Clear the drawing…": asks first — clearing throws away every stroke
+/// (it can still be undone from the Edit menu).
+fn confirm_clear_drawing(app: &Rc<RefCell<App>>, id: Uuid) {
+    use adw::prelude::MessageDialogExt;
+    let empty = app.borrow().nodes.get(&id).is_none_or(
+        |entry| matches!(&entry.record.kind, NodeKind::Drawing(d) if d.strokes.is_empty()),
+    );
+    if empty {
+        return;
     }
+    let parent = app
+        .borrow()
+        .canvas
+        .overlay
+        .root()
+        .and_downcast::<gtk4::Window>();
+    let dialog = adw::MessageDialog::new(
+        parent.as_ref(),
+        Some("Clear this drawing?"),
+        Some("Every stroke is removed. You can undo this from the ⋯ menu (Undo)."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("clear", "Clear");
+    dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, {
+        let app = Rc::clone(app);
+        move |_, response| {
+            if response == "clear" {
+                App::clear_drawing(&app, id);
+            }
+        }
+    });
+    dialog.present();
+}
+
+/// Double-click a Group's title to rename it (see `wire_inline_rename`).
+fn wire_group_rename(app: &Rc<RefCell<App>>, node: &GroupNode, id: Uuid) {
+    let app = Rc::clone(app);
+    wire_inline_rename(&node.title_label, &node.title_entry, move |text| {
+        App::update_group(&app, id, Some(text), None).map_err(|error| {
+            App::notify(&app, &error);
+        })
+    });
 }
 
 #[cfg(test)]
@@ -5275,7 +5739,7 @@ mod tests {
                 labels.iter().any(|l| l == "Connect to another card…"),
                 "{labels:?}"
             );
-            assert!(labels.iter().any(|l| l == "Delete"), "{labels:?}");
+            assert!(labels.iter().any(|l| l == "! Delete"), "{labels:?}");
         }
 
         App::start_link_with_hint(&app, tree.id);
@@ -5295,6 +5759,265 @@ mod tests {
         assert!(App::cancel_link(&app));
         assert!(!App::cancel_link(&app));
         assert!(app.borrow().pending_edge_source.is_none());
+    }
+
+    /// The `Fixed` children's order, bottom first, as node ids.
+    fn paint_order(app: &Rc<RefCell<App>>) -> Vec<Uuid> {
+        let app_ref = app.borrow();
+        let mut order = Vec::new();
+        let mut child = app_ref.canvas.fixed.first_child();
+        while let Some(widget) = child {
+            if let Some((id, _)) = app_ref
+                .nodes
+                .iter()
+                .find(|(_, e)| e.widget.container().upcast_ref::<gtk4::Widget>() == &widget)
+            {
+                order.push(*id);
+            }
+            child = widget.next_sibling();
+        }
+        order
+    }
+
+    /// Milestone 7.5: a Group is a background section. It paints beneath
+    /// every card whatever its z-order or press order, its body is canvas
+    /// (not a card) for clicks, it joins a marquee only when enclosed, and
+    /// it owns nothing — deleting or moving it leaves the cards on it alone.
+    #[test]
+    #[ignore = "needs a display"]
+    fn groups_are_background_sections_that_own_nothing() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let note = App::add_simple_node(
+            &app,
+            NodeKind::Note(NotePayload {
+                markdown: "API".to_string(),
+                color: "yellow".to_string(),
+                view_mode: NoteViewMode::Edit,
+                file: None,
+            }),
+            (100.0, 100.0),
+            (220.0, 160.0),
+        );
+        let drawing = App::create_drawing(&app, (300.0, 100.0));
+        // Created last (highest z_order), it still goes beneath both.
+        let group = App::create_group(&app, (50.0, 50.0));
+        assert_eq!(paint_order(&app)[0], group);
+        // Raising it (a press on its title does this) keeps it beneath.
+        App::bring_to_front(&app, group);
+        assert_eq!(paint_order(&app)[0], group);
+        App::select_only(&app, note);
+        App::lower_selected(&app);
+        assert_eq!(paint_order(&app), vec![group, note, drawing]);
+
+        // Its body is canvas: a point inside it but on no card is empty.
+        assert!(!app.borrow().covers_point((700.0, 450.0)));
+        assert!(app.borrow().covers_point((150.0, 150.0)));
+        // ...but its title strip is its own surface (a click there selects
+        // it rather than falling through and deselecting).
+        assert!(app.borrow().covers_point((600.0, 60.0)));
+
+        // A marquee over the cards doesn't pick up the section around them;
+        // one around the whole section does.
+        App::apply_marquee_selection(&app, (90.0, 90.0), (900.0, 500.0));
+        let selected = app.borrow().selected.clone();
+        assert!(selected.contains(&note) && selected.contains(&drawing));
+        assert!(!selected.contains(&group));
+        App::apply_marquee_selection(&app, (0.0, 0.0), (900.0, 600.0));
+        assert!(app.borrow().selected.contains(&group));
+
+        // "Select with the cards on it" is a one-off selection.
+        App::select_group_with_contents(&app, group);
+        assert_eq!(
+            app.borrow().selected,
+            [group, note, drawing].into_iter().collect()
+        );
+
+        // Groups can't be connected.
+        App::start_link(&app, note);
+        let message = App::complete_link_if_pending(&app, group).unwrap();
+        assert!(message.contains("can't be connected"), "{message}");
+        assert!(app.borrow().edges.is_empty());
+        // Enforced by the shared service, not just the GUI gesture.
+        assert!(!App::create_edge(&app, note, group));
+        assert!(!App::create_edge(&app, group, drawing));
+        assert!(app.borrow().edges.is_empty());
+        let labels: Vec<String> = node_menu_items(&app, group)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert!(
+            !labels.iter().any(|l| l.starts_with("Connect")),
+            "{labels:?}"
+        );
+        assert!(labels.iter().any(|l| l == "[x] Blue"), "{labels:?}");
+
+        // Title and color: undoable, persisted.
+        App::update_group(&app, group, Some("  Backend "), Some("green")).unwrap();
+        assert!(App::update_group(&app, group, None, Some("chartreuse")).is_err());
+        let payload = |app: &Rc<RefCell<App>>| match &app.borrow().nodes[&group].record.kind {
+            NodeKind::Group(g) => g.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(payload(&app).label, "Backend");
+        assert_eq!(payload(&app).color, "green");
+        let toast = adw::ToastOverlay::new();
+        App::undo(&app, &toast);
+        assert_eq!(payload(&app).title(), "Group");
+        assert_eq!(payload(&app).color, "blue");
+        App::redo(&app, &toast);
+        assert_eq!(payload(&app).label, "Backend");
+        match &app.borrow().nodes[&group].widget {
+            NodeWidget::Group(node) => {
+                assert_eq!(node.title_label.text(), "Backend");
+                assert!(node.container.has_css_class("group-green"));
+                assert!(!node.container.has_css_class("group-blue"));
+            }
+            _ => panic!("expected a group widget"),
+        }
+
+        // Moving it moves only it.
+        let note_position = app.borrow().nodes[&note].record.position;
+        App::select_only(&app, group);
+        App::align_left(&app); // a single-node no-op layout must not touch others
+        {
+            let mut app_mut = app.borrow_mut();
+            let canvas = app_mut.canvas.clone();
+            let entry = app_mut.nodes.get_mut(&group).unwrap();
+            entry.record.position = (300.0, 300.0);
+            canvas.reposition_node(entry.widget.container(), (300.0, 300.0));
+        }
+        assert_eq!(app.borrow().nodes[&note].record.position, note_position);
+
+        // Deleting it deletes only it (and undo brings it back, beneath).
+        App::request_delete(&app, vec![group]);
+        assert!(!app.borrow().nodes.contains_key(&group));
+        assert!(app.borrow().nodes.contains_key(&note));
+        assert!(app.borrow().nodes.contains_key(&drawing));
+        App::undo(&app, &toast);
+        assert_eq!(paint_order(&app)[0], group);
+
+        // Locking applies to groups like any card.
+        App::select_only(&app, group);
+        App::set_selected_locked(&app, true);
+        assert!(app.borrow().nodes[&group].record.locked);
+    }
+
+    /// Milestone 7.5: drawing strokes reach the record (and disk), survive
+    /// a workspace switch and a restart, and Clear is undoable.
+    #[test]
+    #[ignore = "needs a display"]
+    fn drawings_persist_their_strokes_and_clear_is_undoable() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let drawing = App::create_drawing(&app, (0.0, 0.0));
+        let group = App::create_group(&app, (-50.0, -50.0));
+        App::update_group(&app, group, Some("Sketches"), Some("purple")).unwrap();
+        let stroke = crate::model::Stroke {
+            color: crate::drawing::PEN_COLORS[1].to_string(),
+            width: 4.0,
+            points: vec![(0.1, 0.1), (0.5, 0.4), (0.9, 0.2)],
+        };
+        let node = match &app.borrow().nodes[&drawing].widget {
+            NodeWidget::Drawing(node) => node.clone(),
+            _ => panic!("expected a drawing widget"),
+        };
+        // What a finished pen stroke reports.
+        node.commit_strokes(vec![stroke.clone()]);
+        let strokes = |app: &Rc<RefCell<App>>| match &app.borrow().nodes[&drawing].record.kind {
+            NodeKind::Drawing(d) => d.strokes.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(strokes(&app), vec![stroke.clone()]);
+        assert_eq!(node.strokes(), vec![stroke.clone()]);
+
+        // Undoing an unrelated property change (a lock) must not roll the
+        // strokes back to the lock's snapshot.
+        App::select_only(&app, drawing);
+        App::set_selected_locked(&app, true);
+        let later = crate::model::Stroke {
+            color: crate::drawing::PEN_COLORS[2].to_string(),
+            width: 2.0,
+            points: vec![(0.2, 0.8), (0.6, 0.9)],
+        };
+        node.commit_strokes(vec![stroke.clone(), later.clone()]);
+        let toast_early = adw::ToastOverlay::new();
+        App::undo(&app, &toast_early);
+        assert!(!app.borrow().nodes[&drawing].record.locked);
+        assert_eq!(strokes(&app), vec![stroke.clone(), later.clone()]);
+        assert_eq!(node.strokes(), vec![stroke.clone(), later.clone()]);
+        node.commit_strokes(vec![stroke.clone()]);
+
+        // A damaged stroke (e.g. from a newer version) is kept, not dropped
+        // by the next edit.
+        let damaged = crate::model::Stroke {
+            color: "chartreuse".to_string(),
+            width: 2.0,
+            points: vec![(0.5, 0.5)],
+        };
+        let other = App::add_simple_node(
+            &app,
+            NodeKind::Drawing(crate::model::DrawingPayload {
+                strokes: vec![damaged.clone()],
+            }),
+            (900.0, 900.0),
+            (300.0, 200.0),
+        );
+        let other_node = match &app.borrow().nodes[&other].widget {
+            NodeWidget::Drawing(node) => node.clone(),
+            _ => unreachable!(),
+        };
+        let mut edited = other_node.strokes();
+        edited.push(stroke.clone());
+        other_node.commit_strokes(edited);
+        assert!(matches!(
+            &app.borrow().nodes[&other].record.kind,
+            NodeKind::Drawing(d) if d.strokes == vec![damaged.clone(), stroke.clone()]
+        ));
+        App::request_delete(&app, vec![other]);
+
+        App::clear_drawing(&app, drawing);
+        assert!(strokes(&app).is_empty());
+        assert!(node.strokes().is_empty());
+        let toast = adw::ToastOverlay::new();
+        App::undo(&app, &toast);
+        assert_eq!(strokes(&app), vec![stroke.clone()]);
+        assert_eq!(node.strokes(), vec![stroke.clone()]);
+
+        // A workspace switch and back re-materializes everything.
+        let home = app.borrow().workspace_id;
+        let other = App::create_workspace(&app, "Other".to_string(), std::env::temp_dir()).unwrap();
+        App::switch_workspace(&app, other, &toast);
+        assert!(app.borrow().nodes.is_empty());
+        App::switch_workspace(&app, home, &toast);
+        assert_eq!(strokes(&app), vec![stroke.clone()]);
+        assert_eq!(paint_order(&app)[0], group);
+
+        // And so does a restart from the saved file.
+        app.borrow().persist().unwrap();
+        let store_path = app.borrow().store_path.clone();
+        let restarted = App::new(
+            AccountStore::new(store_path.parent().unwrap().join("accounts")),
+            store_path,
+        );
+        App::restore(&restarted, &toast);
+        {
+            let restarted_ref = restarted.borrow();
+            let restored = &restarted_ref.nodes;
+            assert!(matches!(
+                &restored[&drawing].record.kind,
+                NodeKind::Drawing(d) if d.strokes == vec![stroke.clone()]
+            ));
+            assert!(matches!(
+                &restored[&group].record.kind,
+                NodeKind::Group(g) if g.label == "Sketches" && g.color == "purple"
+            ));
+        }
+        assert_eq!(paint_order(&restarted)[0], group);
     }
 
     /// Handoff: offers every Claude account plus Codex (never the session's

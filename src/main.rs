@@ -88,46 +88,43 @@ fn build_ui(application: &adw::Application) {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
+    // The header answers four questions and nothing else: where am I
+    // (workspace, and the project folder under the title), what repository
+    // state am I in (the Git control), how do I add something (+), and where
+    // is everything else (the ⋯ menu). Every command still has its action
+    // and shortcut; only the permanent buttons went away.
     let header = adw::HeaderBar::new();
-    let new_session_button = gtk4::Button::from_icon_name("tab-new-symbolic");
-    header.pack_start(&new_session_button);
-    let new_note_button = gtk4::Button::from_icon_name("text-editor-symbolic");
-    header.pack_start(&new_note_button);
-    let new_file_tree_button = gtk4::Button::from_icon_name("folder-symbolic");
-    new_file_tree_button.set_tooltip_text(Some("New file tree of the project"));
-    header.pack_start(&new_file_tree_button);
-    let accounts_button = gtk4::Button::from_icon_name("system-users-symbolic");
-    header.pack_start(&accounts_button);
-    let roles_button = gtk4::Button::from_icon_name("preferences-system-symbolic");
-    roles_button.set_tooltip_text(Some("Manage agent roles"));
-    header.pack_start(&roles_button);
-    // Every selection/layout/undo command lives behind clicks in this menu,
-    // deliberately with no keyboard accelerators of its own: a card's
-    // terminal takes the keyboard (same reasoning as the link
-    // click-to-select/click-again-to-delete pattern), and several of the
-    // obvious shortcuts a tool palette would normally claim — Ctrl+Z
-    // (suspend), Ctrl+C (interrupt), Ctrl+A (readline line-start), Delete —
-    // are exactly the keys a running shell or agent most needs to receive
-    // untouched. A mouse-driven menu has no such conflict.
-    let edit_menu_button = gtk4::MenuButton::new();
-    edit_menu_button.set_icon_name("applications-utilities-symbolic");
-    edit_menu_button.set_tooltip_text(Some("Selection, layout, and undo/redo"));
-    header.pack_start(&edit_menu_button);
-    let zoom_out_button = gtk4::Button::from_icon_name("zoom-out-symbolic");
-    zoom_out_button.set_tooltip_text(Some("Zoom out (Ctrl+-)"));
-    header.pack_end(&zoom_out_button);
-    let zoom_in_button = gtk4::Button::from_icon_name("zoom-in-symbolic");
-    zoom_in_button.set_tooltip_text(Some("Zoom in (Ctrl++)"));
-    header.pack_end(&zoom_in_button);
-    let workspace_icon = gtk4::Image::from_icon_name("view-paged-symbolic");
     let workspace_label = gtk4::Label::new(None);
-    let workspace_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    workspace_box.append(&workspace_icon);
+    workspace_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    workspace_label.set_max_width_chars(18);
+    let workspace_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    workspace_box.append(&gtk4::Image::from_icon_name("view-paged-symbolic"));
     workspace_box.append(&workspace_label);
+    workspace_box.append(&gtk4::Image::from_icon_name("pan-down-symbolic"));
     let workspace_button = gtk4::Button::new();
     workspace_button.set_child(Some(&workspace_box));
-    workspace_button.set_tooltip_text(Some("Switch workspace"));
-    header.pack_end(&workspace_button);
+    workspace_button.add_css_class("flat");
+    workspace_button.set_tooltip_text(Some(
+        "Workspace — switch, create or rename (Ctrl+1…9 to jump)",
+    ));
+    header.pack_start(&workspace_button);
+    let git_button = app::scm::build_git_button(&app, &window);
+    header.pack_start(&git_button);
+
+    let window_title = adw::WindowTitle::new("Duet", "");
+    header.set_title_widget(Some(&window_title));
+
+    let more_button = gtk4::MenuButton::new();
+    more_button.set_icon_name("open-menu-symbolic");
+    more_button.set_tooltip_text(Some("Main menu (F10)"));
+    more_button.set_primary(true);
+    header.pack_end(&more_button);
+    let add_button = gtk4::MenuButton::new();
+    add_button.set_icon_name("list-add-symbolic");
+    add_button.set_tooltip_text(Some(
+        "Add a card (or right-click the canvas to add it there)",
+    ));
+    header.pack_end(&add_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -154,21 +151,6 @@ fn build_ui(application: &adw::Application) {
         }
     });
     window.add_controller(keys);
-
-    zoom_out_button.connect_clicked({
-        let app = app.clone();
-        move |_| {
-            app.borrow().canvas.zoom_by_steps(-1);
-            App::schedule_persist(&app);
-        }
-    });
-    zoom_in_button.connect_clicked({
-        let app = app.clone();
-        move |_| {
-            app.borrow().canvas.zoom_by_steps(1);
-            App::schedule_persist(&app);
-        }
-    });
 
     // Link lines are drawn, not widgets, so deleting one needs a hit test
     // against the curve rather than a click on a control: one click selects
@@ -263,6 +245,21 @@ fn build_ui(application: &adw::Application) {
                     }
                 }),
             ));
+            let app_c = app.clone();
+            items.push((
+                "New drawing".to_string(),
+                Box::new(move || {
+                    App::create_drawing(&app_c, world);
+                }),
+            ));
+            items.push(app::separator());
+            let app_c = app.clone();
+            items.push((
+                "New group section".to_string(),
+                Box::new(move || {
+                    App::create_group(&app_c, world);
+                }),
+            ));
             app::popup_menu(&canvas_menu, items);
         }
     });
@@ -277,6 +274,7 @@ fn build_ui(application: &adw::Application) {
     // Restore after the toast overlay exists: `restore`'s own load/spawn
     // errors are toasted below, and card menus report through it too.
     let mut errors = App::restore(&app, &toast_overlay);
+    app.borrow().refresh_empty_hint();
     sync_workspace_button(&workspace_label, &app);
     // Writes back immediately rather than waiting for the first edit, so a
     // migration from an older single-canvas store.json (see `store::Store`'s
@@ -317,67 +315,24 @@ fn build_ui(application: &adw::Application) {
         }
     });
 
-    new_session_button.connect_clicked({
-        let app = app.clone();
-        let window = window.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| open_new_session_dialog(&app, &window, &toast_overlay, None)
-    });
-
-    accounts_button.connect_clicked({
-        let app = app.clone();
-        let window = window.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| open_account_manager_dialog(&app, &window, &toast_overlay)
-    });
-
-    roles_button.connect_clicked({
-        let app = app.clone();
-        let window = window.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| open_role_manager_dialog(&app, &window, &toast_overlay)
-    });
-
-    workspace_button.connect_clicked({
+    let workspaces_action = gtk4::gio::SimpleAction::new("manage-workspaces", None);
+    workspaces_action.connect_activate({
         let app = app.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         let workspace_label = workspace_label.clone();
-        move |_| open_workspace_switcher_dialog(&app, &window, &toast_overlay, &workspace_label)
+        move |_, _| open_workspace_switcher_dialog(&app, &window, &toast_overlay, &workspace_label)
     });
+    application.add_action(&workspaces_action);
+    workspace_button.set_action_name(Some("app.manage-workspaces"));
 
-    new_note_button.connect_clicked({
+    let note_action = gtk4::gio::SimpleAction::new("new-note", None);
+    note_action.connect_activate({
         let app = app.clone();
         let window = window.clone();
-        move |_| {
-            let position = {
-                let (width, height) = (window.width(), window.height());
-                let screen_center = if width > 0 && height > 0 {
-                    (width as f64 / 2.0, height as f64 / 2.0)
-                } else {
-                    // Defensive fallback: only reachable if the window hasn't
-                    // been allocated a size yet, which shouldn't happen since
-                    // window.present() runs before this button can be clicked.
-                    (600.0, 400.0)
-                };
-                let app_ref = app.borrow();
-                let state = app_ref.canvas.state.borrow();
-                canvas::screen_to_world(screen_center, state.pan, state.zoom)
-            };
-            App::create_note(&app, position);
-        }
+        move |_, _| App::create_note(&app, centered_in_view(&app, &window, (220.0, 160.0)))
     });
-
-    new_file_tree_button.connect_clicked({
-        let app = app.clone();
-        let window = window.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            if let Err(error) = App::create_file_tree(&app, viewport_center_world(&app, &window)) {
-                toast_overlay.add_toast(adw::Toast::new(&error));
-            }
-        }
-    });
+    application.add_action(&note_action);
 
     let action = gtk4::gio::SimpleAction::new("new-session", None);
     action.connect_activate({
@@ -474,13 +429,39 @@ fn build_ui(application: &adw::Application) {
         );
     }
 
-    wire_canvas_edit_actions(
-        application,
-        &app,
-        &window,
-        &toast_overlay,
-        &edit_menu_button,
-    );
+    let menus = wire_canvas_edit_actions(application, &app, &window, &toast_overlay);
+    add_button.set_menu_model(Some(&menus.add));
+    more_button.set_menu_model(Some(&menus.more));
+    wire_help_actions(application, &window);
+
+    // The project folder under the title. Workspace activation notifies
+    // the Git listeners (a new workspace may be a new repository), which is
+    // exactly when this can change.
+    let update_subtitle: Rc<dyn Fn()> = Rc::new({
+        let app = app.clone();
+        let window_title = window_title.clone();
+        move || {
+            let app_ref = app.borrow();
+            let root = app_ref.workspace_root.display().to_string();
+            let home = std::env::var("HOME").unwrap_or_default();
+            let shown = match root.strip_prefix(&home) {
+                Some(rest) if !home.is_empty() => format!("~{rest}"),
+                _ => root,
+            };
+            if window_title.subtitle() != shown {
+                window_title.set_subtitle(&shown);
+            }
+            window_title.set_tooltip_text(Some(&format!(
+                "Workspace {} in {shown}",
+                app_ref.workspace_name
+            )));
+        }
+    });
+    update_subtitle();
+    app.borrow_mut().connect_git_state_changed({
+        let update_subtitle = Rc::clone(&update_subtitle);
+        move || update_subtitle()
+    });
 
     window.present();
 
@@ -500,30 +481,58 @@ fn viewport_size(window: &adw::ApplicationWindow) -> (f64, f64) {
     }
 }
 
-/// The world-space point under the center of the window — where a new node
-/// created from a menu (rather than dropped at a specific spot) appears.
+/// Where a card of `size` created from a menu (rather than dropped at a
+/// specific spot) goes: centered in the current view, title bar included.
+fn centered_in_view(
+    app: &Rc<RefCell<App>>,
+    window: &adw::ApplicationWindow,
+    size: (f64, f64),
+) -> (f64, f64) {
+    let (x, y) = viewport_center_world(app, window);
+    (
+        x - size.0 / 2.0,
+        y - (size.1 + canvas::TITLE_BAR_HEIGHT) / 2.0,
+    )
+}
+
+/// The world-space point under the center of the canvas (the window
+/// minus its header, when the canvas is allocated).
 fn viewport_center_world(app: &Rc<RefCell<App>>, window: &adw::ApplicationWindow) -> (f64, f64) {
-    let (width, height) = viewport_size(window);
     let app_ref = app.borrow();
+    let fixed = &app_ref.canvas.fixed;
+    let (width, height) = if fixed.width() > 0 && fixed.height() > 0 {
+        (fixed.width() as f64, fixed.height() as f64)
+    } else {
+        viewport_size(window)
+    };
     let state = app_ref.canvas.state.borrow();
     canvas::screen_to_world((width / 2.0, height / 2.0), state.pan, state.zoom)
 }
 
 /// Registers every selection/multi-node/layout/undo-redo/canvas-navigation
-/// command as a `gio::SimpleAction` on `application`, and lists them all in
-/// `edit_menu_button`'s popover menu. None of these carry a keyboard
-/// accelerator — see `edit_menu_button`'s doc comment in `build_ui` for why.
+/// and card-creation command as a `gio::SimpleAction` on `application`, and
+/// returns the header's two menus listing them. Selection/edit commands
+/// deliberately carry no keyboard accelerator of their own: a card's
+/// terminal takes the keyboard, and the obvious shortcuts — Ctrl+Z
+/// (suspend), Ctrl+C (interrupt), Ctrl+A (line start), Delete — are exactly
+/// the keys a running shell or agent most needs to receive untouched.
 /// (action name, menu label, handler) for a command that takes no extra UI
 /// input beyond `app` itself.
 type SimpleEditAction<'a> = (&'a str, &'a str, Box<dyn Fn(&Rc<RefCell<App>>)>);
+
+struct HeaderMenus {
+    /// "+": every kind of card.
+    add: gtk4::gio::Menu,
+    /// "⋯": edit, arrange, view, workspace/agents/accounts, help.
+    more: gtk4::gio::Menu,
+}
 
 fn wire_canvas_edit_actions(
     application: &adw::Application,
     app: &Rc<RefCell<App>>,
     window: &adw::ApplicationWindow,
     toast_overlay: &adw::ToastOverlay,
-    edit_menu_button: &gtk4::MenuButton,
-) {
+) -> HeaderMenus {
     // `new-text-node`, `new-file-tree`, `new-portal` and the two placeholder-kind creators, which need a
     // spawn position, and `toggle-snap-to-grid`, which needs a toast
     // describing its new state, are registered separately below instead of
@@ -534,7 +543,10 @@ fn wire_canvas_edit_actions(
         (
             "delete-selected",
             "Delete Selected",
-            Box::new(App::delete_selected),
+            Box::new(|app| {
+                let ids: Vec<Uuid> = app.borrow().selected.iter().copied().collect();
+                App::request_delete(app, ids);
+            }),
         ),
         (
             "lock-selected",
@@ -578,13 +590,10 @@ fn wire_canvas_edit_actions(
         ("copy-selected", "Copy", Box::new(App::copy_selected)),
     ];
 
-    let menu = gtk4::gio::Menu::new();
     let selection_section = gtk4::gio::Menu::new();
     let layout_section = gtk4::gio::Menu::new();
     let clipboard_section = gtk4::gio::Menu::new();
-    let history_section = gtk4::gio::Menu::new();
     let view_section = gtk4::gio::Menu::new();
-    let create_section = gtk4::gio::Menu::new();
 
     for (name, label, handler) in simple_actions {
         let action = gtk4::gio::SimpleAction::new(name, None);
@@ -690,7 +699,6 @@ fn wire_canvas_edit_actions(
         move |_, _| App::undo(&app, &toast_overlay)
     });
     application.add_action(&undo_action);
-    history_section.append_item(&gtk4::gio::MenuItem::new(Some("Undo"), Some("app.undo")));
 
     let redo_action = gtk4::gio::SimpleAction::new("redo", None);
     redo_action.connect_activate({
@@ -699,7 +707,6 @@ fn wire_canvas_edit_actions(
         move |_, _| App::redo(&app, &toast_overlay)
     });
     application.add_action(&redo_action);
-    history_section.append_item(&gtk4::gio::MenuItem::new(Some("Redo"), Some("app.redo")));
 
     // Zoom-to-selection/fit need the window's current size.
     let zoom_selection_action = gtk4::gio::SimpleAction::new("zoom-to-selection", None);
@@ -749,18 +756,14 @@ fn wire_canvas_edit_actions(
         Some("app.toggle-snap-to-grid"),
     ));
 
-    // New Text/placeholder nodes need a spawn position (screen center).
+    // New cards appear in the middle of the view.
     let text_action = gtk4::gio::SimpleAction::new("new-text-node", None);
     text_action.connect_activate({
         let app = app.clone();
         let window = window.clone();
-        move |_, _| App::create_text_node(&app, viewport_center_world(&app, &window))
+        move |_, _| App::create_text_node(&app, centered_in_view(&app, &window, (220.0, 160.0)))
     });
     application.add_action(&text_action);
-    create_section.append_item(&gtk4::gio::MenuItem::new(
-        Some("New Text Node"),
-        Some("app.new-text-node"),
-    ));
 
     let file_tree_action = gtk4::gio::SimpleAction::new("new-file-tree", None);
     file_tree_action.connect_activate({
@@ -768,16 +771,14 @@ fn wire_canvas_edit_actions(
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         move |_, _| {
-            if let Err(error) = App::create_file_tree(&app, viewport_center_world(&app, &window)) {
+            if let Err(error) =
+                App::create_file_tree(&app, centered_in_view(&app, &window, (320.0, 460.0)))
+            {
                 toast_overlay.add_toast(adw::Toast::new(&error));
             }
         }
     });
     application.add_action(&file_tree_action);
-    create_section.append_item(&gtk4::gio::MenuItem::new(
-        Some("New File Tree"),
-        Some("app.new-file-tree"),
-    ));
 
     let portal_action = gtk4::gio::SimpleAction::new("new-portal", None);
     portal_action.connect_activate({
@@ -785,49 +786,208 @@ fn wire_canvas_edit_actions(
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         move |_, _| {
-            if let Err(error) =
-                App::create_portal(&app, None, "", viewport_center_world(&app, &window))
-            {
+            if let Err(error) = App::create_portal(
+                &app,
+                None,
+                "",
+                centered_in_view(&app, &window, (640.0, 480.0)),
+            ) {
                 toast_overlay.add_toast(adw::Toast::new(&error));
             }
         }
     });
     application.add_action(&portal_action);
-    create_section.append_item(&gtk4::gio::MenuItem::new(
-        Some("New Browser Portal"),
-        Some("app.new-portal"),
-    ));
 
-    for kind_label in ["Drawing", "Group"] {
-        let action_name = format!(
-            "new-placeholder-{}",
-            kind_label.to_lowercase().replace(' ', "-")
-        );
-        let action = gtk4::gio::SimpleAction::new(&action_name, None);
-        action.connect_activate({
-            let app = app.clone();
-            let window = window.clone();
-            let kind_label = kind_label.to_string();
-            move |_, _| {
-                if let Some(kind) = crate::app::placeholder_kind(&kind_label) {
-                    App::create_placeholder_node(&app, kind, viewport_center_world(&app, &window));
-                }
-            }
-        });
-        application.add_action(&action);
-        create_section.append_item(&gtk4::gio::MenuItem::new(
-            Some(&format!("New {kind_label} (placeholder)")),
-            Some(&format!("app.{action_name}")),
-        ));
+    let drawing_action = gtk4::gio::SimpleAction::new("new-drawing", None);
+    drawing_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        move |_, _| {
+            App::create_drawing(&app, centered_in_view(&app, &window, (420.0, 300.0)));
+        }
+    });
+    application.add_action(&drawing_action);
+
+    let group_action = gtk4::gio::SimpleAction::new("new-group", None);
+    group_action.connect_activate({
+        let app = app.clone();
+        let window = window.clone();
+        move |_, _| {
+            App::create_group(&app, centered_in_view(&app, &window, (720.0, 460.0)));
+        }
+    });
+    application.add_action(&group_action);
+
+    let add = gtk4::gio::Menu::new();
+    let agents_section = gtk4::gio::Menu::new();
+    agents_section.append(Some("Agent or Terminal…"), Some("app.new-session"));
+    add.append_section(None, &agents_section);
+    let cards_section = gtk4::gio::Menu::new();
+    cards_section.append(Some("Note"), Some("app.new-note"));
+    cards_section.append(Some("Text"), Some("app.new-text-node"));
+    cards_section.append(Some("File Tree"), Some("app.new-file-tree"));
+    cards_section.append(Some("Browser Portal"), Some("app.new-portal"));
+    cards_section.append(Some("Drawing"), Some("app.new-drawing"));
+    add.append_section(None, &cards_section);
+    let canvas_section = gtk4::gio::Menu::new();
+    canvas_section.append(Some("Group Section"), Some("app.new-group"));
+    add.append_section(None, &canvas_section);
+
+    // Zoom commands first in the view section; they have shortcuts, which
+    // the menu shows.
+    view_section.prepend(Some("Reset Zoom"), Some("app.zoom-reset"));
+    view_section.prepend(Some("Zoom Out"), Some("app.zoom-out"));
+    view_section.prepend(Some("Zoom In"), Some("app.zoom-in"));
+
+    let more = gtk4::gio::Menu::new();
+    let edit_section = gtk4::gio::Menu::new();
+    edit_section.append_item(&gtk4::gio::MenuItem::new(Some("Undo"), Some("app.undo")));
+    edit_section.append_item(&gtk4::gio::MenuItem::new(Some("Redo"), Some("app.redo")));
+    let selection_menu = gtk4::gio::Menu::new();
+    selection_menu.append_section(None, &selection_section);
+    selection_menu.append_section(None, &clipboard_section);
+    edit_section.append_submenu(Some("Selection"), &selection_menu);
+    edit_section.append_submenu(Some("Arrange"), &layout_section);
+    more.append_section(None, &edit_section);
+    more.append_section(None, &view_section);
+    let manage_section = gtk4::gio::Menu::new();
+    manage_section.append(Some("Workspaces…"), Some("app.manage-workspaces"));
+    manage_section.append(Some("Agent Roles…"), Some("app.manage-roles"));
+    manage_section.append(Some("Claude Accounts…"), Some("app.manage-accounts"));
+    more.append_section(None, &manage_section);
+    let help_section = gtk4::gio::Menu::new();
+    help_section.append(Some("Keyboard Shortcuts"), Some("app.shortcuts"));
+    help_section.append(Some("About Duet"), Some("app.about"));
+    more.append_section(None, &help_section);
+    HeaderMenus { add, more }
+}
+
+/// "Keyboard Shortcuts" and "About Duet".
+fn wire_help_actions(application: &adw::Application, window: &adw::ApplicationWindow) {
+    let shortcuts = gtk4::gio::SimpleAction::new("shortcuts", None);
+    shortcuts.connect_activate({
+        let window = window.clone();
+        move |_, _| open_shortcuts_dialog(&window)
+    });
+    application.add_action(&shortcuts);
+    application.set_accels_for_action("app.shortcuts", &["<Ctrl>question"]);
+
+    let about = gtk4::gio::SimpleAction::new("about", None);
+    about.connect_activate({
+        let window = window.clone();
+        move |_, _| {
+            let about = adw::AboutWindow::builder()
+                .transient_for(&window)
+                .modal(true)
+                .application_name("Duet")
+                .application_icon("utilities-terminal-symbolic")
+                .version(env!("CARGO_PKG_VERSION"))
+                .comments(
+                    "A spatial canvas for running and orchestrating coding agents side by side, \
+                     with notes, files, Git and browser portals.",
+                )
+                .license_type(gtk4::License::MitX11)
+                .website("https://github.com/devfernandoa/duet")
+                .issue_url("https://github.com/devfernandoa/duet/issues")
+                .build();
+            about.present();
+        }
+    });
+    application.add_action(&about);
+}
+
+/// The keyboard and pointer shortcuts, grouped, in one scrollable window.
+fn open_shortcuts_dialog(parent: &adw::ApplicationWindow) {
+    let groups: &[(&str, &[(&str, &str)])] = &[
+        (
+            "Canvas",
+            &[
+                ("Ctrl+T", "New agent or terminal"),
+                ("Right-click empty canvas", "Add a card right there"),
+                ("Drag empty canvas", "Pan"),
+                ("Mouse wheel over empty canvas", "Zoom around the pointer"),
+                ("Ctrl+wheel (anywhere) / pinch", "Zoom"),
+                ("Two-finger touchpad scroll", "Pan"),
+                ("Ctrl++ / Ctrl+- / Ctrl+0", "Zoom in / out / reset"),
+                ("Shift+drag empty canvas", "Select with a rectangle"),
+                (
+                    "Ctrl/Shift+click a card",
+                    "Add to or remove from the selection",
+                ),
+                ("Esc", "Cancel connecting two cards"),
+            ],
+        ),
+        (
+            "Cards",
+            &[
+                (
+                    "Drag the title bar",
+                    "Move (all selected cards move together)",
+                ),
+                ("Drag the corner grip", "Resize"),
+                ("Right-click the title bar", "Card menu"),
+                ("Double-click a title", "Rename"),
+            ],
+        ),
+        (
+            "Editor",
+            &[
+                ("Ctrl+S", "Save"),
+                ("Ctrl+F / Ctrl+H", "Find / replace"),
+                ("Ctrl+G", "Go to line"),
+            ],
+        ),
+        (
+            "Application",
+            &[
+                ("Ctrl+1 … Ctrl+9", "Switch to workspace 1–9"),
+                ("Ctrl+Shift+R", "Agent roles"),
+                ("Ctrl+.", "Claude accounts"),
+                ("F10", "Main menu"),
+                ("Ctrl+?", "This window"),
+            ],
+        ),
+    ];
+    let page = adw::PreferencesPage::new();
+    for (title, rows) in groups {
+        let group = adw::PreferencesGroup::new();
+        group.set_title(title);
+        for (keys, action) in *rows {
+            let row = adw::ActionRow::new();
+            row.set_title(action);
+            let key_label = gtk4::Label::new(Some(keys));
+            key_label.add_css_class("dim-label");
+            key_label.add_css_class("monospace");
+            row.add_suffix(&key_label);
+            group.add(&row);
+        }
+        page.add(&group);
     }
-
-    menu.append_section(Some("Selection"), &selection_section);
-    menu.append_section(Some("Layout"), &layout_section);
-    menu.append_section(Some("Clipboard"), &clipboard_section);
-    menu.append_section(Some("History"), &history_section);
-    menu.append_section(Some("View"), &view_section);
-    menu.append_section(Some("New Node"), &create_section);
-    edit_menu_button.set_menu_model(Some(&menu));
+    let header = adw::HeaderBar::new();
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&page));
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(520)
+        .default_height(620)
+        .title("Keyboard Shortcuts")
+        .content(&toolbar_view)
+        .build();
+    let keys = gtk4::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let dialog = dialog.clone();
+        move |_controller, key, _code, _modifiers| {
+            if key == gtk4::gdk::Key::Escape {
+                dialog.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(keys);
+    dialog.present();
 }
 
 /// `position`: where on the canvas (world coordinates) the new terminal
@@ -1088,7 +1248,12 @@ fn open_new_session_dialog(
                 };
                 let app_ref = app.borrow();
                 let state = app_ref.canvas.state.borrow();
-                canvas::screen_to_world(screen_center, state.pan, state.zoom)
+                let center = canvas::screen_to_world(screen_center, state.pan, state.zoom);
+                // Centered on the view (a new terminal is 720x504).
+                (
+                    center.0 - 360.0,
+                    center.1 - (504.0 + canvas::TITLE_BAR_HEIGHT) / 2.0,
+                )
             });
             let result = App::create_session(
                 &app,

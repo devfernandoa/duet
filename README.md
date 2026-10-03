@@ -3,18 +3,20 @@
 A GTK4/libadwaita desktop app for running multiple AI coding agents side by
 side on an infinite, pannable/zoomable canvas — and having them talk to each
 other. Each agent (Claude Code, Codex, OpenCode, a plain shell, or a custom
-command) runs in a real PTY inside its own card; notes, plain-text labels,
-file trees, editors, embedded browser portals and a couple of placeholder
-node kinds share the same canvas. Connect two
+command) runs in a real PTY inside its own card; Markdown notes, plain-text
+labels, file trees, editors, embedded browser portals, quick drawings and
+colored group sections share the same canvas. Connect two
 agent cards and they can message each other with `duetctl`, duet's local
 control CLI — the same service layer the GUI itself calls, so nothing an
 agent can do is a GUI-only trick.
 
-Milestones 0 through 6 and 8 (stabilization, the generic canvas, persistent
-workspaces, agent orchestration, agent-writable notes, `@` resource
-addressing, the project file tree/editor/Git, and browser portals) are done;
-terminal/chat views, floors and scores are not yet — see
-[Known limitations](#known-limitations) below for the current gaps.
+**Duet 1.0** covers: persistent workspaces, multiple agents with roles and
+agent-to-agent messaging, agent-readable and -writable Markdown notes,
+`@` resource addressing, a project file tree and editor, the everyday Git
+workflow (status, diff, stage, commit, branches, fetch/pull/push), browser
+portals agents can drive, drawings and group sections. Chat views, floors,
+reusable arrangements, routines and remote environments are post-1.0 ideas —
+see [Known limitations](#known-limitations).
 
 ## Build
 
@@ -47,7 +49,8 @@ creating the session.
 
 Everything lives inside a *workspace*: its own canvas, its own nodes and
 edges, its own default working directory and runtime environment. Switch
-between them with the workspace button in the header bar or `Ctrl+1`
+between them with the workspace button at the left of the header bar (the
+title under "Duet" shows the workspace's folder) or `Ctrl+1`
 through `Ctrl+9` (the Nth workspace in name order). Switching away from a
 workspace detaches its widgets but never kills its processes — an agent kept
 running in the background stays running, and the workspace switcher shows
@@ -62,11 +65,14 @@ a direct child of it.
 
 ## The canvas
 
-Every object on the canvas — a terminal, a note, a plain-text label — is a
+Every object on the canvas — a terminal, a note, a drawing, a group — is a
 persisted node with a stable id, position, size, z-order, collapsed/locked
-state, and (for terminals) an assigned role. `Drawing` and `Group` exist as
-placeholder node kinds today (creatable from the edit menu's Create section)
-ahead of the milestones that give them real behavior.
+state, and (for terminals) an assigned role.
+
+Add cards with the **+** button in the header (agent/terminal, note, text,
+file tree, browser portal, drawing, group section), `Ctrl+T` for a new
+agent, or **right-click empty canvas** to add one right where you clicked.
+An empty workspace says so and shows how to begin.
 
 Every card works the same way:
 
@@ -77,20 +83,40 @@ Every card works the same way:
   several selected cards moves them all); drag its bottom-right corner to
   resize it.
 - Its title bar only shows its name, status, **collapse** (`⌃`) and
-  **close**. **Right-click the title bar** for everything else: rename,
-  restart, Edit/Preview, save, find, Git actions, "Connect to another
-  card…", lock, duplicate, delete.
-
-**Right-click empty canvas** to create a terminal, note, text or file tree
-right where you clicked.
+  **close** (`✕`, undoable; closing a running terminal asks first, since its
+  process stops). **Right-click the title bar** for everything else:
+  rename, restart, Edit/Preview, save, find, Git actions, "Connect to
+  another card…", lock, duplicate, delete (destructive entries are red).
 
 The mouse wheel over empty canvas zooms around the pointer (`Ctrl+wheel`
 zooms over cards too); on a touchpad, two-finger scroll pans and pinch
-zooms. Drag empty canvas to pan. (The zoom buttons and
-`Ctrl +`/`Ctrl -`/`Ctrl 0` work too.) The edit-menu button (no keyboard accelerator of its own, since a
-focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) holds
-selection, layout (align/distribute), duplicate/copy/paste, undo/redo,
-front/back ordering, lock/collapse, snap-to-grid, and node creation.
+zooms. Drag empty canvas to pan; `Ctrl +`/`Ctrl -`/`Ctrl 0` zoom too. The
+**⋯** menu holds undo/redo, selection commands (lock, collapse,
+front/back, duplicate, copy/paste, delete), arrangement (align,
+distribute), view (zoom, zoom to fit/selection, snap to grid), workspaces,
+roles, accounts, keyboard shortcuts (`Ctrl+?`) and About. None of these
+take a keyboard shortcut of their own: a focused terminal needs
+`Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed.
+
+### Groups
+
+A **group section** is a titled, tinted region that organizes part of the
+canvas ("Backend", "Frontend", ...). It always sits *behind* every card —
+there is no "send to back" to remember — and it is purely visual: cards
+over it aren't its children, moving it doesn't move them, and deleting it
+never deletes them. Drag its title strip to move it and its corner grip to
+resize it; double-click the title to rename; its menu picks one of six
+subtle colors, locks it, or "Select with the cards on it" when you do want
+to move a section together with its contents. Its body is ordinary canvas:
+drag it to pan, right-click it to add a card there. Groups can't be
+connected and aren't agent resources.
+
+### Drawings
+
+A **drawing** is a quick sketch card: pen, eraser (removes the strokes it
+touches), four colors, three widths, undo-last-stroke and clear (asks
+first; undoable from ⋯ → Undo). Strokes are saved as vector data scaled to
+the card, so resizing a drawing stretches it rather than cropping it.
 
 ### Terminals
 
@@ -189,12 +215,27 @@ duetctl file search <query>                        # fuzzy file names
 duetctl file search --content <pattern>            # ripgrep (builtin fallback)
 duetctl file write <path> --revision <rev>         # stdin; refused if the file changed since <rev>
 duetctl git status | diff [path] [--staged|--unstaged] | log [path] [-n N]
-duetctl git stage <path>... | unstage <path>... | discard <path>... --confirm | commit -m "<msg>"
+duetctl git stage <path>...|--all | unstage <path>...|--all | discard <path>... --confirm | commit -m "<msg>"
+duetctl git branches | branch <new> | switch <branch>
+duetctl git fetch | pull | push [--set-upstream]
 duetctl notes attach <note-id> <path>              # sync a note with a Markdown file
 ```
 
-On the canvas, a **File Tree** node (header folder button, or Edit menu →
-New File Tree) browses the project with Git status markers, hidden-file and
+The header's **Git control** shows the current branch with its state at a
+glance — `main ↑2 ↓1 •3` means 2 commits to push, 1 to pull, 3 changed
+files. Click it for the repository's state and the everyday operations:
+Fetch, Pull, Push, Stage All / Unstage All, Commit…, "Show all changes", the
+local branches (click one to switch), and a field to create a branch from
+here. It stays conservative on purpose: **pull is fast-forward only** (never
+a merge or rebase, never an auto-stash), **push never forces**, a branch
+with no upstream is only published after you confirm, and switching
+branches relies on Git's own safety checks — if Git refuses (local changes
+would be overwritten, a conflict), Duet shows Git's reason and changes
+nothing. Fetch, pull and push run in the background with a spinner; the
+indicator refreshes after every Git action and save, and every few seconds
+for changes made elsewhere.
+
+On the canvas, a **File Tree** node (**+** → File Tree) browses the project with Git status markers, hidden-file and
 `.gitignore` toggles, back/forward, fuzzy search, and `>pattern` content
 search; right-click a file to open it, diff/stage/unstage/discard it, copy
 its `@file:` reference, or ask an agent about it. Markdown files open as
@@ -206,8 +247,8 @@ the canvas opens it there.
 
 ### Browser portals (`duetctl portal`)
 
-A **Portal** (right-click the canvas → New browser portal, or Edit menu →
-New Browser Portal) is an embedded WebKit browser with back/forward/reload,
+A **Portal** (right-click the canvas → New browser portal, or **+** →
+Browser Portal) is an embedded WebKit browser with back/forward/reload,
 a URL field and "open in your default browser". Each portal has a name
 (double-click the title to rename) — agents address it as `@portal:<name>`,
 or `@<name>` when that's unambiguous — and its own isolated browser profile
@@ -295,29 +336,37 @@ Because identity is isolated per terminal now, two Codex terminals in the
 same working directory no longer resume/summarize the same underlying Codex
 conversation the way they used to.
 
-## Header-bar actions / accelerators
+## Header bar and shortcuts
 
-| Button / Accelerator | Action |
-|-----------------------|--------|
-| New-session button / `Ctrl+T` | Open the new-session dialog (name, working directory, agent, role, Claude account) |
-| New-note button | Drop a Markdown note at the viewport center |
-| Accounts button / `Ctrl+.` | Open the account manager (list, create, delete Claude accounts) |
-| Roles button / `Ctrl+Shift+R` | Open the role manager (list built-ins, create/edit/delete custom roles) |
-| Edit-menu button | Selection, layout (align/distribute), duplicate/copy/paste, undo/redo, front/back, lock/collapse, snap-to-grid, node creation — no accelerator (a focused terminal needs `Ctrl+Z`/`Ctrl+C`/`Ctrl+A`/`Delete` unshadowed) |
+The header answers four questions and stays out of the way otherwise:
+
+- **Where am I?** — the workspace button (left; click to switch, create or
+  rename) and the project folder under the title.
+- **What repository state am I in?** — the Git control next to it.
+- **How do I add something?** — **+** (right).
+- **Where is everything else?** — **⋯** (right, or `F10`).
+
+| Control / shortcut | Action |
+|--------------------|--------|
+| `Ctrl+T` / **+** → Agent or Terminal… | New-session dialog (name, working directory, agent, role, Claude account) |
+| **+** → Note / Text / File Tree / Browser Portal / Drawing / Group Section | Add that card in the middle of the view |
+| Right-click empty canvas | Add a card at that spot |
+| Git control | Branch, ahead/behind, changes; fetch, pull, push, stage all, commit, branches |
+| Workspace button / `Ctrl+1`..`Ctrl+9` | Switch workspace (dialog, or jump straight to the Nth) |
+| `Ctrl+Shift+R` / ⋯ → Agent Roles… | Role manager |
+| `Ctrl+.` / ⋯ → Claude Accounts… | Account manager |
 | `Ctrl +` / `Ctrl -` / `Ctrl 0` | Zoom in / out / reset |
-| Workspace button / `Ctrl+1`..`Ctrl+9` | Switch workspace (via dialog, or jump straight to the Nth) |
-| Per-card title-bar drag handle | Move just this card (doesn't pan the canvas) |
-| Per-card bottom-right grip | Resize this card |
-| Per-card close button | Remove this card (kills the process, for a terminal) |
-| Right-click a card's title bar | The card's menu (rename, connect, collapse, lock, duplicate, delete, ...) |
-| Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
-| Right-click empty canvas | New terminal / note / text / file tree / browser portal at that spot |
 | Wheel on empty canvas, `Ctrl+wheel` anywhere, pinch | Zoom around the pointer |
 | Two-finger scroll, drag on empty canvas | Pan |
+| Shift-drag on empty canvas | Marquee selection |
+| Drag a card's title bar / corner grip | Move (all selected cards together) / resize |
+| Right-click a card's title bar | The card's menu |
+| Card menu → Connect to another card… | Then click the card to connect to; `Esc` or a click on empty canvas cancels |
+| `Ctrl+?` / ⋯ → Keyboard Shortcuts | Every shortcut, in one window |
 
-Errors (a failed restore, a failed create, account/role operations) surface
-as in-app toasts rather than being printed to the terminal duet was launched
-from.
+Errors surface in the app rather than only on the terminal duet was
+launched from: a failed restore, create, save or account/role operation as a
+toast; a Git operation Git refused as a dialog with Git's own reason.
 
 ## Data locations
 
@@ -338,8 +387,15 @@ from.
 
 ## Known limitations
 
-- `Drawing` and `Group` are placeholder node kinds only — no freehand
-  drawing or containment semantics yet.
+- Switching back to a workspace shows each terminal's output from that
+  point on, not the scrollback it printed while in the background (the
+  process itself keeps running).
+- Groups are visual sections only (no membership, nesting or agent
+  access); drawings are simple vector sketches (no shapes, text, layers or
+  pressure).
+- Git covers the everyday workflow only: no merge-conflict editor, rebase,
+  cherry-pick, stash manager, history graph or force push — use a terminal
+  card for those.
 - Portal profiles are always persistent and isolated per portal; an
   ephemeral profile is representable (`PortalStorage::Ephemeral`) but has no
   UI to choose it yet.
@@ -351,8 +407,10 @@ from.
   depending on the two cards' kinds); there's no UI to edit them yet.
 - No graphical prompt composer — `@` references are resolved by agents
   through `duetctl resolve` and the `duet` skill.
-- No floors (git-isolated parallel work), reusable arrangements ("Scores"),
-  or cross-workspace search yet.
+- Post-1.0 (not release blockers): terminal/chat dual views, floors
+  (git-isolated parallel work), reusable arrangements ("Scores"), a command
+  palette and attention queue, routines, SSH/Docker environments and remote
+  control.
 
 The original design rationale (predating the orchestration work above) is in
 [`docs/superpowers/specs/`](docs/superpowers/specs/).

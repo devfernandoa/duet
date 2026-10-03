@@ -29,6 +29,8 @@ pub struct PortalNode {
     pub external_button: gtk4::Button,
     /// Where the runtime's `WebView` is placed.
     web_slot: gtk4::Box,
+    /// Shown over a portal that has no page yet.
+    empty_hint: gtk4::Box,
 }
 
 fn tool_button(icon: &str, tooltip: &str) -> gtk4::Button {
@@ -97,9 +99,29 @@ impl PortalNode {
         web_slot.set_vexpand(true);
         web_slot.set_overflow(gtk4::Overflow::Hidden);
 
+        let empty_hint = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        empty_hint.set_halign(gtk4::Align::Center);
+        empty_hint.set_valign(gtk4::Align::Center);
+        empty_hint.set_can_target(false);
+        empty_hint.add_css_class("portal-empty-hint");
+        let hint_icon = gtk4::Image::from_icon_name("web-browser-symbolic");
+        hint_icon.set_pixel_size(32);
+        let hint_text = gtk4::Label::new(Some(
+            "Type a URL above — e.g. localhost:3000.\n\
+             Connect an agent to this portal to let it browse and test here.",
+        ));
+        hint_text.set_justify(gtk4::Justification::Center);
+        hint_text.set_wrap(true);
+        empty_hint.append(&hint_icon);
+        empty_hint.append(&hint_text);
+        empty_hint.set_visible(url.trim().is_empty());
+        let page = gtk4::Overlay::new();
+        page.set_child(Some(&web_slot));
+        page.add_overlay(&empty_hint);
+
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content.append(&toolbar);
-        content.append(&web_slot);
+        content.append(&page);
         content.set_size_request(320, 240);
 
         let resize_handle = resize_handle();
@@ -135,6 +157,7 @@ impl PortalNode {
             url_entry,
             external_button,
             web_slot,
+            empty_hint,
         }
     }
 
@@ -164,6 +187,10 @@ impl PortalNode {
     pub fn show_url(&self, url: &str) {
         if !self.url_entry.has_focus() && self.url_entry.text() != url {
             self.url_entry.set_text(url);
+        }
+        let blank = url.trim().is_empty() || url == "about:blank";
+        if self.empty_hint.is_visible() != blank {
+            self.empty_hint.set_visible(blank);
         }
     }
 
