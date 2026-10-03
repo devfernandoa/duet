@@ -179,15 +179,31 @@ pub fn default_accounts_dir() -> anyhow::Result<PathBuf> {
 /// `accounts/<name>`, which several concurrent terminals can safely share).
 /// Codex's local app-server daemon treats a `CODEX_HOME` as home to at most
 /// one live interactive session at a time; two Codex terminals sharing one
-/// fail with "already running in another app". The trade-off is that a
-/// brand-new Codex terminal needs its own `codex login` — see `agent.rs`'s
-/// `codex_launch` doc comment.
+/// fail with "already running in another app". `auth.json` inside this
+/// directory is a symlink into `default_codex_auth_dir` (see
+/// `app::ensure_codex_home`), not a real file of its own, so logging in
+/// from any one Codex terminal authenticates every other one too — only
+/// the daemon/session state is actually isolated per terminal.
 pub fn default_codex_home_dir(terminal_id: Uuid) -> anyhow::Result<PathBuf> {
     let dir = dirs::data_dir()
         .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?
         .join("duet")
         .join("codex")
         .join(terminal_id.to_string());
+    Ok(dir)
+}
+
+/// Where every Codex terminal's `auth.json` symlink points — one shared
+/// login for the whole `duet` install, the Codex analogue of Claude's
+/// `accounts/default`. Codex has no named-account concept of its own yet,
+/// so unlike `default_accounts_dir` this is a single fixed directory, not
+/// one joined with a user-chosen name.
+pub fn default_codex_auth_dir() -> anyhow::Result<PathBuf> {
+    let dir = dirs::data_dir()
+        .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?
+        .join("duet")
+        .join("codex-auth")
+        .join("default");
     Ok(dir)
 }
 
