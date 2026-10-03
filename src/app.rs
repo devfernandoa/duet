@@ -106,6 +106,10 @@ const MESSAGE_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 /// before the press becomes a move.
 const DRAG_THRESHOLD: f64 = 4.0;
 
+/// Height of a Group's title strip (its only card-like surface), in world
+/// units — see `style.css`'s `.group-title-bar`.
+const GROUP_TITLE_HEIGHT: f64 = 36.0;
+
 /// Offset applied to a duplicated or pasted node so it doesn't land exactly
 /// on top of its source.
 const DUPLICATE_OFFSET: (f64, f64) = (32.0, 32.0);
@@ -493,6 +497,11 @@ impl App {
     /// The window's toast overlay (see `set_toast_overlay`).
     pub fn toaster(app: &Rc<RefCell<App>>) -> adw::ToastOverlay {
         app.borrow().toast_overlay.clone()
+    }
+
+    /// Shows the canvas's "this workspace is empty" hint exactly when it is.
+    pub fn refresh_empty_hint(&self) {
+        self.canvas.set_empty_hint_visible(self.nodes.is_empty());
     }
 
     /// Shows `message` as a toast.
@@ -2118,6 +2127,15 @@ impl App {
     /// the connect gesture actually do what it visually promises.
     pub fn create_edge(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
         let mut app = app.borrow_mut();
+        // Groups are visual sections: never an endpoint of a connection.
+        let is_group = |id: &Uuid| {
+            app.nodes
+                .get(id)
+                .is_some_and(|e| e.record.kind.is_background())
+        };
+        if is_group(&source) || is_group(&target) {
+            return false;
+        }
         if source != target
             && app.nodes.contains_key(&source)
             && app.nodes.contains_key(&target)
@@ -2239,17 +2257,20 @@ impl App {
     /// which should discard whatever was selected).
     pub fn covers_point(&self, world: (f64, f64)) -> bool {
         // A Group's body is canvas, not a card: clicks there act on the
-        // canvas (deselect, link hit-test, right-click create menu).
-        self.nodes
-            .values()
-            .filter(|entry| !entry.record.kind.is_background())
-            .any(|entry| {
-                let (position, size) = (entry.record.position, entry.record.size);
-                world.0 >= position.0
-                    && world.0 <= position.0 + size.0
-                    && world.1 >= position.1
-                    && world.1 <= position.1 + size.1 + TITLE_BAR_HEIGHT
-            })
+        // canvas (deselect, link hit-test, right-click create menu). Its
+        // title strip is the group's own surface, like a card's.
+        self.nodes.values().any(|entry| {
+            let (position, size) = (entry.record.position, entry.record.size);
+            let bottom = if entry.record.kind.is_background() {
+                position.1 + GROUP_TITLE_HEIGHT
+            } else {
+                position.1 + size.1 + TITLE_BAR_HEIGHT
+            };
+            world.0 >= position.0
+                && world.0 <= position.0 + size.0
+                && world.1 >= position.1
+                && world.1 <= bottom
+        })
     }
 
     /// Click-to-select, click-again-to-delete for edge lines. A click that
@@ -2743,6 +2764,7 @@ impl App {
         if let Some(entry) = removed {
             canvas.remove_node(entry.widget.container());
         }
+        app.borrow().refresh_empty_hint();
         let _ = app.borrow().persist();
     }
 
@@ -3454,14 +3476,32 @@ impl App {
                 }
             }
             CanvasCommand::SetProperties { before, after } => {
-                let records = if inverse { before } else { after };
+                let (records, others) = if inverse {
+                    (before, after)
+                } else {
+                    (after, before)
+                };
                 let mut app_mut = app.borrow_mut();
                 for record in records {
-                    if let Some(entry) = app_mut.nodes.get_mut(&record.id) {
-                        entry.record = record.clone();
-                        entry.widget.set_collapsed(entry.record.collapsed);
+                    let Some(entry) = app_mut.nodes.get_mut(&record.id) else {
+                        continue;
+                    };
+                    // Only what this command changed: restoring the whole
+                    // snapshot would also roll back everything edited since
+                    // (a drawing's later strokes, a note's later text).
+                    let other = others.iter().find(|o| o.id == record.id);
+                    let changed = |same: bool| other.is_none() || !same;
+                    if changed(other.is_some_and(|o| o.collapsed == record.collapsed)) {
+                        entry.record.collapsed = record.collapsed;
+                    }
+                    if changed(other.is_some_and(|o| o.locked == record.locked)) {
+                        entry.record.locked = record.locked;
+                    }
+                    if changed(other.is_some_and(|o| o.kind == record.kind)) {
+                        entry.record.kind = record.kind.clone();
                         entry.widget.sync_payload(&entry.record.kind);
                     }
+                    entry.widget.set_collapsed(entry.record.collapsed);
                 }
             }
         }
@@ -3886,53 +3926,61 @@ fn wire_rename(
     id: Uuid,
     toast_overlay: &adw::ToastOverlay,
 ) {
-    // Double-click, not single: a single press on the title starts a drag
-    // of the card (the whole title bar is its handle).
+    let app = Rc::clone(app);
+    let toast_overlay = toast_overlay.clone();
+    wire_inline_rename(&node.title_label, &node.title_entry, move |name| {
+        App::rename_session(&app, id, name).map_err(|error| {
+            toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
+        })
+    });
+}
+
+/// The shared inline-rename gesture for a card title: double-click the
+/// label (a single press starts a drag of the card — the whole title bar is
+/// its handle) to edit it in `entry`; Enter calls `commit` and closes the
+/// field when it succeeds (on failure it stays open — `commit` reports why);
+/// Escape closes it without saving.
+fn wire_inline_rename(
+    label: &gtk4::Label,
+    entry: &gtk4::Entry,
+    commit: impl Fn(&str) -> Result<(), ()> + 'static,
+) {
     let click = gtk4::GestureClick::new();
     click.connect_pressed({
-        let label = node.title_label.clone();
-        let entry = node.title_entry.clone();
+        let label = label.clone();
+        let entry = entry.clone();
         move |_gesture, n_press, _x, _y| {
             if n_press == 2 {
                 crate::node::set_renaming(&label, &entry, true);
             }
         }
     });
-    node.title_label.add_controller(click);
+    label.add_controller(click);
 
     let finish = {
-        let label = node.title_label.clone();
-        let entry = node.title_entry.clone();
+        let label = label.clone();
+        let entry = entry.clone();
         move || crate::node::set_renaming(&label, &entry, false)
     };
-
-    node.title_entry.connect_activate({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
+    entry.connect_activate({
         let finish = finish.clone();
         move |entry| {
-            if let Err(error) = App::rename_session(&app, id, &entry.text()) {
-                toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
-                return;
+            if commit(&entry.text()).is_ok() {
+                finish();
             }
-            finish();
         }
     });
-
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    keys.connect_key_pressed({
-        let finish = finish.clone();
-        move |_controller, key, _code, _modifiers| {
-            if key == gtk4::gdk::Key::Escape {
-                finish();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
+    keys.connect_key_pressed(move |_controller, key, _code, _modifiers| {
+        if key == gtk4::gdk::Key::Escape {
+            finish();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
         }
     });
-    node.title_entry.add_controller(keys);
+    entry.add_controller(keys);
 }
 
 /// Whether Ctrl or Shift is held in a gesture's current event — the
@@ -4448,6 +4496,7 @@ fn materialize_node(
         },
     );
     wire_node_chrome(app, id);
+    app.borrow().refresh_empty_hint();
     Ok(())
 }
 
@@ -4477,6 +4526,7 @@ fn spawn_workspace_contents(
         }
     }
     app.borrow_mut().edges = edges;
+    app.borrow().refresh_empty_hint();
     errors
 }
 
@@ -4751,50 +4801,14 @@ fn confirm_clear_drawing(app: &Rc<RefCell<App>>, id: Uuid) {
     dialog.present();
 }
 
-/// Double-click a Group's title to rename it; Enter commits, Escape or
-/// leaving the field cancels.
+/// Double-click a Group's title to rename it (see `wire_inline_rename`).
 fn wire_group_rename(app: &Rc<RefCell<App>>, node: &GroupNode, id: Uuid) {
-    let click = gtk4::GestureClick::new();
-    click.connect_pressed({
-        let label = node.title_label.clone();
-        let entry = node.title_entry.clone();
-        move |_gesture, n_press, _x, _y| {
-            if n_press == 2 {
-                crate::node::set_renaming(&label, &entry, true);
-            }
-        }
+    let app = Rc::clone(app);
+    wire_inline_rename(&node.title_label, &node.title_entry, move |text| {
+        App::update_group(&app, id, Some(text), None).map_err(|error| {
+            App::notify(&app, &error);
+        })
     });
-    node.title_label.add_controller(click);
-    let finish = {
-        let label = node.title_label.clone();
-        let entry = node.title_entry.clone();
-        move || crate::node::set_renaming(&label, &entry, false)
-    };
-    node.title_entry.connect_activate({
-        let app = Rc::clone(app);
-        let finish = finish.clone();
-        move |entry| {
-            let text = entry.text().to_string();
-            finish();
-            if let Err(error) = App::update_group(&app, id, Some(&text), None) {
-                App::notify(&app, &error);
-            }
-        }
-    });
-    let keys = gtk4::EventControllerKey::new();
-    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    keys.connect_key_pressed({
-        let finish = finish.clone();
-        move |_controller, key, _code, _modifiers| {
-            if key == gtk4::gdk::Key::Escape {
-                finish();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        }
-    });
-    node.title_entry.add_controller(keys);
 }
 
 #[cfg(test)]
@@ -5801,6 +5815,9 @@ mod tests {
         // Its body is canvas: a point inside it but on no card is empty.
         assert!(!app.borrow().covers_point((700.0, 450.0)));
         assert!(app.borrow().covers_point((150.0, 150.0)));
+        // ...but its title strip is its own surface (a click there selects
+        // it rather than falling through and deselecting).
+        assert!(app.borrow().covers_point((600.0, 60.0)));
 
         // A marquee over the cards doesn't pick up the section around them;
         // one around the whole section does.
@@ -5822,6 +5839,10 @@ mod tests {
         App::start_link(&app, note);
         let message = App::complete_link_if_pending(&app, group).unwrap();
         assert!(message.contains("can't be connected"), "{message}");
+        assert!(app.borrow().edges.is_empty());
+        // Enforced by the shared service, not just the GUI gesture.
+        assert!(!App::create_edge(&app, note, group));
+        assert!(!App::create_edge(&app, group, drawing));
         assert!(app.borrow().edges.is_empty());
         let labels: Vec<String> = node_menu_items(&app, group)
             .into_iter()
@@ -5913,6 +5934,51 @@ mod tests {
         };
         assert_eq!(strokes(&app), vec![stroke.clone()]);
         assert_eq!(node.strokes(), vec![stroke.clone()]);
+
+        // Undoing an unrelated property change (a lock) must not roll the
+        // strokes back to the lock's snapshot.
+        App::select_only(&app, drawing);
+        App::set_selected_locked(&app, true);
+        let later = crate::model::Stroke {
+            color: crate::drawing::PEN_COLORS[2].to_string(),
+            width: 2.0,
+            points: vec![(0.2, 0.8), (0.6, 0.9)],
+        };
+        node.commit_strokes(vec![stroke.clone(), later.clone()]);
+        let toast_early = adw::ToastOverlay::new();
+        App::undo(&app, &toast_early);
+        assert!(!app.borrow().nodes[&drawing].record.locked);
+        assert_eq!(strokes(&app), vec![stroke.clone(), later.clone()]);
+        assert_eq!(node.strokes(), vec![stroke.clone(), later.clone()]);
+        node.commit_strokes(vec![stroke.clone()]);
+
+        // A damaged stroke (e.g. from a newer version) is kept, not dropped
+        // by the next edit.
+        let damaged = crate::model::Stroke {
+            color: "chartreuse".to_string(),
+            width: 2.0,
+            points: vec![(0.5, 0.5)],
+        };
+        let other = App::add_simple_node(
+            &app,
+            NodeKind::Drawing(crate::model::DrawingPayload {
+                strokes: vec![damaged.clone()],
+            }),
+            (900.0, 900.0),
+            (300.0, 200.0),
+        );
+        let other_node = match &app.borrow().nodes[&other].widget {
+            NodeWidget::Drawing(node) => node.clone(),
+            _ => unreachable!(),
+        };
+        let mut edited = other_node.strokes();
+        edited.push(stroke.clone());
+        other_node.commit_strokes(edited);
+        assert!(matches!(
+            &app.borrow().nodes[&other].record.kind,
+            NodeKind::Drawing(d) if d.strokes == vec![damaged.clone(), stroke.clone()]
+        ));
+        App::request_delete(&app, vec![other]);
 
         App::clear_drawing(&app, drawing);
         assert!(strokes(&app).is_empty());

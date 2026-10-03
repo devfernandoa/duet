@@ -522,10 +522,9 @@ fn fill_git_popover(app: &Rc<RefCell<App>>, popover: &gtk4::Popover, window: &gt
         show.connect_clicked({
             let app = Rc::clone(app);
             let popover = popover.clone();
-            let window = window.clone();
             move |_| {
                 popover.popdown();
-                let position = viewport_center(&app, &window);
+                let position = centered_in_view(&app, (640.0, 480.0));
                 if let Err(error) = App::open_editor(
                     &app,
                     &crate::project::path::ProjectPath::root(),
@@ -647,11 +646,17 @@ fn fill_git_popover(app: &Rc<RefCell<App>>, popover: &gtk4::Popover, window: &gt
     popover.set_child(Some(&content));
 }
 
-fn viewport_center(app: &Rc<RefCell<App>>, window: &gtk4::Window) -> (f64, f64) {
-    let (width, height) = (window.width().max(1) as f64, window.height().max(1) as f64);
+/// Top-left for a `size` card centered in the canvas view.
+fn centered_in_view(app: &Rc<RefCell<App>>, size: (f64, f64)) -> (f64, f64) {
     let app_ref = app.borrow();
+    let fixed = &app_ref.canvas.fixed;
+    let (width, height) = (fixed.width().max(1) as f64, fixed.height().max(1) as f64);
     let state = app_ref.canvas.state.borrow();
-    crate::canvas::screen_to_world((width / 2.0, height / 2.0), state.pan, state.zoom)
+    let center = crate::canvas::screen_to_world((width / 2.0, height / 2.0), state.pan, state.zoom);
+    (
+        center.0 - size.0 / 2.0,
+        center.1 - (size.1 + crate::canvas::TITLE_BAR_HEIGHT) / 2.0,
+    )
 }
 
 /// Starts a remote operation from the GUI and reports the outcome: a toast
@@ -660,13 +665,14 @@ fn viewport_center(app: &Rc<RefCell<App>>, window: &gtk4::Window) -> (f64, f64) 
 pub fn run_remote_op(app: &Rc<RefCell<App>>, op: RemoteOp, window: &gtk4::Window) {
     let app_c = Rc::clone(app);
     let window_c = window.clone();
+    let root = app.borrow().workspace_root.clone();
     App::git_remote(
         app,
         op,
         Box::new(move |outcome| match outcome {
             Ok(outcome) => App::notify(&app_c, &outcome.message),
             Err(GitError::UpstreamRequired(target)) => {
-                confirm_publish(&app_c, &target, &window_c);
+                confirm_publish(&app_c, &target, root.clone(), &window_c);
             }
             Err(error) => {
                 let title = match op {
@@ -680,7 +686,15 @@ pub fn run_remote_op(app: &Rc<RefCell<App>>, op: RemoteOp, window: &gtk4::Window
     );
 }
 
-fn confirm_publish(app: &Rc<RefCell<App>>, target: &PushTarget, window: &gtk4::Window) {
+/// Asks before publishing `target`. The answer only applies to the
+/// repository and branch it was asked about: if the workspace (`root`) or
+/// its branch changed while the dialog was open, nothing is pushed.
+fn confirm_publish(
+    app: &Rc<RefCell<App>>,
+    target: &PushTarget,
+    root: std::path::PathBuf,
+    window: &gtk4::Window,
+) {
     let dialog = adw::MessageDialog::new(
         Some(window),
         Some(&format!("Publish {}?", target.branch)),
@@ -697,10 +711,26 @@ fn confirm_publish(app: &Rc<RefCell<App>>, target: &PushTarget, window: &gtk4::W
     dialog.connect_response(None, {
         let app = Rc::clone(app);
         let window = window.clone();
+        let branch = target.branch.clone();
         move |_, response| {
-            if response == "publish" {
-                run_remote_op(&app, RemoteOp::Push { set_upstream: true }, &window);
+            if response != "publish" {
+                return;
             }
+            let (same_root, current_branch) = {
+                let app_ref = app.borrow();
+                (
+                    app_ref.workspace_root == root,
+                    app_ref.git_status().ok().and_then(|s| s.branch),
+                )
+            };
+            if !same_root || current_branch.as_deref() != Some(branch.as_str()) {
+                App::notify(
+                    &app,
+                    &format!("Not published: the workspace or branch changed since you asked to push {branch}"),
+                );
+                return;
+            }
+            run_remote_op(&app, RemoteOp::Push { set_upstream: true }, &window);
         }
     });
     dialog.present();

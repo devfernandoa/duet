@@ -274,6 +274,7 @@ fn build_ui(application: &adw::Application) {
     // Restore after the toast overlay exists: `restore`'s own load/spawn
     // errors are toasted below, and card menus report through it too.
     let mut errors = App::restore(&app, &toast_overlay);
+    app.borrow().refresh_empty_hint();
     sync_workspace_button(&workspace_label, &app);
     // Writes back immediately rather than waiting for the first edit, so a
     // migration from an older single-canvas store.json (see `store::Store`'s
@@ -433,9 +434,10 @@ fn build_ui(application: &adw::Application) {
     more_button.set_menu_model(Some(&menus.more));
     wire_help_actions(application, &window);
 
-    // The project folder under the title, kept current across workspace
-    // switches; and the empty-workspace hint.
-    glib::timeout_add_local(Duration::from_millis(500), {
+    // The project folder under the title. Workspace activation notifies
+    // the Git listeners (a new workspace may be a new repository), which is
+    // exactly when this can change.
+    let update_subtitle: Rc<dyn Fn()> = Rc::new({
         let app = app.clone();
         let window_title = window_title.clone();
         move || {
@@ -448,16 +450,17 @@ fn build_ui(application: &adw::Application) {
             };
             if window_title.subtitle() != shown {
                 window_title.set_subtitle(&shown);
-                window_title.set_tooltip_text(Some(&format!(
-                    "Workspace {} in {shown}",
-                    app_ref.workspace_name
-                )));
             }
-            app_ref
-                .canvas
-                .set_empty_hint_visible(app_ref.nodes.is_empty());
-            glib::ControlFlow::Continue
+            window_title.set_tooltip_text(Some(&format!(
+                "Workspace {} in {shown}",
+                app_ref.workspace_name
+            )));
         }
+    });
+    update_subtitle();
+    app.borrow_mut().connect_git_state_changed({
+        let update_subtitle = Rc::clone(&update_subtitle);
+        move || update_subtitle()
     });
 
     window.present();

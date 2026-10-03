@@ -100,8 +100,8 @@ pub fn erase_at(strokes: &mut Vec<Stroke>, point: (f64, f64), size: (f64, f64)) 
 }
 
 /// Whether a persisted stroke is usable: a known-good color, a sane width
-/// and points inside the unit square. Used to drop damaged strokes on load
-/// rather than paint garbage.
+/// and points inside the unit square. A damaged stroke is not painted, but
+/// it is kept in the drawing's data (never silently discarded).
 pub fn is_valid(stroke: &Stroke) -> bool {
     stroke.width.is_finite()
         && stroke.width > 0.0

@@ -249,6 +249,12 @@ impl<'a> GitService<'a> {
         } else {
             vec!["-c", "core.quotepath=false"]
         };
+        // A status read (polled by the header every few seconds) must never
+        // take `index.lock` — that could make a concurrent pull or switch
+        // fail with "index.lock exists".
+        if args.first() == Some(&"status") {
+            full.insert(0, "--no-optional-locks");
+        }
         full.extend_from_slice(args);
         self.project
             .run("git", &full, stdin)
@@ -279,6 +285,15 @@ impl<'a> GitService<'a> {
     fn prefix(&self) -> Result<String, GitError> {
         let output = self.run_ok(&["rev-parse", "--show-prefix"])?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn head_hash(&self) -> Option<String> {
+        let output = self
+            .run(&["rev-parse", "--verify", "--quiet", "HEAD"], None)
+            .ok()?;
+        output
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     fn has_head(&self) -> bool {
@@ -553,6 +568,7 @@ impl<'a> GitService<'a> {
                 "resolve the merge conflicts before pulling".to_string(),
             ));
         }
+        let head_before = self.head_hash();
         self.run_ok(&[
             "pull",
             "--ff-only",
@@ -572,20 +588,28 @@ impl<'a> GitService<'a> {
             }
             other => friendly_failure(other),
         })?;
-        let after = self.status()?;
-        let message = if status.behind == 0 {
+        // Counted from HEAD itself, not the pre-pull `behind`: the pull
+        // fetched first, so that number may have been stale.
+        let pulled = match (head_before, self.head_hash()) {
+            (Some(before), Some(after)) if before != after => self
+                .run_ok(&["rev-list", "--count", &format!("{before}..{after}")])
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .unwrap_or(1),
+            _ => 0,
+        };
+        let message = if pulled == 0 {
             format!("{branch} is already up to date with {upstream}")
         } else {
             format!(
-                "Pulled {} commit{} into {branch}",
-                status.behind,
-                if status.behind == 1 { "" } else { "s" }
+                "Pulled {pulled} commit{} into {branch}",
+                if pulled == 1 { "" } else { "s" }
             )
-        };
-        let message = if after.behind > 0 {
-            format!("{message} ({} still behind)", after.behind)
-        } else {
-            message
         };
         Ok(GitSyncOutcome { message })
     }
@@ -1222,6 +1246,20 @@ pub(crate) mod tests {
         assert!(pulled.message.contains("Pulled 1 commit"), "{pulled:?}");
         assert_eq!(work.read(&p("a.txt")).unwrap(), b"two\n");
         assert_eq!(git_service.status().unwrap().behind, 0);
+
+        // Pull without fetching first: the stale `behind` is 0, but the
+        // message counts what was actually pulled.
+        for n in ["three", "four"] {
+            std::fs::write(seed.root().join("a.txt"), format!("{n}\n")).unwrap();
+            git(seed.root(), &["commit", "-q", "-am", n]);
+        }
+        git(seed.root(), &["push", "-q"]);
+        assert_eq!(git_service.status().unwrap().behind, 0);
+        let pulled = git_service.pull().unwrap();
+        assert!(pulled.message.contains("Pulled 2 commits"), "{pulled:?}");
+        assert_eq!(work.read(&p("a.txt")).unwrap(), b"four\n");
+        let again = git_service.pull().unwrap();
+        assert!(again.message.contains("already up to date"), "{again:?}");
 
         // A local commit: ahead 1, push sends it.
         work.write(&p("b.txt"), b"local\n").unwrap();

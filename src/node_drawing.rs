@@ -110,12 +110,10 @@ impl DrawingNode {
         title_bar.append(&close_button);
         as_drag_handle(&title_bar);
 
-        let strokes = Rc::new(RefCell::new(
-            strokes
-                .into_iter()
-                .filter(drawing::is_valid)
-                .collect::<Vec<_>>(),
-        ));
+        // Every stroke is kept, even one that fails `drawing::is_valid`
+        // (hand-edited, or from a newer version): it's skipped when
+        // painting, never dropped from the persisted drawing.
+        let strokes = Rc::new(RefCell::new(strokes));
         let tool = Rc::new(Cell::new(DrawingTool::Pen));
         let color = Rc::new(RefCell::new(PEN_COLORS[0].to_string()));
         let width = Rc::new(Cell::new(PEN_WIDTHS[0]));
@@ -220,7 +218,7 @@ impl DrawingNode {
                 let size = (width as f64, height as f64);
                 cr.set_line_cap(gtk4::cairo::LineCap::Round);
                 cr.set_line_join(gtk4::cairo::LineJoin::Round);
-                for stroke in strokes.borrow().iter() {
+                for stroke in strokes.borrow().iter().filter(|s| drawing::is_valid(s)) {
                     paint_stroke(cr, stroke, size);
                 }
             });
