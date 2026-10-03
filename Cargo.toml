@@ -3,7 +3,7 @@ name = "duet"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A TUI for running claude and codex in named, persistent tabs with agent-switch handoff"
+description = "A GTK4 desktop app for running and orchestrating multiple AI coding agents on a persistent canvas"
 repository = "https://github.com/devfernandoa/duet"
 
 [dependencies]
