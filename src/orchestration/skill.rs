@@ -139,6 +139,9 @@ path-shaped reference without a qualifier, like `@src/auth.rs` or
    (`@file:src/auth.rs#L10-20`, `@diff:src/auth.rs`), not pasted content —
    the receiving agent resolves it itself.
 5. `duetctl notes attach <note-id> <path>` syncs a note with a Markdown file.
+6. `duetctl whoami` lists the files and folders the user connected to you on
+   the canvas ("connected files") — start from those when a task is vague
+   about which code it means.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)

@@ -97,6 +97,10 @@ const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 /// distinct keystroke instead.
 const MESSAGE_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
+/// How far (screen pixels) the pointer must travel on a card's title bar
+/// before the press becomes a move.
+const DRAG_THRESHOLD: f64 = 4.0;
+
 /// Offset applied to a duplicated or pasted node so it doesn't land exactly
 /// on top of its source.
 const DUPLICATE_OFFSET: (f64, f64) = (32.0, 32.0);
@@ -181,20 +185,20 @@ impl NodeWidget {
     /// `NoteNode::refresh_preview_after_resize`'s doc comment for why a
     /// resize needs that); every other kind just requests a widget size.
     fn apply_resize(&self, size: (f64, f64)) {
+        let (width, height) = (size.0 as i32, size.1 as i32);
         match self {
             NodeWidget::Terminal(node) => node.request_grid(size.0, size.1),
             NodeWidget::Note(node) => {
-                self.container()
-                    .set_size_request(size.0 as i32, size.1 as i32);
+                node.collapse.set_card_size(width, height);
                 node.refresh_preview_after_resize();
             }
-            NodeWidget::Text(_)
-            | NodeWidget::FileTree(_)
-            | NodeWidget::Editor(_)
-            | NodeWidget::Placeholder(_) => {
-                self.container()
-                    .set_size_request(size.0 as i32, size.1 as i32);
-            }
+            // Through the collapse handle, not straight onto the container:
+            // a collapsed card keeps only its width, or hiding its body
+            // couldn't shrink it to the title bar.
+            NodeWidget::Text(node) => node.collapse.set_card_size(width, height),
+            NodeWidget::FileTree(node) => node.collapse.set_card_size(width, height),
+            NodeWidget::Editor(node) => node.collapse.set_card_size(width, height),
+            NodeWidget::Placeholder(node) => node.collapse.set_card_size(width, height),
         }
     }
 
@@ -325,9 +329,13 @@ pub struct App {
     /// runtime event, not workspace state, the same reasoning that keeps
     /// `runtime: SessionRuntime` out of `store::WorkspaceRecord`.
     pub bus: MessageBus,
-    /// Set while the user has clicked a node's link button and is waiting to
-    /// click a target node to complete the edge. `None` otherwise.
+    /// Set while "Connect to another card…" waits for the user to click the
+    /// target card that completes the edge. `None` otherwise.
     pub pending_edge_source: Option<Uuid>,
+    /// The "click the card to connect to" hint shown while
+    /// `pending_edge_source` is set, dismissed as soon as link mode ends so
+    /// the outcome's own toast shows immediately instead of queueing behind it.
+    link_hint: Option<adw::Toast>,
     /// The edge id the user clicked on the canvas, highlighted and armed so
     /// a second click on it deletes it. `None` when nothing is selected.
     pub selected_edge: Option<Uuid>,
@@ -355,6 +363,10 @@ pub struct App {
     /// Counts `sync_project_files` calls, so slower work (FileTree
     /// refreshes) can run every few ticks.
     sync_tick: u32,
+    /// Where card menus and other in-canvas actions report to the user.
+    /// A detached overlay until `main.rs` hands over the window's real one
+    /// (`set_toast_overlay`), so tests and headless paths can still toast.
+    toast_overlay: adw::ToastOverlay,
 }
 
 impl App {
@@ -382,6 +394,7 @@ impl App {
             edges: Vec::new(),
             bus: MessageBus::new(),
             pending_edge_source: None,
+            link_hint: None,
             selected_edge: None,
             selected: HashSet::new(),
             clipboard: Vec::new(),
@@ -392,7 +405,22 @@ impl App {
             file_sync: HashMap::new(),
             tree_state: HashMap::new(),
             sync_tick: 0,
+            toast_overlay: adw::ToastOverlay::new(),
         }))
+    }
+
+    pub fn set_toast_overlay(&mut self, toast_overlay: &adw::ToastOverlay) {
+        self.toast_overlay = toast_overlay.clone();
+    }
+
+    /// The window's toast overlay (see `set_toast_overlay`).
+    pub fn toaster(app: &Rc<RefCell<App>>) -> adw::ToastOverlay {
+        app.borrow().toast_overlay.clone()
+    }
+
+    /// Shows `message` as a toast.
+    pub fn notify(app: &Rc<RefCell<App>>, message: &str) {
+        App::toaster(app).add_toast(adw::Toast::new(message));
     }
 
     /// Debounces `persist()` so a burst of rapid-fire events (e.g. every
@@ -1030,6 +1058,10 @@ impl App {
                     NodeKind::Terminal(terminal) => terminal.name.clone(),
                     NodeKind::Note(note) => orchestration::notes::note_title(&note.markdown),
                     NodeKind::Editor(editor) => editor.path.clone(),
+                    NodeKind::FileTree(tree) if tree.root.is_empty() => {
+                        "project folder".to_string()
+                    }
+                    NodeKind::FileTree(tree) => format!("{}/", tree.root),
                     _ => entry.record.kind.label().to_string(),
                 })
                 .unwrap_or_else(|| "?".to_string())
@@ -1794,14 +1826,15 @@ impl App {
     /// longer names a live node. Returns whether a new edge was recorded.
     ///
     /// Two `Terminal` nodes get `SendMessages` by default; a `Terminal` and
-    /// a `Note` get both `ReadNote` and `WriteNote`; a `Note` and a `Note`
+    /// a `Note` get both `ReadNote` and `WriteNote`; a `Terminal` and an
+    /// `Editor`/`FileTree` get `ShareContext` (the file shows up in the
+    /// agent's `whoami`); a `Note` and a `Note`
     /// get neither (there's no agent on either side for a capability to be
     /// granted *to* — the edge is still recorded and discoverable via
     /// `App::note_connections`, just visual/structural rather than
     /// permission-bearing). The Terminal/Terminal and Terminal/Note defaults
-    /// exist for the same reason: today's only edge-creation gesture (the
-    /// link button, now on both `SessionNode` and `NoteNode` — Milestone 4
-    /// generalized it per `model.rs`'s `EdgeRecord` doc comment) has no
+    /// exist for the same reason: today's only edge-creation gesture (a card
+    /// menu's "Connect to another card…", available on every kind) has no
     /// capability-picker UI to grant anything more deliberately, so a
     /// connection that didn't default to *some* capability would be visually
     /// drawn but functionally inert, including for Milestone 4's own
@@ -1836,6 +1869,11 @@ impl App {
                 .nodes
                 .get(&target)
                 .is_some_and(|e| e.record.as_note().is_some());
+            let is_file_view = |id: Uuid| {
+                app.nodes.get(&id).is_some_and(|e| {
+                    matches!(e.record.kind, NodeKind::Editor(_) | NodeKind::FileTree(_))
+                })
+            };
             if source_is_terminal && target_is_terminal {
                 edge.capabilities.insert(EdgeCapability::SendMessages);
             } else if (source_is_terminal && target_is_note)
@@ -1843,6 +1881,12 @@ impl App {
             {
                 edge.capabilities.insert(EdgeCapability::ReadNote);
                 edge.capabilities.insert(EdgeCapability::WriteNote);
+            } else if (source_is_terminal && is_file_view(target))
+                || (is_file_view(source) && target_is_terminal)
+            {
+                // A file or folder handed to an agent: it shows up in the
+                // agent's `duetctl whoami` as context to start from.
+                edge.capabilities.insert(EdgeCapability::ShareContext);
             }
             app.edges.push(edge.clone());
             app.undo_stack.push(CanvasCommand::AddEdge { edge });
@@ -1983,10 +2027,87 @@ impl App {
         app.borrow().refresh_link_highlight();
     }
 
+    /// `start_link` plus the on-screen hint for what to do next.
+    pub fn start_link_with_hint(app: &Rc<RefCell<App>>, source: Uuid) {
+        App::start_link(app, source);
+        let hint = adw::Toast::new("Click the card to connect to · Esc to cancel");
+        hint.set_timeout(0);
+        App::toaster(app).add_toast(hint.clone());
+        if let Some(old) = app.borrow_mut().link_hint.replace(hint) {
+            old.dismiss();
+        }
+    }
+
+    fn dismiss_link_hint(app: &Rc<RefCell<App>>) {
+        let hint = app.borrow_mut().link_hint.take();
+        if let Some(hint) = hint {
+            hint.dismiss();
+        }
+    }
+
+    /// Leaves link mode without connecting anything. Returns whether link
+    /// mode was active.
+    pub fn cancel_link(app: &Rc<RefCell<App>>) -> bool {
+        let was_pending = app.borrow_mut().pending_edge_source.take().is_some();
+        if was_pending {
+            app.borrow().refresh_link_highlight();
+        }
+        App::dismiss_link_hint(app);
+        was_pending
+    }
+
+    /// Brings one card to the front, the way a press on it does. Not an
+    /// undo step (stacking follows focus, like windows), but persisted.
+    pub fn bring_to_front(app: &Rc<RefCell<App>>, id: Uuid) {
+        let mut app_mut = app.borrow_mut();
+        let max_z = app_mut
+            .nodes
+            .values()
+            .map(|e| e.record.z_order)
+            .max()
+            .unwrap_or(0);
+        let canvas = app_mut.canvas.clone();
+        let Some(entry) = app_mut.nodes.get_mut(&id) else {
+            return;
+        };
+        if entry.record.z_order == max_z {
+            return;
+        }
+        entry.record.z_order = max_z + 1;
+        let container = entry.widget.container().clone();
+        drop(app_mut);
+        canvas.raise_node(&container);
+        App::schedule_persist(app);
+    }
+
+    /// Switches a note between Edit, Preview and Split.
+    pub fn set_note_view_mode(app: &Rc<RefCell<App>>, id: Uuid, mode: NoteViewMode) {
+        let node = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return;
+            };
+            let Some(note) = entry.record.as_note_mut() else {
+                return;
+            };
+            note.view_mode = mode;
+            match &entry.widget {
+                NodeWidget::Note(node) => node.clone(),
+                _ => return,
+            }
+        };
+        node.set_view_mode(mode);
+        if mode != NoteViewMode::Preview {
+            node.edit_view.grab_focus();
+        }
+        App::schedule_persist(app);
+    }
+
     /// If an edge is pending (from `start_link`), completes it with `target`
     /// and clears the pending state.
     pub fn complete_link_if_pending(app: &Rc<RefCell<App>>, target: Uuid) -> Option<String> {
         let source = app.borrow_mut().pending_edge_source.take()?;
+        App::dismiss_link_hint(app);
         let created = App::create_edge(app, source, target);
         let app_ref = app.borrow();
         app_ref.refresh_link_highlight();
@@ -2871,6 +2992,227 @@ impl App {
     }
 }
 
+/// One card-menu entry: its label and what it does. `"Save\tCtrl+S"` shows
+/// a shortcut hint on the right; a `"[x] "`/`"[ ] "` prefix makes it a
+/// checked/unchecked toggle (see `check_label`); an empty label is a
+/// separator.
+pub type MenuItem = (String, Box<dyn Fn()>);
+
+pub fn separator() -> MenuItem {
+    (String::new(), Box::new(|| {}))
+}
+
+/// A toggle's menu label (see `MenuItem`).
+pub fn check_label(label: &str, on: bool) -> String {
+    format!("{} {label}", if on { "[x]" } else { "[ ]" })
+}
+
+/// Fills a card's reusable `popover` with `items` and shows it. Each
+/// action runs after the popover has closed, so one that opens a dialog or
+/// rebuilds the card doesn't fight the popdown.
+pub fn popup_menu(popover: &gtk4::Popover, items: Vec<MenuItem>) {
+    let list = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    list.add_css_class("card-menu");
+    let mut last_was_separator = true;
+    for (label, action) in items {
+        if label.is_empty() {
+            if !last_was_separator {
+                list.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+            }
+            last_was_separator = true;
+            continue;
+        }
+        last_was_separator = false;
+        let (text, hint) = label.split_once('\t').unwrap_or((label.as_str(), ""));
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let (checked, text) = match (text.strip_prefix("[x] "), text.strip_prefix("[ ] ")) {
+            (Some(text), _) => (Some(true), text),
+            (_, Some(text)) => (Some(false), text),
+            _ => (None, text),
+        };
+        if let Some(checked) = checked {
+            let mark = gtk4::Image::from_icon_name("object-select-symbolic");
+            mark.set_opacity(if checked { 1.0 } else { 0.0 });
+            row.append(&mark);
+        }
+        let text_label = gtk4::Label::new(Some(text));
+        text_label.set_xalign(0.0);
+        text_label.set_hexpand(true);
+        row.append(&text_label);
+        if !hint.is_empty() {
+            let hint_label = gtk4::Label::new(Some(hint));
+            hint_label.add_css_class("dim-label");
+            row.append(&hint_label);
+        }
+        let button = gtk4::Button::new();
+        button.set_child(Some(&row));
+        button.add_css_class("flat");
+        let action: Rc<dyn Fn()> = Rc::from(action);
+        button.connect_clicked({
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                let action = Rc::clone(&action);
+                glib::idle_add_local_once(move || action());
+            }
+        });
+        list.append(&button);
+    }
+    if let Some(last) = list.last_child()
+        && last.is::<gtk4::Separator>()
+    {
+        list.remove(&last);
+    }
+    popover.set_child(Some(&list));
+    popover.popup();
+}
+
+/// Runs `f` with the selection set to just `id` — how a card menu reuses
+/// the selection-based commands (collapse, lock, duplicate, delete, ...).
+fn on_this_card(app: &Rc<RefCell<App>>, id: Uuid, f: impl Fn(&Rc<RefCell<App>>)) {
+    App::select_only(app, id);
+    f(app);
+}
+
+/// Everything a card's right-click menu offers: its kind's own actions,
+/// then the ones every card has.
+fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
+    let Some((kind, collapsed, locked)) = app
+        .borrow()
+        .nodes
+        .get(&id)
+        .map(|e| (e.record.kind.clone(), e.record.collapsed, e.record.locked))
+    else {
+        return Vec::new();
+    };
+    let mut items: Vec<MenuItem> = match &kind {
+        NodeKind::Terminal(_) => {
+            let mut items: Vec<MenuItem> = Vec::new();
+            let app_c = Rc::clone(app);
+            items.push((
+                "Rename…\tdouble-click".to_string(),
+                Box::new(move || {
+                    if let Some(entry) = app_c.borrow().nodes.get(&id)
+                        && let NodeWidget::Terminal(node) = &entry.widget
+                    {
+                        crate::node::set_renaming(&node.title_label, &node.title_entry, true);
+                    }
+                }),
+            ));
+            let app_c = Rc::clone(app);
+            items.push((
+                "Hand off to the other agent".to_string(),
+                Box::new(move || {
+                    if let Err(error) = App::switch_agent(&app_c, id) {
+                        App::notify(&app_c, &error.to_string());
+                    }
+                }),
+            ));
+            let app_c = Rc::clone(app);
+            items.push((
+                "Restart process".to_string(),
+                Box::new(move || {
+                    on_this_card(&app_c, id, |app| {
+                        App::restart_selected_terminals(app, &App::toaster(app))
+                    })
+                }),
+            ));
+            let app_c = Rc::clone(app);
+            items.push((
+                "Stop process".to_string(),
+                Box::new(move || on_this_card(&app_c, id, App::terminate_selected_terminals)),
+            ));
+            items
+        }
+        NodeKind::Note(note) => {
+            let mut items: Vec<MenuItem> = Vec::new();
+            for (label, mode) in [
+                ("Edit", NoteViewMode::Edit),
+                ("Preview", NoteViewMode::Preview),
+                ("Edit + preview", NoteViewMode::Split),
+            ] {
+                let app_c = Rc::clone(app);
+                let label = check_label(label, note.view_mode == mode);
+                items.push((
+                    label,
+                    Box::new(move || App::set_note_view_mode(&app_c, id, mode)),
+                ));
+            }
+            items.push(separator());
+            items.extend(files::note_file_menu_items(app, id));
+            items
+        }
+        NodeKind::Editor(_) => files::editor_menu_items(app, id),
+        NodeKind::FileTree(_) => files::tree_menu_items(app, id),
+        NodeKind::Text(_) | NodeKind::Portal(_) | NodeKind::Drawing(_) | NodeKind::Group(_) => {
+            Vec::new()
+        }
+    };
+    items.push(separator());
+    let app_c = Rc::clone(app);
+    items.push((
+        "Connect to another card…".to_string(),
+        Box::new(move || App::start_link_with_hint(&app_c, id)),
+    ));
+    let connected = app
+        .borrow()
+        .edges
+        .iter()
+        .filter(|e| e.source == id || e.target == id)
+        .map(|e| e.id)
+        .collect::<Vec<_>>();
+    if !connected.is_empty() {
+        let app_c = Rc::clone(app);
+        items.push((
+            format!(
+                "Remove {} connection{}",
+                connected.len(),
+                if connected.len() == 1 { "" } else { "s" }
+            ),
+            Box::new(move || {
+                for edge in &connected {
+                    App::remove_edge(&app_c, *edge);
+                }
+            }),
+        ));
+    }
+    items.push(separator());
+    let app_c = Rc::clone(app);
+    items.push((
+        if collapsed { "Expand" } else { "Collapse" }.to_string(),
+        Box::new(move || {
+            on_this_card(&app_c, id, |app| {
+                App::set_selected_collapsed(app, !collapsed)
+            })
+        }),
+    ));
+    let app_c = Rc::clone(app);
+    items.push((
+        if locked {
+            "Unlock position"
+        } else {
+            "Lock position"
+        }
+        .to_string(),
+        Box::new(move || on_this_card(&app_c, id, |app| App::set_selected_locked(app, !locked))),
+    ));
+    let app_c = Rc::clone(app);
+    items.push((
+        "Duplicate".to_string(),
+        Box::new(move || {
+            on_this_card(&app_c, id, |app| {
+                App::duplicate_selected(app, &App::toaster(app))
+            })
+        }),
+    ));
+    let app_c = Rc::clone(app);
+    items.push((
+        "Delete".to_string(),
+        Box::new(move || on_this_card(&app_c, id, App::delete_selected)),
+    ));
+    items
+}
+
 /// The next `z_order` to assign to a freshly-created node: one above the
 /// current maximum, so new nodes always paint on top.
 fn next_z_order(app: &App) -> i64 {
@@ -2937,19 +3279,25 @@ fn duplicate_records(records: &[NodeRecord]) -> Vec<NodeRecord> {
         .collect()
 }
 
-/// Click-to-rename: the title label swaps for an entry pre-filled with the
-/// current name, Enter commits, Escape reverts without saving.
+/// Double-click-to-rename: the title label swaps for an entry pre-filled
+/// with the current name, Enter commits, Escape reverts without saving.
 fn wire_rename(
     app: &Rc<RefCell<App>>,
     node: &SessionNode,
     id: Uuid,
     toast_overlay: &adw::ToastOverlay,
 ) {
+    // Double-click, not single: a single press on the title starts a drag
+    // of the card (the whole title bar is its handle).
     let click = gtk4::GestureClick::new();
-    click.connect_released({
+    click.connect_pressed({
         let label = node.title_label.clone();
         let entry = node.title_entry.clone();
-        move |_gesture, _n_press, _x, _y| crate::node::set_renaming(&label, &entry, true)
+        move |_gesture, n_press, _x, _y| {
+            if n_press == 2 {
+                crate::node::set_renaming(&label, &entry, true);
+            }
+        }
     });
     node.title_label.add_controller(click);
 
@@ -3031,35 +3379,85 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
         move |_| App::close_node(&app, id)
     });
 
+    // Any press anywhere on the card — title bar, terminal, text, tree —
+    // selects it and brings it to front, the way windows behave. Capture
+    // phase, so it sees the press before the card's own widgets do; it
+    // doesn't claim the press, so they still get it, except in link mode,
+    // where the press *is* the "connect to this card" click and must not
+    // also type into a terminal or move a cursor.
+    let press = gtk4::GestureClick::new();
+    press.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    press.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    press.connect_pressed({
+        let app = Rc::clone(app);
+        move |gesture, _n_press, _x, _y| {
+            let pending = app.borrow().pending_edge_source;
+            if let Some(source) = pending {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                if source == id {
+                    App::cancel_link(&app);
+                    App::notify(&app, "Connecting cancelled");
+                    return;
+                }
+                let message = App::complete_link_if_pending(&app, id)
+                    .unwrap_or_else(|| "Those two cards are already connected".to_string());
+                App::notify(&app, &message);
+                return;
+            }
+            App::handle_node_press(&app, id, additive_modifier_held(gesture));
+            // On idle: restacking the card mid-press would disturb the
+            // gesture that's just starting on it.
+            let app = Rc::clone(&app);
+            glib::idle_add_local_once(move || App::bring_to_front(&app, id));
+        }
+    });
+    container.add_controller(press);
+
+    // Right-click on the title bar: the card's menu. The popover is
+    // parented once and reused — see `node_files::FileTreeNode::
+    // menu_popover` for why it's never unparented.
+    let menu = gtk4::Popover::new();
+    menu.set_has_arrow(false);
+    menu.set_position(gtk4::PositionType::Bottom);
+    menu.set_halign(gtk4::Align::Start);
+    menu.set_parent(&drag_handle);
+    let secondary = gtk4::GestureClick::new();
+    secondary.set_button(gtk4::gdk::BUTTON_SECONDARY);
+    secondary.connect_pressed({
+        let app = Rc::clone(app);
+        let menu = menu.clone();
+        move |gesture, _n_press, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            App::handle_node_press(&app, id, false);
+            menu.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popup_menu(&menu, node_menu_items(&app, id));
+        }
+    });
+    drag_handle.add_controller(secondary);
+
     // (original positions of every selected node at drag start, pointer
     // position at drag start in the canvas `Fixed`'s stationary coordinate
     // space) — see `world_drag_delta` for why the pointer's start must be
     // captured in that frame.
     let move_start: MoveStart = Rc::new(RefCell::new(None));
+    let moving = Rc::new(std::cell::Cell::new(false));
     let drag = gtk4::GestureDrag::new();
     drag.connect_drag_begin({
         let app = Rc::clone(app);
-        let container = container.clone();
         let move_start = Rc::clone(&move_start);
+        let moving = Rc::clone(&moving);
         move |gesture, x, y| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            App::handle_node_press(&app, id, additive_modifier_held(gesture));
-
-            let app_mut = app.borrow();
-            let pointer = canvas_point(gesture, &app_mut.canvas.fixed, (x, y));
-            let app_for_raise = app.clone();
-            let container_for_raise = container.clone();
-            glib::idle_add_local_once(move || {
-                app_for_raise
-                    .borrow()
-                    .canvas
-                    .raise_node(&container_for_raise);
-            });
-            let selected: Vec<Uuid> = app_mut.selected.iter().copied().collect();
+            moving.set(false);
+            // Not claimed yet: a press on a title-bar button (or the
+            // rename entry) must still reach it. The drag claims the press
+            // in `drag-update`, once the pointer has really moved.
+            let app_ref = app.borrow();
+            let pointer = canvas_point(gesture, &app_ref.canvas.fixed, (x, y));
+            let selected: Vec<Uuid> = app_ref.selected.iter().copied().collect();
             let positions: HashMap<Uuid, (f64, f64)> = selected
                 .into_iter()
                 .filter_map(|sid| {
-                    app_mut.nodes.get(&sid).and_then(|entry| {
+                    app_ref.nodes.get(&sid).and_then(|entry| {
                         (!entry.record.locked).then_some((sid, entry.record.position))
                     })
                 })
@@ -3070,10 +3468,20 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
     drag.connect_drag_update({
         let app = Rc::clone(app);
         let move_start = Rc::clone(&move_start);
-        move |gesture, _offset_x, _offset_y| {
+        let moving = Rc::clone(&moving);
+        move |gesture, offset_x, offset_y| {
             let Some((start_positions, start_pointer)) = move_start.borrow().clone() else {
                 return;
             };
+            if !moving.get() {
+                // A few pixels of slop, so a click on a title-bar button
+                // never turns into a tiny move.
+                if offset_x.hypot(offset_y) < DRAG_THRESHOLD {
+                    return;
+                }
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                moving.set(true);
+            }
             let delta = {
                 let app_ref = app.borrow();
                 let zoom = app_ref.canvas.state.borrow().zoom;
@@ -3217,86 +3625,6 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
     resize_handle.add_controller(resize);
 }
 
-/// Wires a terminal node's link button (click to enter link mode, sourced
-/// from this node) and its terminal (click to complete a pending link,
-/// targeting this node). The `EdgeRecord` model itself is generic over any
-/// two node ids — `App::create_edge` doesn't care what kind either endpoint
-/// is — and as of Milestone 4 the UI affordance to start/complete a link is
-/// no longer Terminal-only either: see `wire_note_link_controls` below for
-/// the identical wiring onto `Note` cards.
-fn wire_link_controls(
-    app: &Rc<RefCell<App>>,
-    node: &SessionNode,
-    id: Uuid,
-    toast_overlay: &adw::ToastOverlay,
-) {
-    node.link_button.connect_clicked({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            App::start_link(&app, id);
-            toast_overlay.add_toast(adw::Toast::new(
-                "link mode: click another node to connect this one's output into it",
-            ));
-        }
-    });
-
-    node.handoff_button.connect_clicked({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            if let Err(error) = App::switch_agent(&app, id) {
-                toast_overlay.add_toast(adw::Toast::new(&error.to_string()));
-            }
-        }
-    });
-
-    let click = gtk4::GestureClick::new();
-    click.connect_pressed({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        move |_gesture, _n_press, _x, _y| {
-            if let Some(message) = App::complete_link_if_pending(&app, id) {
-                toast_overlay.add_toast(adw::Toast::new(&message));
-            }
-        }
-    });
-    node.terminal.add_controller(click);
-}
-
-/// `wire_link_controls`'s Note-card counterpart: same link button, same
-/// click-to-complete behavior, just targeting `NoteNode::connect_link_target`
-/// (both text panes) instead of `SessionNode::terminal`. Letting a Note
-/// start *or* complete a link (not just be a target) is what makes Note↔Note
-/// connections (Milestone 4 section 7) reachable through the same one
-/// gesture, with no separate UI.
-fn wire_note_link_controls(
-    app: &Rc<RefCell<App>>,
-    node: &NoteNode,
-    id: Uuid,
-    toast_overlay: &adw::ToastOverlay,
-) {
-    node.link_button.connect_clicked({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            App::start_link(&app, id);
-            toast_overlay.add_toast(adw::Toast::new(
-                "link mode: click another node to connect this note to it",
-            ));
-        }
-    });
-    node.connect_link_target({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        move || {
-            if let Some(message) = App::complete_link_if_pending(&app, id) {
-                toast_overlay.add_toast(adw::Toast::new(&message));
-            }
-        }
-    });
-}
-
 /// Builds the right `NodeWidget` for `record.kind`, wires its change
 /// tracking (persist on edit) plus the shared chrome (`wire_node_chrome`),
 /// adds it to the canvas, and inserts the resulting `NodeEntry` into
@@ -3358,7 +3686,6 @@ fn materialize_node(
                     let _ = app.borrow_mut().runtime.write_input(id, bytes);
                 }
             });
-            wire_link_controls(app, &node, id, toast_overlay);
             wire_rename(app, &node, id, toast_overlay);
             NodeWidget::Terminal(node)
         }
@@ -3388,10 +3715,13 @@ fn materialize_node(
             // without this, a restored note with a divider shows it at the
             // wrong width until the user happens to edit or resize that note.
             node.refresh_preview_after_resize();
+            node.set_title(&orchestration::notes::note_title(&note.markdown));
             node.edit_view.buffer().connect_changed({
                 let app = Rc::clone(app);
+                let node = node.clone();
                 move |buffer| {
                     let markdown = crate::node::buffer_text(buffer);
+                    node.set_title(&orchestration::notes::note_title(&markdown));
                     if let Some(entry) = app.borrow_mut().nodes.get_mut(&id)
                         && let Some(note) = entry.record.as_note_mut()
                     {
@@ -3400,30 +3730,10 @@ fn materialize_node(
                     App::schedule_persist(&app);
                 }
             });
-            node.mode_button.connect_clicked({
+            node.connect_preview_double_click({
                 let app = Rc::clone(app);
-                move |_| {
-                    let mut app_mut = app.borrow_mut();
-                    let Some(entry) = app_mut.nodes.get_mut(&id) else {
-                        return;
-                    };
-                    let NodeWidget::Note(note_node) = &entry.widget else {
-                        return;
-                    };
-                    let Some(note) = entry.record.as_note_mut() else {
-                        return;
-                    };
-                    note.view_mode = match note.view_mode {
-                        NoteViewMode::Edit => NoteViewMode::Preview,
-                        NoteViewMode::Preview => NoteViewMode::Split,
-                        NoteViewMode::Split => NoteViewMode::Edit,
-                    };
-                    note_node.set_view_mode(note.view_mode);
-                    drop(app_mut);
-                    App::schedule_persist(&app);
-                }
+                move || App::set_note_view_mode(&app, id, NoteViewMode::Edit)
             });
-            wire_note_link_controls(app, &node, id, toast_overlay);
             files::wire_note_file(app, &node, id, note.file.as_ref(), toast_overlay);
             NodeWidget::Note(node)
         }
@@ -4404,7 +4714,7 @@ mod tests {
         {
             let mut app_mut = app.borrow_mut();
             // Read-only on requirements/implementation; read-write on status
-            // — exactly what the generalized Note link button would grant by
+            // — exactly what connecting a Terminal to a Note grants by
             // default when connecting a Terminal to a Note (ReadNote AND
             // WriteNote together, per `create_edge`'s doc comment) — pinned
             // here as explicit edges so this test doesn't depend on reading
@@ -4626,5 +4936,95 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Regression: collapsing any non-terminal card did nothing once cards
+    /// were restored at their persisted size — the size request sat on the
+    /// whole card, so hiding its body couldn't shrink it. The height must
+    /// only apply while expanded, and come back on expand.
+    #[test]
+    #[ignore = "needs a display"]
+    fn collapsing_a_sized_card_releases_its_height_and_expanding_restores_it() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let mut note = note_record();
+        note.size = (300.0, 280.0);
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+        let container = app.borrow().nodes[&id].widget.container().clone();
+        assert_eq!(container.size_request(), (300, 280));
+
+        App::select_only(&app, id);
+        App::set_selected_collapsed(&app, true);
+        assert_eq!(container.size_request(), (300, -1));
+        // Resizing while collapsed keeps it collapsed.
+        app.borrow().nodes[&id].widget.apply_resize((320.0, 300.0));
+        assert_eq!(container.size_request(), (320, -1));
+        App::set_selected_collapsed(&app, false);
+        assert_eq!(container.size_request(), (320, 300));
+
+        // Restoring an already-collapsed card starts collapsed, too.
+        let mut text = text_record();
+        text.size = (250.0, 200.0);
+        text.collapsed = true;
+        let text_id = text.id;
+        materialize_node(&app, text, &adw::ToastOverlay::new()).unwrap();
+        let text_container = app.borrow().nodes[&text_id].widget.container().clone();
+        assert_eq!(text_container.size_request(), (250, -1));
+    }
+
+    /// Every card kind has a right-click menu, and every menu can start a
+    /// connection; a file card connected to a terminal shares it as
+    /// context, which the agent's `whoami` lists.
+    #[test]
+    #[ignore = "needs a display"]
+    fn card_menus_and_connecting_files_to_agents() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let app = new_test_app();
+        let toast = adw::ToastOverlay::new();
+        let agent = terminal_node(EnvironmentKind::LocalPty);
+        let note = note_record();
+        let mut tree = text_record();
+        tree.id = Uuid::new_v4();
+        tree.kind = NodeKind::FileTree(crate::model::FileTreePayload {
+            root: "src".to_string(),
+            ..Default::default()
+        });
+        for record in [&agent, &note, &tree] {
+            materialize_node(&app, record.clone(), &toast).unwrap();
+        }
+        for id in [agent.id, note.id, tree.id] {
+            let labels: Vec<String> = node_menu_items(&app, id)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+            assert!(
+                labels.iter().any(|l| l == "Connect to another card…"),
+                "{labels:?}"
+            );
+            assert!(labels.iter().any(|l| l == "Delete"), "{labels:?}");
+        }
+
+        App::start_link_with_hint(&app, tree.id);
+        assert!(App::complete_link_if_pending(&app, agent.id).is_some());
+        let edge = app.borrow().edges[0].clone();
+        assert_eq!(
+            edge.capabilities,
+            [EdgeCapability::ShareContext].into_iter().collect()
+        );
+        assert_eq!(
+            app.borrow().connected_files(agent.id),
+            vec!["@file:src".to_string()]
+        );
+
+        // Connecting a card to itself just cancels; Esc-style cancel works.
+        App::start_link(&app, agent.id);
+        assert!(App::cancel_link(&app));
+        assert!(!App::cancel_link(&app));
+        assert!(app.borrow().pending_edge_source.is_none());
     }
 }

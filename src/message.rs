@@ -119,6 +119,11 @@ pub struct WhoamiInfo {
     pub agent: AgentInfo,
     pub role_instructions: Option<String>,
     pub connected_agents: Vec<AgentInfo>,
+    /// Project files and folders connected to this agent on the canvas (an
+    /// Editor, a FileTree's root, or a file-backed note), as `@file:`
+    /// references — context the user handed this agent to start from.
+    #[serde(default)]
+    pub connected_files: Vec<String>,
 }
 
 /// One note, as `duetctl notes list` reports it — just enough to pick a

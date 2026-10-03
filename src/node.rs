@@ -101,6 +101,14 @@ fn sync_minimize_icon(button: &gtk4::Button, expanded: bool) {
 pub struct CollapseHandle {
     button: gtk4::Button,
     body: gtk4::Overlay,
+    /// The whole card. Cards sized through their container (every kind but
+    /// a terminal, whose size lives on the VTE widget inside `body`) keep
+    /// their height request here only while expanded — otherwise hiding
+    /// `body` couldn't shrink the card to its title bar.
+    card: gtk4::Widget,
+    /// The card size last requested through `set_card_size`, re-applied on
+    /// expand. `None` for a card never sized that way.
+    card_size: Rc<Cell<Option<(i32, i32)>>>,
 }
 
 impl CollapseHandle {
@@ -113,7 +121,27 @@ impl CollapseHandle {
         if self.body.is_visible() != expanded {
             self.body.set_visible(expanded);
             sync_minimize_icon(&self.button, expanded);
+            self.apply_card_size();
         }
+    }
+
+    pub fn is_collapsed(&self) -> bool {
+        !self.body.is_visible()
+    }
+
+    /// Sizes the whole card (title bar included). While collapsed only the
+    /// width applies; the height comes back on expand.
+    pub fn set_card_size(&self, width: i32, height: i32) {
+        self.card_size.set(Some((width, height)));
+        self.apply_card_size();
+    }
+
+    fn apply_card_size(&self) {
+        let Some((width, height)) = self.card_size.get() else {
+            return;
+        };
+        let height = if self.body.is_visible() { height } else { -1 };
+        self.card.set_size_request(width, height);
     }
 }
 
@@ -127,25 +155,53 @@ impl CollapseHandle {
 pub(crate) fn wire_minimize(
     button: &gtk4::Button,
     body: &gtk4::Overlay,
+    card: &impl IsA<gtk4::Widget>,
     initially_collapsed: bool,
     on_toggle: impl Fn(bool) + 'static,
 ) -> CollapseHandle {
     let expanded = !initially_collapsed;
     body.set_visible(expanded);
     sync_minimize_icon(button, expanded);
-    button.connect_clicked({
-        let body = body.clone();
-        move |button| {
-            let expanded = !body.is_visible();
-            body.set_visible(expanded);
-            sync_minimize_icon(button, expanded);
-            on_toggle(!expanded);
-        }
-    });
-    CollapseHandle {
+    let handle = CollapseHandle {
         button: button.clone(),
         body: body.clone(),
-    }
+        card: card.clone().upcast(),
+        card_size: Rc::new(Cell::new(None)),
+    };
+    button.connect_clicked({
+        let handle = handle.clone();
+        move |_| {
+            let collapsed = !handle.is_collapsed();
+            handle.set_collapsed(collapsed);
+            on_toggle(collapsed);
+        }
+    });
+    handle
+}
+
+/// The compact title-bar buttons every card keeps: collapse and close.
+/// Everything else a card can do lives in its right-click menu (wired in
+/// `app.rs`), so the title bar stays readable at any card width.
+fn title_buttons(close_tooltip: &str) -> (gtk4::Button, gtk4::Button) {
+    let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
+    minimize_button.add_css_class("flat");
+    let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
+    close_button.add_css_class("flat");
+    close_button.set_tooltip_text(Some(close_tooltip));
+    (minimize_button, close_button)
+}
+
+/// An empty, expanding spacer for a title bar.
+fn spacer() -> gtk4::Box {
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    spacer
+}
+
+/// Marks `title_bar` as the card's drag handle: the whole bar (title text
+/// included) moves the card, and it says so on hover.
+pub(crate) fn as_drag_handle(title_bar: &gtk4::Box) {
+    title_bar.set_cursor_from_name(Some("grab"));
 }
 
 /// Builds the role badge shown in a session card's title bar: an icon plus
@@ -190,16 +246,11 @@ pub struct SessionNode {
     role_icon: gtk4::Image,
     role_label: gtk4::Label,
     pub terminal: vte4::Terminal,
-    pub link_button: gtk4::Button,
-    pub handoff_button: gtk4::Button,
     pub status_label: gtk4::Label,
-    /// Drag this to move the card on the canvas (wired in `app.rs`). An
-    /// empty, hexpanding spacer between the title and the action buttons, so
-    /// dragging it never races with clicking `link_button`/`handoff_button`/
-    /// `close_button` — those are siblings under `title_bar`, not inside
-    /// `drag_handle`, so a press on them is never seen by the drag gesture
-    /// attached to `drag_handle` (same reasoning as `wire_link_controls`'s
-    /// doc comment about attaching to specific widgets, not shared ancestors).
+    /// The whole title bar: dragging anywhere on it (the name included)
+    /// moves the card, and right-clicking it opens the card's menu (both
+    /// wired in `app.rs`). Its buttons still get their own clicks — the
+    /// move only starts once the pointer actually travels.
     pub drag_handle: gtk4::Box,
     pub close_button: gtk4::Button,
     /// Drag this to resize the terminal (wired in `app.rs`).
@@ -218,7 +269,6 @@ impl SessionNode {
         let title_label = gtk4::Label::new(Some(name));
         title_label.add_css_class("heading");
         title_label.add_css_class("node-title");
-        title_label.set_cursor_from_name(Some("pointer"));
         // A long session name otherwise sets the whole card's minimum width
         // (a 28-character name measured 348px wide), so the card could not be
         // resized narrower than its own title and `record.size` drifted away
@@ -230,22 +280,9 @@ impl SessionNode {
         title_entry.set_visible(false);
         title_entry.set_max_width_chars(16);
 
-        let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        drag_handle.set_hexpand(true);
-        drag_handle.set_cursor_from_name(Some("grab"));
-
-        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
-        minimize_button.add_css_class("flat");
-        let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
-        link_button.add_css_class("flat");
-        link_button.set_tooltip_text(Some("Link this session's output into another"));
-        let handoff_button = gtk4::Button::from_icon_name("media-playlist-shuffle-symbolic");
-        handoff_button.add_css_class("flat");
-        handoff_button.set_tooltip_text(Some("Hand off to the other agent"));
         let status_label = gtk4::Label::new(None);
-        let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_button.add_css_class("flat");
-        close_button.set_tooltip_text(Some("Close session"));
+        status_label.add_css_class("dim-label");
+        let (minimize_button, close_button) = title_buttons("Close session");
 
         let (role_badge, role_icon, role_label) = role_badge_widgets();
 
@@ -254,12 +291,12 @@ impl SessionNode {
         title_bar.append(&title_label);
         title_bar.append(&title_entry);
         title_bar.append(&role_badge);
-        title_bar.append(&drag_handle);
+        title_bar.append(&spacer());
         title_bar.append(&status_label);
         title_bar.append(&minimize_button);
-        title_bar.append(&link_button);
-        title_bar.append(&handoff_button);
         title_bar.append(&close_button);
+        as_drag_handle(&title_bar);
+        let drag_handle = title_bar.clone();
 
         // No size request here, but only because callers immediately set one
         // via `request_grid` (restore/create from the record, resize drags
@@ -301,7 +338,13 @@ impl SessionNode {
         container.append(&body);
         container.add_css_class("card");
 
-        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(
+            &minimize_button,
+            &body,
+            &container,
+            collapsed,
+            on_collapse_toggle,
+        );
 
         let node = SessionNode {
             container,
@@ -311,8 +354,6 @@ impl SessionNode {
             role_icon,
             role_label,
             terminal,
-            link_button,
-            handoff_button,
             status_label,
             drag_handle,
             close_button,
@@ -330,7 +371,7 @@ impl SessionNode {
     pub fn set_name(&self, name: &str) {
         self.title_label.set_text(name);
         self.title_label
-            .set_tooltip_text(Some(&format!("{name}\nClick to rename")));
+            .set_tooltip_text(Some(&format!("{name}\nDouble-click to rename")));
     }
 
     /// Shows the role badge (icon + name) in the title bar, or hides it when
@@ -446,14 +487,14 @@ pub struct NoteNode {
     preview_refresh_scheduled: Rc<Cell<bool>>,
     edit_scroller: gtk4::ScrolledWindow,
     preview_scroller: gtk4::ScrolledWindow,
-    pub mode_button: gtk4::Button,
-    pub link_button: gtk4::Button,
-    /// Opens the "link this note to a project file" popover (wired in
-    /// `app::files`, which owns what linking means).
-    pub file_button: gtk4::Button,
-    /// `file_button`'s popover, parented once and reused (unparenting a
-    /// closed popover crashes GTK 4.14 — see `node_files::FileTreeNode`).
+    /// The "link this note to a project file" popover (opened from the
+    /// card's menu, wired in `app::files`), parented to the title bar once
+    /// and reused — unparenting a closed popover crashes GTK 4.14 (see
+    /// `node_files::FileTreeNode::menu_popover`).
     pub file_popover: gtk4::Popover,
+    /// The note's own title (its first heading or line), so a collapsed
+    /// note still says what it is.
+    title_label: gtk4::Label,
     /// The backing file's path, shown only for a file-backed note.
     file_label: gtk4::Label,
     /// A one-word sync state ("synced", "conflict", ...) for a file-backed
@@ -471,15 +512,6 @@ pub struct NoteNode {
     pub collapse: CollapseHandle,
 }
 
-fn mode_label(mode: crate::model::NoteViewMode) -> &'static str {
-    use crate::model::NoteViewMode;
-    match mode {
-        NoteViewMode::Edit => "Edit",
-        NoteViewMode::Preview => "Preview",
-        NoteViewMode::Split => "Split",
-    }
-}
-
 impl NoteNode {
     pub fn new(
         initial_markdown: &str,
@@ -488,31 +520,11 @@ impl NoteNode {
         collapsed: bool,
         on_collapse_toggle: impl Fn(bool) + 'static,
     ) -> NoteNode {
-        let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        drag_handle.set_hexpand(true);
-        drag_handle.set_cursor_from_name(Some("grab"));
-
-        let mode_button = gtk4::Button::with_label(mode_label(initial_mode));
-        mode_button.add_css_class("flat");
-        mode_button.set_tooltip_text(Some("Cycle Edit / Preview / Split"));
-        // Milestone 4 generalizes the link-button/click-to-complete gesture
-        // (previously Terminal-only — see `model.rs`'s `EdgeRecord` doc
-        // comment anticipating exactly this) onto Note cards, so a Note can
-        // be connected to an agent or to another Note the same way two
-        // agents already connect to each other.
-        let link_button = gtk4::Button::from_icon_name("insert-link-symbolic");
-        link_button.add_css_class("flat");
-        link_button.set_tooltip_text(Some("Connect this note to an agent or another note"));
-        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
-        minimize_button.add_css_class("flat");
-        let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_button.add_css_class("flat");
-        close_button.set_tooltip_text(Some("Delete note"));
-        let file_button = gtk4::Button::from_icon_name("document-save-as-symbolic");
-        file_button.add_css_class("flat");
-        file_button.set_tooltip_text(Some("Link this note to a project file"));
-        let file_popover = gtk4::Popover::new();
-        file_popover.set_parent(&file_button);
+        let (minimize_button, close_button) = title_buttons("Delete note");
+        let title_label = gtk4::Label::new(None);
+        title_label.add_css_class("note-title");
+        title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title_label.set_xalign(0.0);
         let file_label = gtk4::Label::new(None);
         file_label.add_css_class("note-file-label");
         file_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
@@ -525,14 +537,16 @@ impl NoteNode {
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("note-title-bar");
+        title_bar.append(&title_label);
+        title_bar.append(&spacer());
         title_bar.append(&file_label);
-        title_bar.append(&drag_handle);
         title_bar.append(&sync_label);
-        title_bar.append(&mode_button);
-        title_bar.append(&file_button);
-        title_bar.append(&link_button);
         title_bar.append(&minimize_button);
         title_bar.append(&close_button);
+        as_drag_handle(&title_bar);
+        let drag_handle = title_bar.clone();
+        let file_popover = gtk4::Popover::new();
+        file_popover.set_parent(&title_bar);
 
         let edit_view = gtk4::TextView::new();
         edit_view.buffer().set_text(initial_markdown);
@@ -622,7 +636,13 @@ impl NoteNode {
         container.append(&body);
         container.set_css_classes(&["card", &format!("note-{color}")]);
 
-        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(
+            &minimize_button,
+            &body,
+            &container,
+            collapsed,
+            on_collapse_toggle,
+        );
 
         let node = NoteNode {
             container,
@@ -631,10 +651,8 @@ impl NoteNode {
             preview_refresh_scheduled: Rc::new(Cell::new(false)),
             edit_scroller,
             preview_scroller,
-            mode_button,
-            link_button,
-            file_button,
             file_popover,
+            title_label,
             file_label,
             sync_label,
             banner,
@@ -650,6 +668,10 @@ impl NoteNode {
         node
     }
 
+    pub fn set_title(&self, title: &str) {
+        self.title_label.set_text(title);
+    }
+
     /// Shows (or, with `None`, hides) the backing file's path in the title
     /// bar.
     pub fn set_file_backing(&self, path: Option<&str>) {
@@ -660,14 +682,10 @@ impl NoteNode {
                     .set_tooltip_text(Some(&format!("Synced with project file {path}")));
                 self.file_label.set_visible(true);
                 self.sync_label.set_visible(true);
-                self.file_button
-                    .set_tooltip_text(Some("Linked to a project file"));
             }
             None => {
                 self.file_label.set_visible(false);
                 self.sync_label.set_visible(false);
-                self.file_button
-                    .set_tooltip_text(Some("Link this note to a project file"));
                 self.hide_banner();
             }
         }
@@ -692,23 +710,16 @@ impl NoteNode {
         self.banner.is_visible()
     }
 
-    /// Calls `f` on a plain click anywhere in either text pane (Edit or
-    /// Preview) — the click target for completing a pending link onto this
-    /// note, the same role `node.terminal` plays for `SessionNode` (see
-    /// `app::wire_link_controls`). Both panes are wired, not just whichever
-    /// is currently visible, since `set_view_mode` can toggle between them
-    /// at any time and the link-completion target shouldn't depend on which
-    /// mode the note happens to be in.
-    pub fn connect_link_target(&self, f: impl Fn() + 'static) {
-        let f = Rc::new(f);
-        for view in [&self.edit_view, &self.preview_view] {
-            let click = gtk4::GestureClick::new();
-            click.connect_pressed({
-                let f = Rc::clone(&f);
-                move |_gesture, _n_press, _x, _y| f()
-            });
-            view.add_controller(click);
-        }
+    /// Calls `f` on a double-click in the rendered Preview — the quick way
+    /// into editing a note, now that the mode switch lives in the menu.
+    pub fn connect_preview_double_click(&self, f: impl Fn() + 'static) {
+        let click = gtk4::GestureClick::new();
+        click.connect_pressed(move |_gesture, n_press, _x, _y| {
+            if n_press == 2 {
+                f();
+            }
+        });
+        self.preview_view.add_controller(click);
     }
 
     /// Schedules a re-render of the Preview pane from the current Edit
@@ -755,7 +766,6 @@ impl NoteNode {
         };
         self.edit_scroller.set_visible(edit_visible);
         self.preview_scroller.set_visible(preview_visible);
-        self.mode_button.set_label(mode_label(mode));
     }
 }
 
@@ -777,21 +787,15 @@ impl TextNode {
         collapsed: bool,
         on_collapse_toggle: impl Fn(bool) + 'static,
     ) -> TextNode {
-        let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        drag_handle.set_hexpand(true);
-        drag_handle.set_cursor_from_name(Some("grab"));
-
-        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
-        minimize_button.add_css_class("flat");
-        let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_button.add_css_class("flat");
-        close_button.set_tooltip_text(Some("Delete text node"));
+        let (minimize_button, close_button) = title_buttons("Delete text node");
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("note-title-bar");
-        title_bar.append(&drag_handle);
+        title_bar.append(&spacer());
         title_bar.append(&minimize_button);
         title_bar.append(&close_button);
+        as_drag_handle(&title_bar);
+        let drag_handle = title_bar.clone();
 
         let text_view = gtk4::TextView::new();
         text_view.buffer().set_text(initial_text);
@@ -826,7 +830,13 @@ impl TextNode {
         // Note at a glance.
         container.set_css_classes(&["card", "note-blue"]);
 
-        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(
+            &minimize_button,
+            &body,
+            &container,
+            collapsed,
+            on_collapse_toggle,
+        );
 
         TextNode {
             container,
@@ -859,25 +869,19 @@ impl PlaceholderNode {
         collapsed: bool,
         on_collapse_toggle: impl Fn(bool) + 'static,
     ) -> PlaceholderNode {
-        let drag_handle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        drag_handle.set_hexpand(true);
-        drag_handle.set_cursor_from_name(Some("grab"));
-
         let kind_title = gtk4::Label::new(Some(kind_label));
         kind_title.add_css_class("heading");
 
-        let minimize_button = gtk4::Button::from_icon_name("go-up-symbolic");
-        minimize_button.add_css_class("flat");
-        let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_button.add_css_class("flat");
-        close_button.set_tooltip_text(Some("Remove node"));
+        let (minimize_button, close_button) = title_buttons("Remove node");
 
         let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         title_bar.add_css_class("node-title-bar");
         title_bar.append(&kind_title);
-        title_bar.append(&drag_handle);
+        title_bar.append(&spacer());
         title_bar.append(&minimize_button);
         title_bar.append(&close_button);
+        as_drag_handle(&title_bar);
+        let drag_handle = title_bar.clone();
 
         let detail_label = gtk4::Label::new(Some(detail));
         detail_label.add_css_class("dim-label");
@@ -903,7 +907,13 @@ impl PlaceholderNode {
         container.append(&body);
         container.set_css_classes(&["card", "placeholder-node"]);
 
-        let collapse = wire_minimize(&minimize_button, &body, collapsed, on_collapse_toggle);
+        let collapse = wire_minimize(
+            &minimize_button,
+            &body,
+            &container,
+            collapsed,
+            on_collapse_toggle,
+        );
 
         PlaceholderNode {
             container,

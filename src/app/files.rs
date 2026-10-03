@@ -15,7 +15,10 @@
 //! GTK — a widget update can synchronously emit a signal whose handler
 //! borrows `App` again.
 
-use super::{App, CanvasCommand, NodeWidget, materialize_node, next_z_order};
+use super::{
+    App, CanvasCommand, MenuItem, NodeWidget, check_label, materialize_node, next_z_order,
+    popup_menu, separator,
+};
 use crate::canvas;
 use crate::model::{
     EditorPayload, FileTreePayload, FloorRef, NodeKind, NodeRecord, NoteFileBacking, NotePayload,
@@ -862,8 +865,6 @@ impl App {
                 return;
             }
         };
-        node.diff_button.set_visible(payload.diff.is_none());
-        node.source_button.set_visible(payload.diff.is_some());
         if let Some(scope) = payload.diff {
             node.set_read_only(true);
             match GitService::new(&project).diff(Some(&path), scope) {
@@ -1137,7 +1138,7 @@ impl App {
         let Some((node, payload)) = app.borrow().tree_widget(id) else {
             return;
         };
-        let (project, query, cached, workspace_name, can_back, can_forward) = {
+        let (project, query, cached, workspace_name) = {
             let app_ref = app.borrow();
             let state = app_ref.tree_state.get(&id);
             (
@@ -1149,8 +1150,6 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| app_ref.workspace_root.display().to_string()),
-                state.is_some_and(|s| s.history.can_go_back()),
-                state.is_some_and(|s| s.history.can_go_forward()),
             )
         };
         let root = parse_root(&payload.root);
@@ -1253,11 +1252,6 @@ impl App {
             &project.root().join(root.as_str()).display().to_string(),
         ));
         node.status_label.set_text(&status);
-        node.back_button.set_sensitive(can_back);
-        node.forward_button.set_sensitive(can_forward);
-        node.up_button.set_sensitive(!root.is_root());
-        node.hidden_toggle.set_active(payload.show_hidden);
-        node.gitignore_toggle.set_active(payload.respect_gitignore);
         if node.items() != items {
             node.set_items(items, payload.selected.as_deref());
         }
@@ -1333,6 +1327,36 @@ impl App {
             entry.record.position.0 + entry.record.size.0 + 40.0 + (opened % 6.0) * 24.0,
             entry.record.position.1 + (opened % 6.0) * 24.0,
         )
+    }
+
+    /// The project files/folders connected to `agent_id` by an edge: an
+    /// Editor's file, a FileTree's root folder, or a file-backed note's
+    /// file — as `@file:` references, for `duetctl whoami`.
+    pub fn connected_files(&self, agent_id: Uuid) -> Vec<String> {
+        let mut references: Vec<String> = self
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let other = if edge.source == agent_id {
+                    edge.target
+                } else if edge.target == agent_id {
+                    edge.source
+                } else {
+                    return None;
+                };
+                let path = match &self.nodes.get(&other)?.record.kind {
+                    NodeKind::Editor(editor) => editor.path.clone(),
+                    NodeKind::FileTree(tree) => tree.root.clone(),
+                    NodeKind::Note(note) => note.file.as_ref()?.path.clone(),
+                    _ => return None,
+                };
+                let path = ProjectPath::parse(&path).ok()?;
+                Some(file_reference(&path, None))
+            })
+            .collect();
+        references.sort();
+        references.dedup();
+        references
     }
 
     /// `ProjectPath` for an absolute host path, if it's inside the root.
@@ -1454,65 +1478,6 @@ pub(super) fn materialize_file_tree(
         let toast_overlay = toast_overlay.clone();
         move |item, anchor| show_tree_menu(&app, id, item, &anchor, &toast_overlay)
     });
-    node.refresh_button.connect_clicked({
-        let app = Rc::clone(app);
-        move |_| {
-            if let Some(state) = app.borrow_mut().tree_state.get_mut(&id) {
-                state.files = None;
-            }
-            App::refresh_file_tree(&app, id);
-        }
-    });
-    node.collapse_all_button.connect_clicked({
-        let app = Rc::clone(app);
-        move |_| App::update_tree(&app, id, |payload| payload.expanded.clear())
-    });
-    node.up_button.connect_clicked({
-        let app = Rc::clone(app);
-        move |_| {
-            let parent = app
-                .borrow()
-                .tree_widget(id)
-                .and_then(|(_, payload)| parse_root(&payload.root).parent());
-            if let Some(parent) = parent {
-                App::navigate_tree(&app, id, parent);
-            }
-        }
-    });
-    node.back_button.connect_clicked({
-        let app = Rc::clone(app);
-        move |_| App::step_tree_history(&app, id, false)
-    });
-    node.forward_button.connect_clicked({
-        let app = Rc::clone(app);
-        move |_| App::step_tree_history(&app, id, true)
-    });
-    node.hidden_toggle.connect_toggled({
-        let app = Rc::clone(app);
-        move |toggle| {
-            let active = toggle.is_active();
-            let changed = app
-                .borrow()
-                .tree_widget(id)
-                .is_some_and(|(_, payload)| payload.show_hidden != active);
-            if changed {
-                App::update_tree(&app, id, |payload| payload.show_hidden = active);
-            }
-        }
-    });
-    node.gitignore_toggle.connect_toggled({
-        let app = Rc::clone(app);
-        move |toggle| {
-            let active = toggle.is_active();
-            let changed = app
-                .borrow()
-                .tree_widget(id)
-                .is_some_and(|(_, payload)| payload.respect_gitignore != active);
-            if changed {
-                App::update_tree(&app, id, |payload| payload.respect_gitignore = active);
-            }
-        }
-    });
     node.search_entry.connect_search_changed({
         let app = Rc::clone(app);
         move |entry| {
@@ -1533,12 +1498,6 @@ pub(super) fn materialize_file_tree(
                 activate_tree_item(&app, id, &item, &toast_overlay);
             }
         }
-    });
-    node.commit_button.connect_clicked({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        let anchor = node.container.clone();
-        move |_| open_commit_dialog(&app, &anchor, &toast_overlay)
     });
     {
         let app = Rc::clone(app);
@@ -1605,37 +1564,6 @@ fn activate_tree_item(
     if let Err(error) = App::open_project_file(app, &path, position, line) {
         toast(toast_overlay, &error);
     }
-}
-
-/// One popover-menu entry: its label and what clicking it does.
-type MenuItem = (String, Box<dyn Fn()>);
-
-/// Fills a node's reusable `popover` with a menu of `(label, action)`
-/// items and shows it. Popovers are owned by their node and never
-/// unparented (see `node_files::FileTreeNode::menu_popover`).
-fn popup_menu(popover: &gtk4::Popover, items: Vec<MenuItem>) {
-    let list = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    for (label, action) in items {
-        let button = gtk4::Button::with_label(&label);
-        button.add_css_class("flat");
-        if let Some(child) = button.child().and_downcast::<gtk4::Label>() {
-            child.set_xalign(0.0);
-        }
-        let action: Rc<dyn Fn()> = Rc::from(action);
-        button.connect_clicked({
-            let popover = popover.clone();
-            move |_| {
-                popover.popdown();
-                let action = Rc::clone(&action);
-                // After the popover is gone, so an action that opens a
-                // dialog or rebuilds the tree doesn't fight the popdown.
-                glib::idle_add_local_once(move || action());
-            }
-        });
-        list.append(&button);
-    }
-    popover.set_child(Some(&list));
-    popover.popup();
 }
 
 fn show_tree_menu(
@@ -1967,7 +1895,7 @@ pub(super) fn materialize_editor(
     id: Uuid,
     payload: &EditorPayload,
     collapsed: bool,
-    toast_overlay: &adw::ToastOverlay,
+    _toast_overlay: &adw::ToastOverlay,
 ) -> NodeWidget {
     let node = EditorNode::new(&payload.path, collapsed, {
         let app = Rc::clone(app);
@@ -1985,23 +1913,6 @@ pub(super) fn materialize_editor(
         let app = Rc::clone(app);
         move || App::save_editor(&app, id, false)
     });
-    node.reload_button.connect_clicked({
-        let app = Rc::clone(app);
-        let node = node.clone();
-        move |_| {
-            if node.is_modified() {
-                node.show_banner(
-                    "Reloading discards your unsaved edits.",
-                    "Reload anyway",
-                    Some("Cancel"),
-                );
-                app.borrow_mut().file_sync.entry(id).or_default().banner =
-                    Some(SyncBanner::EditorChangedWhileDirty);
-            } else {
-                App::load_editor(&app, id);
-            }
-        }
-    });
     node.banner_primary.connect_clicked({
         let app = Rc::clone(app);
         move |_| App::resolve_editor_banner(&app, id, true)
@@ -2010,88 +1921,136 @@ pub(super) fn materialize_editor(
         let app = Rc::clone(app);
         move |_| App::resolve_editor_banner(&app, id, false)
     });
-    let path = ProjectPath::parse(&payload.path).ok();
-    let diff = payload.diff;
-    node.copy_reference_button.connect_clicked({
-        let node = node.clone();
-        let path = path.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            let Some(path) = &path else { return };
-            let reference = editor_reference(&node, path, diff);
-            node.container.clipboard().set_text(&reference);
-            toast(&toast_overlay, &format!("Copied {reference}"));
-        }
-    });
-    node.ask_agent_button.connect_clicked({
-        let app = Rc::clone(app);
-        let node = node.clone();
-        let path = path.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            let Some(path) = &path else { return };
-            let reference = editor_reference(&node, path, diff);
-            let message = if diff.is_some() {
-                format!("Please review the uncommitted changes in {reference} (read them with `duetctl git diff {path}`)")
-            } else {
-                format!("Please take a look at {reference}")
-            };
-            ask_agent(&app, &node.aux_popover, message, &toast_overlay);
-        }
-    });
-    node.diff_button.connect_clicked({
-        let app = Rc::clone(app);
-        let path = path.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            let Some(path) = &path else { return };
-            let position = App::beside(&app, id);
-            if let Err(error) = App::open_editor(&app, path, Some(DiffScope::Head), position, None)
-            {
-                toast(&toast_overlay, &error);
-            }
-        }
-    });
-    node.source_button.connect_clicked({
-        let app = Rc::clone(app);
-        let path = path.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            let Some(path) = &path else { return };
-            let position = App::beside(&app, id);
-            if let Err(error) = App::open_project_file(&app, path, position, None) {
-                toast(&toast_overlay, &error);
-            }
-        }
-    });
-    for (button, stage) in [(&node.stage_button, true), (&node.unstage_button, false)] {
-        button.connect_clicked({
-            let app = Rc::clone(app);
-            let path = path.clone();
-            let toast_overlay = toast_overlay.clone();
-            move |_| {
-                let Some(path) = &path else { return };
-                let raw = [path.display().to_string()];
-                let result = if stage {
-                    App::git_stage(&app, &raw)
-                } else {
-                    App::git_unstage(&app, &raw)
-                };
-                match result {
-                    Ok(()) => toast(
-                        &toast_overlay,
-                        &format!("{} {path}", if stage { "Staged" } else { "Unstaged" }),
-                    ),
-                    Err(error) => toast(&toast_overlay, &error),
-                }
-            }
-        });
-    }
     {
         let app = Rc::clone(app);
         glib::idle_add_local_once(move || App::load_editor(&app, id));
     }
     NodeWidget::Editor(node)
+}
+
+/// An editor card's right-click menu items (the card-wide ones — connect,
+/// collapse, delete... — are appended by `app::node_menu_items`).
+pub(super) fn editor_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
+    let Some((node, payload)) = app.borrow().editor_widget(id) else {
+        return Vec::new();
+    };
+    let Ok(path) = ProjectPath::parse(&payload.path) else {
+        return Vec::new();
+    };
+    let diff = payload.diff;
+    let source = node.display() == EditorDisplay::Source;
+    let mut items: Vec<MenuItem> = Vec::new();
+    if diff.is_none() && source && !node.is_read_only() {
+        let node_c = node.clone();
+        items.push(("Save\tCtrl+S".to_string(), Box::new(move || node_c.save())));
+    }
+    {
+        let (app_c, node_c) = (Rc::clone(app), node.clone());
+        items.push((
+            "Reload from disk".to_string(),
+            Box::new(move || {
+                if node_c.is_modified() {
+                    node_c.show_banner(
+                        "Reloading discards your unsaved edits.",
+                        "Reload anyway",
+                        Some("Cancel"),
+                    );
+                    app_c.borrow_mut().file_sync.entry(id).or_default().banner =
+                        Some(SyncBanner::EditorChangedWhileDirty);
+                } else {
+                    App::load_editor(&app_c, id);
+                }
+            }),
+        ));
+    }
+    if source {
+        let node_c = node.clone();
+        items.push((
+            "Find and replace\tCtrl+F".to_string(),
+            Box::new(move || node_c.show_search(!node_c.is_read_only())),
+        ));
+        let node_c = node.clone();
+        items.push((
+            "Go to line…\tCtrl+G".to_string(),
+            Box::new(move || node_c.show_goto()),
+        ));
+    }
+    items.push(separator());
+    {
+        let (app_c, node_c, path_c) = (Rc::clone(app), node.clone(), path.clone());
+        items.push((
+            "Copy reference".to_string(),
+            Box::new(move || {
+                let reference = editor_reference(&node_c, &path_c, diff);
+                node_c.container.clipboard().set_text(&reference);
+                App::notify(&app_c, &format!("Copied {reference}"));
+            }),
+        ));
+        let (app_c, node_c, path_c) = (Rc::clone(app), node.clone(), path.clone());
+        items.push((
+            "Ask an agent about this…".to_string(),
+            Box::new(move || {
+                let reference = editor_reference(&node_c, &path_c, diff);
+                let message = if diff.is_some() {
+                    format!(
+                        "Please review the uncommitted changes in {reference} (read them with `duetctl git diff {path_c}`)"
+                    )
+                } else {
+                    format!("Please take a look at {reference}")
+                };
+                ask_agent(&app_c, &node_c.aux_popover, message, &App::toaster(&app_c));
+            }),
+        ));
+    }
+    {
+        let (app_c, path_c) = (Rc::clone(app), path.clone());
+        let (label, open_diff) = match diff {
+            None => ("Show changes (diff)", true),
+            Some(_) => ("Open file", false),
+        };
+        items.push((
+            label.to_string(),
+            Box::new(move || {
+                let position = App::beside(&app_c, id);
+                let result = if open_diff {
+                    App::open_editor(&app_c, &path_c, Some(DiffScope::Head), position, None)
+                } else {
+                    App::open_project_file(&app_c, &path_c, position, None)
+                };
+                if let Err(error) = result {
+                    App::notify(&app_c, &error);
+                }
+            }),
+        ));
+    }
+    if let Some(entry) = app
+        .borrow()
+        .git_status()
+        .ok()
+        .and_then(|s| s.entry(&path).cloned())
+    {
+        for (label, stage) in [("Stage file", true), ("Unstage file", false)] {
+            if (stage && !entry.has_unstaged()) || (!stage && !entry.has_staged()) {
+                continue;
+            }
+            let (app_c, raw) = (Rc::clone(app), path.display().to_string());
+            items.push((
+                label.to_string(),
+                Box::new(move || {
+                    let raw = [raw.clone()];
+                    let result = if stage {
+                        App::git_stage(&app_c, &raw)
+                    } else {
+                        App::git_unstage(&app_c, &raw)
+                    };
+                    if let Err(error) = result {
+                        App::notify(&app_c, &error);
+                    }
+                }),
+            ));
+        }
+    }
+    items
 }
 
 /// The reference the editor's "Copy reference"/"Ask an agent" use: the
@@ -2132,91 +2091,163 @@ pub(super) fn wire_note_file(
         let app = Rc::clone(app);
         move |_| App::resolve_note_banner(&app, id, false)
     });
-    node.file_button.connect_clicked({
-        let app = Rc::clone(app);
-        let toast_overlay = toast_overlay.clone();
-        let popover = node.file_popover.clone();
-        move |button| show_note_file_popover(&app, id, button, &popover, &toast_overlay)
-    });
+    let _ = toast_overlay;
 }
 
-fn show_note_file_popover(
-    app: &Rc<RefCell<App>>,
-    id: Uuid,
-    anchor: &gtk4::Button,
-    popover: &gtk4::Popover,
-    toast_overlay: &adw::ToastOverlay,
-) {
+/// A note card's file-related menu items: link to / unlink from a project
+/// file, and copy the file's reference.
+pub(super) fn note_file_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
     let current = app
         .borrow()
         .nodes
         .get(&id)
         .and_then(|e| e.record.as_note())
         .and_then(|note| note.file.clone());
-    let anchor_widget: gtk4::Widget = anchor.clone().upcast();
+    let mut items: Vec<MenuItem> = Vec::new();
     match current {
         Some(backing) => {
-            let mut items: Vec<MenuItem> = Vec::new();
-            let (app_c, toast_c) = (Rc::clone(app), toast_overlay.clone());
-            let path = backing.path.clone();
+            let (app_c, path) = (Rc::clone(app), backing.path.clone());
             items.push((
-                "Copy reference".to_string(),
-                Box::new({
-                    let anchor = anchor_widget.clone();
-                    move || {
-                        let reference = format!("@file:{path}");
-                        anchor.clipboard().set_text(&reference);
-                        toast(&toast_c, &format!("Copied {reference}"));
+                "Copy file reference".to_string(),
+                Box::new(move || {
+                    let reference = format!("@file:{path}");
+                    if let Some(node) = app_c.borrow().note_widget(id) {
+                        node.container.clipboard().set_text(&reference);
                     }
+                    App::notify(&app_c, &format!("Copied {reference}"));
                 }),
             ));
-            let toast_c = toast_overlay.clone();
+            let app_c = Rc::clone(app);
             items.push((
                 "Unlink from file".to_string(),
                 Box::new(move || {
                     if let Err(error) = App::detach_note_file(&app_c, None, id) {
-                        toast(&toast_c, &error);
+                        App::notify(&app_c, &error);
                     }
                 }),
             ));
-            popup_menu(popover, items);
         }
         None => {
-            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-            content.append(&gtk4::Label::new(Some(
-                "Sync this note with a project file:",
-            )));
-            let entry = gtk4::Entry::new();
-            entry.set_placeholder_text(Some("docs/notes.md"));
-            entry.set_width_chars(30);
-            let link = gtk4::Button::with_label("Link");
-            link.add_css_class("suggested-action");
-            content.append(&entry);
-            content.append(&link);
-            popover.set_child(Some(&content));
-            let submit = {
-                let app = Rc::clone(app);
-                let entry = entry.clone();
-                let popover = popover.clone();
-                let toast_overlay = toast_overlay.clone();
-                move || {
-                    popover.popdown();
-                    match App::attach_note_file(&app, None, id, &entry.text()) {
-                        Ok(path) => toast(&toast_overlay, &format!("Note linked to {path}")),
-                        Err(error) => toast(&toast_overlay, &error),
-                    }
-                }
-            };
-            let submit = Rc::new(submit);
-            link.connect_clicked({
-                let submit = Rc::clone(&submit);
-                move |_| submit()
-            });
-            entry.connect_activate(move |_| submit());
-            popover.popup();
-            entry.grab_focus();
+            let app_c = Rc::clone(app);
+            items.push((
+                "Sync with a project file…".to_string(),
+                Box::new(move || show_note_link_popover(&app_c, id)),
+            ));
         }
     }
+    items
+}
+
+/// The small "which file?" prompt behind "Sync with a project file…",
+/// shown in the note's reusable popover.
+fn show_note_link_popover(app: &Rc<RefCell<App>>, id: Uuid) {
+    let Some(node) = app.borrow().note_widget(id) else {
+        return;
+    };
+    let popover = node.file_popover.clone();
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    content.append(&gtk4::Label::new(Some(
+        "Sync this note with a project file:",
+    )));
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("docs/notes.md"));
+    entry.set_width_chars(30);
+    let link = gtk4::Button::with_label("Sync");
+    link.add_css_class("suggested-action");
+    content.append(&entry);
+    content.append(&link);
+    popover.set_child(Some(&content));
+    let submit = {
+        let app = Rc::clone(app);
+        let entry = entry.clone();
+        let popover = popover.clone();
+        move || {
+            popover.popdown();
+            match App::attach_note_file(&app, None, id, &entry.text()) {
+                Ok(path) => App::notify(&app, &format!("Note synced with {path}")),
+                Err(error) => App::notify(&app, &error),
+            }
+        }
+    };
+    let submit = Rc::new(submit);
+    link.connect_clicked({
+        let submit = Rc::clone(&submit);
+        move |_| submit()
+    });
+    entry.connect_activate(move |_| submit());
+    popover.popup();
+    entry.grab_focus();
+}
+
+/// A FileTree card's menu items: navigation, filters, refresh, commit.
+pub(super) fn tree_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
+    let Some((node, payload)) = app.borrow().tree_widget(id) else {
+        return Vec::new();
+    };
+    let (can_back, can_forward) = app
+        .borrow()
+        .tree_state
+        .get(&id)
+        .map(|s| (s.history.can_go_back(), s.history.can_go_forward()))
+        .unwrap_or((false, false));
+    let root = parse_root(&payload.root);
+    let mut items: Vec<MenuItem> = Vec::new();
+    let app_c = Rc::clone(app);
+    items.push((
+        "Refresh".to_string(),
+        Box::new(move || {
+            if let Some(state) = app_c.borrow_mut().tree_state.get_mut(&id) {
+                state.files = None;
+            }
+            App::refresh_file_tree(&app_c, id);
+        }),
+    ));
+    let app_c = Rc::clone(app);
+    items.push((
+        "Collapse all folders".to_string(),
+        Box::new(move || App::update_tree(&app_c, id, |payload| payload.expanded.clear())),
+    ));
+    if let Some(parent) = root.parent() {
+        let app_c = Rc::clone(app);
+        items.push((
+            "Up one folder".to_string(),
+            Box::new(move || App::navigate_tree(&app_c, id, parent.clone())),
+        ));
+    }
+    if can_back {
+        let app_c = Rc::clone(app);
+        items.push((
+            "Back".to_string(),
+            Box::new(move || App::step_tree_history(&app_c, id, false)),
+        ));
+    }
+    if can_forward {
+        let app_c = Rc::clone(app);
+        items.push((
+            "Forward".to_string(),
+            Box::new(move || App::step_tree_history(&app_c, id, true)),
+        ));
+    }
+    items.push(separator());
+    let app_c = Rc::clone(app);
+    let show_hidden = payload.show_hidden;
+    items.push((
+        check_label("Show hidden files", show_hidden),
+        Box::new(move || App::update_tree(&app_c, id, |p| p.show_hidden = !show_hidden)),
+    ));
+    let app_c = Rc::clone(app);
+    let respect = payload.respect_gitignore;
+    items.push((
+        check_label("Hide ignored files", respect),
+        Box::new(move || App::update_tree(&app_c, id, |p| p.respect_gitignore = !respect)),
+    ));
+    items.push(separator());
+    let (app_c, anchor) = (Rc::clone(app), node.container.clone());
+    items.push((
+        "Commit staged changes…".to_string(),
+        Box::new(move || open_commit_dialog(&app_c, &anchor, &App::toaster(&app_c))),
+    ));
+    items
 }
 
 /// Lets project files be dropped on the canvas — from a FileTree row

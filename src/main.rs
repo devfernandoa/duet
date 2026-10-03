@@ -133,6 +133,24 @@ fn build_ui(application: &adw::Application) {
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&toolbar_view));
     window.set_content(Some(&toast_overlay));
+    app.borrow_mut().set_toast_overlay(&toast_overlay);
+
+    // Esc leaves "connect" mode. Capture phase on the window, so it works
+    // even while a terminal has focus (and only consumes Esc in that mode).
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_controller, key, _code, _modifiers| {
+            if key == gtk4::gdk::Key::Escape && App::cancel_link(&app) {
+                toast_overlay.add_toast(adw::Toast::new("Connecting cancelled"));
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(keys);
 
     zoom_out_button.connect_clicked({
         let app = app.clone();
@@ -158,6 +176,11 @@ fn build_ui(application: &adw::Application) {
         let app = app.clone();
         let toast_overlay = toast_overlay.clone();
         move |world| {
+            // A click on empty canvas in "connect" mode cancels it.
+            if !app.borrow().covers_point(world) && App::cancel_link(&app) {
+                toast_overlay.add_toast(adw::Toast::new("Connecting cancelled"));
+                return;
+            }
             if let Some(message) = App::click_link_at(&app, world) {
                 toast_overlay.add_toast(adw::Toast::new(&message));
             } else if !app.borrow().covers_point(world) {
@@ -182,9 +205,8 @@ fn build_ui(application: &adw::Application) {
         move |start, current| App::apply_marquee_selection(&app, start, current)
     });
 
-    // Restore after the toast overlay exists: restored sessions' handoff
-    // buttons are wired (via `wire_link_controls`) to show a toast on
-    // failure, and `restore`'s own load/spawn errors are also toasted below.
+    // Restore after the toast overlay exists: `restore`'s own load/spawn
+    // errors are toasted below, and card menus report through it too.
     let mut errors = App::restore(&app, &toast_overlay);
     sync_workspace_button(&workspace_label, &app);
     // Writes back immediately rather than waiting for the first edit, so a
