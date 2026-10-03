@@ -449,7 +449,7 @@ fn build_ui(application: &adw::Application) {
     }
 
     let menus = wire_canvas_edit_actions(application, &app, &window, &toast_overlay);
-    wire_theme_action(application, &toast_overlay);
+    wire_theme_action(application, &window, &toast_overlay);
     add_button.set_menu_model(Some(&menus.add));
     more_button.set_menu_model(Some(&menus.more));
     wire_help_actions(application, &window);
@@ -895,17 +895,44 @@ fn wire_canvas_edit_actions(
     HeaderMenus { add, more }
 }
 
-fn apply_theme(theme: settings::ThemePreference) {
+/// Duet's own palettes. A user GTK theme (`~/.config/gtk-4.0/gtk.css`,
+/// `GTK_THEME`) is loaded at user priority, above an application's styles,
+/// and redefines libadwaita's colors — so switching libadwaita's color
+/// scheme alone changes nothing visible under such a theme. Light and Dark
+/// therefore also load a full palette just above user priority; Follow
+/// System loads nothing and leaves the desktop's theme in charge.
+const LIGHT_PALETTE: &str = include_str!("themes/light.css");
+const DARK_PALETTE: &str = include_str!("themes/dark.css");
+
+/// Above the user's own GTK theme.
+const PALETTE_PRIORITY: u32 = gtk4::STYLE_PROVIDER_PRIORITY_USER + 10;
+
+fn apply_theme(theme: settings::ThemePreference, palette: &gtk4::CssProvider) {
     adw::StyleManager::default().set_color_scheme(match theme {
         settings::ThemePreference::System => adw::ColorScheme::Default,
         settings::ThemePreference::Light => adw::ColorScheme::ForceLight,
         settings::ThemePreference::Dark => adw::ColorScheme::ForceDark,
     });
+    palette.load_from_data(match theme {
+        settings::ThemePreference::System => "",
+        settings::ThemePreference::Light => LIGHT_PALETTE,
+        settings::ThemePreference::Dark => DARK_PALETTE,
+    });
 }
 
 /// ⋯ → Appearance: Follow System / Light / Dark, applied at once and
 /// remembered in `settings.json`.
-fn wire_theme_action(application: &adw::Application, toast_overlay: &adw::ToastOverlay) {
+fn wire_theme_action(
+    application: &adw::Application,
+    window: &adw::ApplicationWindow,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let palette = gtk4::CssProvider::new();
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(window),
+        &palette,
+        PALETTE_PRIORITY,
+    );
     let path = settings::default_settings_path().ok();
     let (current, warning) = path
         .as_deref()
@@ -914,7 +941,7 @@ fn wire_theme_action(application: &adw::Application, toast_overlay: &adw::ToastO
     if let Some(warning) = warning {
         toast_overlay.add_toast(adw::Toast::new(&warning));
     }
-    apply_theme(current.theme);
+    apply_theme(current.theme, &palette);
     let action = gtk4::gio::SimpleAction::new_stateful(
         "theme",
         Some(glib::VariantTy::STRING),
@@ -930,7 +957,7 @@ fn wire_theme_action(application: &adw::Application, toast_overlay: &adw::ToastO
                 return;
             };
             action.set_state(&theme.id().to_variant());
-            apply_theme(theme);
+            apply_theme(theme, &palette);
             if let Some(path) = &path {
                 let (mut saved, _) = settings::Settings::load(path);
                 saved.theme = theme;

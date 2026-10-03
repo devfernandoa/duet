@@ -1,0 +1,53 @@
+/* Duet's own Dark palette (⋯ → Appearance → Dark). Neutral greys, deliberately not tied to the desktop's own dark theme.
+   Loaded above the user's GTK theme (gtk.css, GTK_THEME), so choosing it
+   always looks the same whatever the desktop is themed with. */
+@define-color accent_color #78aeed;
+@define-color accent_bg_color #3584e4;
+@define-color accent_fg_color #ffffff;
+@define-color destructive_color #ff7b63;
+@define-color destructive_bg_color #c01c28;
+@define-color destructive_fg_color #ffffff;
+@define-color success_color #8ff0a4;
+@define-color success_bg_color #26a269;
+@define-color success_fg_color #ffffff;
+@define-color warning_color #f8e45c;
+@define-color warning_bg_color #cd9309;
+@define-color warning_fg_color rgba(0,0,0,0.8);
+@define-color error_color #ff7b63;
+@define-color error_bg_color #c01c28;
+@define-color error_fg_color #ffffff;
+@define-color window_bg_color #262626;
+@define-color window_fg_color #f2f2f2;
+@define-color view_bg_color #1f1f1f;
+@define-color view_fg_color #f2f2f2;
+@define-color headerbar_bg_color #333333;
+@define-color headerbar_fg_color #f2f2f2;
+@define-color headerbar_border_color #f2f2f2;
+@define-color headerbar_backdrop_color #262626;
+@define-color headerbar_shade_color rgba(0,0,0,0.36);
+@define-color headerbar_darker_shade_color rgba(0,0,0,0.9);
+@define-color sidebar_bg_color #2e2e2e;
+@define-color sidebar_fg_color #f2f2f2;
+@define-color sidebar_backdrop_color #282828;
+@define-color sidebar_shade_color rgba(0,0,0,0.25);
+@define-color card_bg_color #333333;
+@define-color card_fg_color #f2f2f2;
+@define-color card_shade_color rgba(0,0,0,0.36);
+@define-color dialog_bg_color #333333;
+@define-color dialog_fg_color #f2f2f2;
+@define-color popover_bg_color #3a3a3a;
+@define-color popover_fg_color #f2f2f2;
+@define-color popover_shade_color rgba(0,0,0,0.25);
+@define-color thumbnail_bg_color #3a3a3a;
+@define-color thumbnail_fg_color #f2f2f2;
+@define-color shade_color rgba(0,0,0,0.25);
+@define-color scrollbar_outline_color rgba(0,0,0,0.5);
+
+/* A few widget rules as well, for user themes that style widgets directly
+   rather than only redefining colors. Deliberately nothing that Duet's own
+   style.css colors (cards, notes, text views, lists): this sheet's priority
+   would override those. */
+window.background { background-color: @window_bg_color; color: @window_fg_color; }
+headerbar { background-color: @headerbar_bg_color; color: @headerbar_fg_color; }
+popover > contents, popover > arrow { background-color: @popover_bg_color; color: @popover_fg_color; }
+toast { background-color: @popover_bg_color; color: @popover_fg_color; }
