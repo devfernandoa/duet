@@ -12,13 +12,35 @@ agent cards and they can message each other with `duetctl`, duet's local
 control CLI — the same service layer the GUI itself calls, so nothing an
 agent can do is a GUI-only trick.
 
+<p align="center">
+  <a href="https://devfernandoa.github.io/duet/"><img src="site/assets/demo.gif" alt="Duet demo: a Lead agent delegates to Backend, Frontend tests the app in a portal, and the change is committed and pushed" width="960"></a>
+  <br>
+  <sub><a href="site/assets/demo.mp4">Watch the full demo video</a> · <a href="https://devfernandoa.github.io/duet/">Product page</a> · <a href="https://github.com/devfernandoa/duet/releases/latest">Download</a></sub>
+</p>
+
 **Duet 1.0** covers: persistent workspaces, multiple agents with roles and
 agent-to-agent messaging, agent-readable and -writable Markdown notes,
 `@` resource addressing, a project file tree and editor, the everyday Git
 workflow (status, diff, stage, commit, branches, fetch/pull/push), browser
 portals agents can drive, drawings and group sections. Chat views, floors,
 reusable arrangements, routines and remote environments are post-1.0 ideas —
-see [Known limitations](#known-limitations).
+see the [roadmap](https://devfernandoa.github.io/duet/#roadmap) and
+[Known limitations](#known-limitations).
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Agents messaging each other](site/assets/agents.png) | ![An agent driving a browser portal](site/assets/portal.png) |
+| A Lead agent hands a task to Backend with `duetctl send`; Backend reads the file and writes the code. | Frontend reads and clicks the live app in a browser portal, then ticks off the QA note. |
+| ![The Git popover](site/assets/git.png) | ![File tree, editor and note in a group](site/assets/files.png) |
+| Stage, commit, branch, fetch, pull and push from the header bar. | File tree, editor and Markdown notes, gathered in a colored group. |
+
+Light and dark themes, independent of your system theme:
+
+| Dark | Light |
+|---|---|
+| ![Duet in dark mode](site/assets/canvas-dark.png) | ![Duet in light mode](site/assets/canvas-light.png) |
 
 ## Build
 
