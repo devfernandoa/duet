@@ -169,12 +169,23 @@ fn codex_home_env(home_dir: Option<&Path>) -> Vec<(String, String)> {
 /// usable as one, so Duet opts every launch it starts into the same
 /// baseline a human would pick for agentic work, the same way Claude
 /// Code's own Bash tool isn't read-only by default either.
+///
+/// Also always passes `--ask-for-approval never`: Codex's default still
+/// pauses to ask a human before most commands even inside a
+/// `workspace-write` sandbox, which has nothing left to approve *for* in a
+/// duet-launched terminal — nobody is sitting at this one watching for a
+/// prompt the way they would a normal interactive `codex` session. A
+/// command that would have needed approval simply fails and is reported
+/// back to the model instead (see the flag's own help text), same as any
+/// other command failure it already has to handle.
 pub fn codex_launch(resume: bool, initial_prompt: Option<&str>, home_dir: Option<&Path>) -> Launch {
     let mut args = vec![
         "-s".to_string(),
         "workspace-write".to_string(),
         "-c".to_string(),
         "sandbox_workspace_write.network_access=true".to_string(),
+        "-a".to_string(),
+        "never".to_string(),
     ];
     if resume {
         args.push("resume".to_string());
@@ -312,13 +323,16 @@ mod tests {
         );
     }
 
-    /// Every launch always opts out of Codex's own `read-only` default —
-    /// see `codex_launch`'s doc comment for why.
-    const CODEX_SANDBOX_ARGS: [&str; 4] = [
+    /// Every launch always opts out of Codex's own `read-only` sandbox and
+    /// always-ask approval defaults — see `codex_launch`'s doc comment for
+    /// why.
+    const CODEX_SANDBOX_ARGS: [&str; 6] = [
         "-s",
         "workspace-write",
         "-c",
         "sandbox_workspace_write.network_access=true",
+        "-a",
+        "never",
     ];
 
     #[test]
