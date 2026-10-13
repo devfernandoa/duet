@@ -1544,7 +1544,13 @@ pub fn configure_node(
                 terminal.name = name.trim().to_string();
                 (before, entry.record.clone())
             };
-            App::push_undo(app, CanvasCommand::SetProperties { before, after });
+            App::push_undo(
+                app,
+                CanvasCommand::SetProperties {
+                    before: vec![before],
+                    after: vec![after],
+                },
+            );
         }
         _ => return Err("that node kind has nothing to configure yet".to_string()),
     }
@@ -1557,7 +1563,7 @@ pub fn configure_node(
 }
 ```
 
-Before finalizing, confirm `CanvasCommand::SetProperties`'s exact field names (`before`/`after`) by reading its definition next to `MoveNodes`/`ResizeNode` in the same enum.
+**Verified, not guessed:** `CanvasCommand::SetProperties`'s real fields are `before: Vec<NodeRecord>, after: Vec<NodeRecord>` (app.rs:323-326) — a *batch* property change, not a single-record pair. The snippet above already wraps both sides in `vec![...]`, matching exactly how the existing `update_group` builds its own `SetProperties` push (app.rs:2334-2340: `before: vec![before], after: vec![after]`) — do not pass bare `NodeRecord` values here, that would fail to compile against the real enum shape.
 
 Add `ControlRequest::CanvasConfigure { requested_by: Option<Uuid>, id: Uuid, name: Option<String>, color: Option<String> }`, its `handle_request` arm, and `duet canvas configure <id> [--name <text>] [--color <text>]` CLI parsing.
 
