@@ -660,6 +660,19 @@ fn parse_control_capability(name: &str) -> Result<ControlCapability, String> {
     }
 }
 
+/// The inverse of `parse_control_capability`: the exact kebab-case string
+/// `duetctl control status` must print so its own output can be fed
+/// straight back into `control request --capability <name>`. Derived from
+/// `ControlCapability`'s existing `#[serde(rename_all = "kebab-case")]`
+/// rather than a second hand-written table that could drift from
+/// `parse_control_capability`'s.
+fn capability_slug(cap: ControlCapability) -> String {
+    serde_json::to_value(cap)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{cap:?}"))
+}
+
 /// Resolves a role name to its id against the live role roster (built-in
 /// plus custom) — the same name-matching style `agent::find_identity`
 /// already uses for agents. `"none"` is handled by the caller before this
@@ -958,11 +971,11 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 None => ControlCapability::DEFAULT_SET
                     .into_iter()
                     .chain([ControlCapability::RemoveCanvasNodes])
-                    .map(|cap| format!("{cap:?}"))
+                    .map(capability_slug)
                     .collect(),
                 Some(agent_id) => App::control_status(app, agent_id)
                     .into_iter()
-                    .map(|cap| format!("{cap:?}"))
+                    .map(capability_slug)
                     .collect(),
             };
             ControlResponse::ControlGrantStatus { granted }
@@ -2486,6 +2499,27 @@ fn print_resolve_outcome(outcome: &ResolveOutcome) {
 mod tests {
     use super::*;
     use crate::account::AccountStore;
+
+    /// `duetctl control status`'s output must be exactly what
+    /// `duetctl control request --capability <name>` accepts back — a
+    /// hand-written mismatch here (e.g. `format!("{cap:?}")` emitting
+    /// `"SpawnAgents"` while the parser only accepts `"spawn-agents"`)
+    /// would silently break that round trip. No GTK involved, so this
+    /// doesn't need `gtk4::init()`/`#[ignore]`.
+    #[test]
+    fn capability_slug_round_trips_through_parse_control_capability() {
+        for cap in ControlCapability::DEFAULT_SET
+            .into_iter()
+            .chain([ControlCapability::RemoveCanvasNodes])
+        {
+            let slug = capability_slug(cap);
+            assert_eq!(
+                parse_control_capability(&slug),
+                Ok(cap),
+                "capability_slug({cap:?}) = {slug:?} doesn't round-trip through parse_control_capability"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "needs a display"]

@@ -388,8 +388,12 @@ pub struct App {
     pub runtime: SessionRuntime,
     /// Milestone 7.6: delegated canvas-control grants for this process's
     /// agents. Never persisted — see `orchestration::control_grant`'s module
-    /// doc.
-    pub control: DelegatedControlService,
+    /// doc. Deliberately not `pub`: every mutating method
+    /// (`approve`/`deny` above all) must stay reachable only from inside
+    /// the `app` module tree — see `app/delegated_control.rs`'s module
+    /// doc — and a `pub` field would make that a convention instead of a
+    /// compiler-enforced guarantee.
+    control: DelegatedControlService,
     pub edges: Vec<EdgeRecord>,
     /// Routing, permissions and per-agent queueing for agent-to-agent
     /// messages — see `orchestration::bus`. Not persisted: a message is a
