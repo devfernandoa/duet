@@ -5037,6 +5037,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a display"]
     fn require_control_capability_allows_the_human_operator() {
         if gtk4::init().is_err() {
             return;
@@ -5052,6 +5053,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a display"]
     fn require_control_capability_denies_an_ungranted_agent() {
         if gtk4::init().is_err() {
             return;
@@ -5069,6 +5071,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a display"]
     fn closing_a_node_revokes_that_agents_control_grant() {
         if gtk4::init().is_err() {
             return;
