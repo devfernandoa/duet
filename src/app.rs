@@ -2516,45 +2516,53 @@ impl App {
     /// granting it no `WriteNote`). A future pass can expose revoking/editing
     /// capabilities explicitly; until then these are the defaults that make
     /// the connect gesture actually do what it visually promises.
-    pub fn create_edge(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
-        let mut app = app.borrow_mut();
+    pub fn create_edge(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        source: Uuid,
+        target: Uuid,
+    ) -> Result<bool, String> {
+        App::require_control_capability(app, requested_by, ControlCapability::ConnectCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let mut app_mut = app.borrow_mut();
         // Groups are visual sections: never an endpoint of a connection.
         let is_group = |id: &Uuid| {
-            app.nodes
+            app_mut
+                .nodes
                 .get(id)
                 .is_some_and(|e| e.record.kind.is_background())
         };
         if is_group(&source) || is_group(&target) {
-            return false;
+            return Ok(false);
         }
-        if source != target
-            && app.nodes.contains_key(&source)
-            && app.nodes.contains_key(&target)
-            && !app
+        let created = source != target
+            && app_mut.nodes.contains_key(&source)
+            && app_mut.nodes.contains_key(&target)
+            && !app_mut
                 .edges
                 .iter()
-                .any(|e| e.source == source && e.target == target)
-        {
+                .any(|e| e.source == source && e.target == target);
+        if created {
             let mut edge = EdgeRecord::visual(Uuid::new_v4(), source, target);
-            let source_is_terminal = app
+            let source_is_terminal = app_mut
                 .nodes
                 .get(&source)
                 .is_some_and(|e| e.record.as_terminal().is_some());
-            let target_is_terminal = app
+            let target_is_terminal = app_mut
                 .nodes
                 .get(&target)
                 .is_some_and(|e| e.record.as_terminal().is_some());
-            let source_is_note = app
+            let source_is_note = app_mut
                 .nodes
                 .get(&source)
                 .is_some_and(|e| e.record.as_note().is_some());
-            let target_is_note = app
+            let target_is_note = app_mut
                 .nodes
                 .get(&target)
                 .is_some_and(|e| e.record.as_note().is_some());
             // Files, folders and drawings handed to an agent as context.
             let is_file_view = |id: Uuid| {
-                app.nodes.get(&id).is_some_and(|e| {
+                app_mut.nodes.get(&id).is_some_and(|e| {
                     matches!(
                         e.record.kind,
                         NodeKind::Editor(_) | NodeKind::FileTree(_) | NodeKind::Drawing(_)
@@ -2575,7 +2583,8 @@ impl App {
                 // in the agent's `duetctl whoami` as context to start from
                 // (a drawing is then readable with `duetctl drawing read`).
                 edge.capabilities.insert(EdgeCapability::ShareContext);
-            } else if let (Some(a), Some(b)) = (app.nodes.get(&source), app.nodes.get(&target))
+            } else if let (Some(a), Some(b)) =
+                (app_mut.nodes.get(&source), app_mut.nodes.get(&target))
                 && let Some(capability) =
                     portals::default_portal_capability(&a.record.kind, &b.record.kind)
             {
@@ -2584,13 +2593,27 @@ impl App {
                 // nothing.
                 edge.capabilities.insert(capability);
             }
-            app.edges.push(edge.clone());
-            app.undo_stack.push(CanvasCommand::AddEdge { edge });
-            app.redo_stack.clear();
-            let _ = app.persist();
-            return true;
+            app_mut.edges.push(edge.clone());
+            app_mut.undo_stack.push(CanvasCommand::AddEdge { edge });
+            app_mut.redo_stack.clear();
+            let _ = app_mut.persist();
         }
-        false
+        drop(app_mut);
+        if created && let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            let (source_name, target_name) = {
+                let app_ref = app.borrow();
+                (
+                    node_display_name(&app_ref, source),
+                    node_display_name(&app_ref, target),
+                )
+            };
+            App::notify(
+                app,
+                &format!("{requester} connected {source_name} -> {target_name}"),
+            );
+        }
+        Ok(created)
     }
 
     /// Puts the `link-source` CSS class on exactly the node named by
@@ -2822,7 +2845,10 @@ impl App {
             app.borrow().refresh_link_highlight();
             return Some("Groups are visual sections and can't be connected".to_string());
         }
-        let created = App::create_edge(app, source, target);
+        let created = match App::create_edge(app, None, source, target) {
+            Ok(created) => created,
+            Err(error) => return Some(error),
+        };
         let app_ref = app.borrow();
         app_ref.refresh_link_highlight();
         if !created {
@@ -6074,9 +6100,9 @@ mod tests {
         materialize_node(&app, note_a.clone(), &toast).unwrap();
         materialize_node(&app, note_b.clone(), &toast).unwrap();
 
-        assert!(App::create_edge(&app, agent_a.id, agent_b.id));
-        assert!(App::create_edge(&app, agent_a.id, note_a.id));
-        assert!(App::create_edge(&app, note_a.id, note_b.id));
+        assert!(App::create_edge(&app, None, agent_a.id, agent_b.id).unwrap());
+        assert!(App::create_edge(&app, None, agent_a.id, note_a.id).unwrap());
+        assert!(App::create_edge(&app, None, note_a.id, note_b.id).unwrap());
 
         let capabilities_between =
             |a: Uuid, b: Uuid| -> std::collections::BTreeSet<EdgeCapability> {
@@ -6102,6 +6128,69 @@ mod tests {
 
         app.borrow_mut().runtime.terminate(agent_a.id);
         app.borrow_mut().runtime.terminate(agent_b.id);
+    }
+
+    /// §7.6's delegated-control gate on `App::create_edge`: an agent needs
+    /// `ConnectCanvasNodes` over the active workspace before it may connect
+    /// two nodes.
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_edge_requires_connect_canvas_nodes_capability_for_an_agent() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let a = terminal_node(EnvironmentKind::LocalPty);
+        let b = terminal_node(EnvironmentKind::LocalPty);
+        let (id_a, id_b) = (a.id, b.id);
+        materialize_node(&app, a, &adw::ToastOverlay::new()).unwrap();
+        materialize_node(&app, b, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+
+        assert!(
+            App::create_edge(&app, Some(agent), id_a, id_b)
+                .unwrap_err()
+                .contains("not authorized")
+        );
+
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::ConnectCanvasNodes]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        assert!(App::create_edge(&app, Some(agent), id_a, id_b).unwrap());
+    }
+
+    /// The human operator (`requested_by: None`) is always authorized,
+    /// unaffected by the new gate.
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_edge_still_works_unauthenticated_for_the_human_operator() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let a = terminal_node(EnvironmentKind::LocalPty);
+        let b = terminal_node(EnvironmentKind::LocalPty);
+        let (id_a, id_b) = (a.id, b.id);
+        materialize_node(&app, a, &adw::ToastOverlay::new()).unwrap();
+        materialize_node(&app, b, &adw::ToastOverlay::new()).unwrap();
+
+        assert!(App::create_edge(&app, None, id_a, id_b).unwrap());
     }
 
     /// Milestone 4's full acceptance scenario, exercised at the service
@@ -6528,8 +6617,8 @@ mod tests {
         assert!(message.contains("can't be connected"), "{message}");
         assert!(app.borrow().edges.is_empty());
         // Enforced by the shared service, not just the GUI gesture.
-        assert!(!App::create_edge(&app, note, group));
-        assert!(!App::create_edge(&app, group, drawing));
+        assert!(!App::create_edge(&app, None, note, group).unwrap());
+        assert!(!App::create_edge(&app, None, group, drawing).unwrap());
         assert!(app.borrow().edges.is_empty());
         let labels: Vec<String> = node_menu_items(&app, group)
             .into_iter()
@@ -6741,7 +6830,7 @@ mod tests {
             .unwrap_err();
         assert!(refused.contains("not authorized"), "{refused}");
 
-        assert!(App::create_edge(&app, agent.id, drawing));
+        assert!(App::create_edge(&app, None, agent.id, drawing).unwrap());
         assert_eq!(
             app.borrow().edges[0].capabilities,
             [EdgeCapability::ShareContext].into_iter().collect()

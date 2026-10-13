@@ -186,6 +186,17 @@ pub enum ControlRequest {
         #[serde(default)]
         color: Option<String>,
     },
+    /// `duetctl canvas connect <source-id> <target-id>`: see
+    /// `App::create_edge`. Fails if `requested_by` lacks
+    /// `ConnectCanvasNodes`. Capabilities on the new edge are never chosen
+    /// here — they come entirely from `create_edge`'s existing
+    /// kind-pair table, which is already least-privilege by construction.
+    CanvasConnect {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        source: Uuid,
+        target: Uuid,
+    },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
     /// as prompt text — see `orchestration::skill`. `agent_id` is resolved
@@ -1191,6 +1202,20 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 message: format!("configured node {id}"),
             },
         ),
+        ControlRequest::CanvasConnect {
+            requested_by,
+            source,
+            target,
+        } => respond(
+            App::create_edge(app, requested_by, source, target),
+            |created| ControlResponse::CanvasDone {
+                message: if created {
+                    format!("connected {source} -> {target}")
+                } else {
+                    format!("{source} and {target} are not connected to each other")
+                },
+            },
+        ),
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -2187,12 +2212,13 @@ const CANVAS_USAGE: &str = r#"usage:
   duetctl canvas resize <id> --width <num> --height <num>
   duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
                          --x <num> --y <num> [--width <num>] [--height <num>]
-  duetctl canvas configure <id> [--name <text>] [--color <text>]"#;
+  duetctl canvas configure <id> [--name <text>] [--color <text>]
+  duetctl canvas connect <source-id> <target-id>"#;
 
-/// `duetctl canvas move|resize|create|configure <id> ...`: Milestone 7.6's
-/// delegated canvas-control move/resize/create/configure — see
+/// `duetctl canvas move|resize|create|configure|connect <id> ...`: Milestone
+/// 7.6's delegated canvas-control move/resize/create/configure/connect — see
 /// `App::move_node`/`App::resize_node`/`App::create_canvas_node`/
-/// `App::configure_node`.
+/// `App::configure_node`/`App::create_edge`.
 fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [cmd, id, rest @ ..] if cmd == "move" => parse_canvas_move(parse_uuid_arg(id)?, rest),
@@ -2201,6 +2227,11 @@ fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, id, rest @ ..] if cmd == "configure" => {
             parse_canvas_configure(parse_uuid_arg(id)?, rest)
         }
+        [cmd, source, target] if cmd == "connect" => Ok(ControlRequest::CanvasConnect {
+            requested_by: acting_agent_id(),
+            source: parse_uuid_arg(source)?,
+            target: parse_uuid_arg(target)?,
+        }),
         _ => anyhow::bail!(CANVAS_USAGE),
     }
 }
