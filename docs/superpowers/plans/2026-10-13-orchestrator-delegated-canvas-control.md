@@ -885,7 +885,7 @@ git commit -m "feat: add control request/status CLI and the human-only approval 
 - Modify: `src/control.rs` (`AgentsCreate`, its `handle_request` arm, CLI parsing)
 
 **Interfaces:**
-- Consumes: `App::require_control_capability` (Task 2), existing `App::create_session`/`materialize_node`, `role::LaunchRequest.initial_prompt` (research item 6 — the same field role instructions already fold into the first launch's prompt).
+- Consumes: `App::require_control_capability` (Task 2), existing `App::create_session`/`materialize_node`/`build_terminal_launch`/`orchestration::env::discovery_prompt` — the verified live seam for an initial task (see Step 3 below; `role::LaunchRequest.initial_prompt` via role-instruction-folding is dead code for this purpose as of `finish_hand_off`'s current comment — do not use it).
 - Produces: `App::create_agent(app, requested_by, name, cwd, agent, role_id, position: Option<(f64,f64)>, size: Option<(f64,f64)>, initial_prompt: Option<String>) -> anyhow::Result<Uuid>` (signature grows; update its two existing call sites — `control.rs`'s `AgentsCreate` arm and anywhere else `App::create_agent` is called).
 
 **Design note — two independent gates, not one AND'd together:** `create_agent` keeps its existing `require_manager` check for a plain call (no `position`/`size`/`initial_prompt` — today's exact `duetctl agents create` behavior, unchanged). The moment ANY of the three new parameters is used, the call is exercising the NEW Milestone 7.6 surface, so it is gated by `require_control_capability(..., SpawnAgents)` **instead of** `require_manager` — not in addition to it. This matters: §20 says role alone must not grant control, and a human-approved `SpawnAgents` grant is a strictly more specific, more recent authorization than a standing manager role, so it must be sufficient on its own — an orchestrator agent with a grant but no manager role must still be able to use it. Requiring both would also make a grant useless for any non-manager-role agent, which the spec never asks for.
@@ -997,6 +997,7 @@ pub fn create_agent(
         role_id,
         viewport_center_world,
         &adw::ToastOverlay::new(),
+        initial_prompt,
     )?;
     if let Some(size) = size {
         let mut app_mut = app.borrow_mut();
@@ -1004,9 +1005,6 @@ pub fn create_agent(
             entry.record.size = size;
             entry.widget.apply_resize(size);
         }
-    }
-    if let Some(prompt) = initial_prompt {
-        App::queue_initial_prompt(app, id, prompt);
     }
     if let Some(agent_id) = requested_by {
         let requester = App::agent_display_name(app, agent_id);
@@ -1016,7 +1014,7 @@ pub fn create_agent(
 }
 ```
 
-Add a small position default and the "queue an initial prompt" helper next to `create_agent`:
+Add a small position default next to `create_agent`:
 
 ```rust
 /// Where a spawned agent lands when the caller didn't ask for a specific
@@ -1029,22 +1027,54 @@ fn default_spawn_position(app: &Rc<RefCell<App>>) -> (f64, f64) {
     let count = app.borrow().nodes.len() as f64;
     (120.0 + count * 40.0, 120.0 + count * 40.0)
 }
-
-/// §9: the safest existing mechanism for "start this agent with a task" —
-/// the same `LaunchRequest.initial_prompt` field role instructions and
-/// handoff summaries already fold into an agent's very first prompt. No
-/// new PTY-typing path.
-fn queue_initial_prompt(app: &Rc<RefCell<App>>, id: Uuid, prompt: String) {
-    let mut app_mut = app.borrow_mut();
-    if let Some(entry) = app_mut.nodes.get_mut(&id)
-        && let Some(terminal) = entry.record.kind.as_terminal_mut()
-    {
-        terminal.pending_initial_prompt = Some(prompt);
-    }
-}
 ```
 
-This last step assumes `TerminalPayload` does not yet have a `pending_initial_prompt`-style field distinct from role-instruction folding — **before writing this**, read `role.rs`'s `with_role_instructions`/`LaunchRequest.initial_prompt` and `build_terminal_launch` (app.rs ~4673) end to end to find the exact existing seam where a role's instructions get folded into the first prompt, and reuse that exact seam for an orchestrator-supplied task instead of inventing a new field, per research item 6 and the Global Constraints "reuse existing services" rule. If the seam takes a `&str`/`Option<&str>` read at spawn time rather than a persisted field, thread `initial_prompt` through `create_session`'s call to `build_terminal_launch` instead of storing it on `TerminalPayload`. Adjust this step to match what you find; do not persist a prompt that was always meant to be transient.
+**§9's "initial task" seam — verified by direct inspection, not guessed:** `role.rs`'s `with_role_instructions`/`LaunchRequest.initial_prompt` is **not** the live seam — `finish_hand_off` (app.rs ~2723-2756)'s own comment says role instructions and discovery text "are no longer resent as a prompt… only the handoff summary." The actual seam a brand-new Terminal's first launch uses is `build_terminal_launch` (app.rs ~4726): `let initial_prompt = terminal.never_launched.then(|| orchestration::env::discovery_prompt(None, skill_installed)).flatten();` — `orchestration::env::discovery_prompt(base: Option<&str>, skill_installed: bool) -> Option<String>` already combines a caller-supplied `base` with the discovery instruction exactly the way role instructions used to; it's a pure, already-existing composition function. Thread an orchestrator task through as that `base`, transiently, with no new persisted field:
+
+1. Give `build_terminal_launch` a new trailing parameter and use it as `discovery_prompt`'s `base`:
+   ```rust
+   fn build_terminal_launch(
+       app: &App,
+       id: Uuid,
+       terminal: &TerminalPayload,
+       initial_task: Option<&str>,
+   ) -> anyhow::Result<Launch> {
+       // ...unchanged...
+       let initial_prompt = terminal
+           .never_launched
+           .then(|| orchestration::env::discovery_prompt(initial_task, skill_installed))
+           .flatten();
+       // ...unchanged...
+   }
+   ```
+   It has exactly two call sites (grep confirmed): `restart_selected_terminals` (app.rs ~2949) — pass `None` (a restart never carries a fresh task) — and inside `materialize_node`'s `Terminal` match arm (app.rs ~4425, becoming `materialize_node_inner`'s arm below) — pass the new parameter through.
+
+2. `materialize_node` (app.rs ~4399) has roughly 31 call sites across `app.rs`/`app/files.rs`/`app/portals.rs` (mostly tests) — too many to touch for a parameter only one caller needs. Instead, rename its existing body to a new function with the extra parameter, and restore `materialize_node` itself as a 3-line pass-through wrapper so every existing call site keeps compiling unchanged:
+   ```rust
+   fn materialize_node(
+       app: &Rc<RefCell<App>>,
+       record: NodeRecord,
+       toast_overlay: &adw::ToastOverlay,
+   ) -> Result<(), String> {
+       materialize_node_inner(app, record, toast_overlay, None)
+   }
+
+   fn materialize_node_inner(
+       app: &Rc<RefCell<App>>,
+       mut record: NodeRecord,
+       toast_overlay: &adw::ToastOverlay,
+       initial_task: Option<&str>,
+   ) -> Result<(), String> {
+       // ...the entire existing materialize_node body, unchanged, except
+       // its one build_terminal_launch(&app_ref, id, terminal) call becomes
+       // build_terminal_launch(&app_ref, id, terminal, initial_task)...
+   }
+   ```
+   This is a pure rename + one new pass-through parameter — zero logic duplicated, zero other call sites touched.
+
+3. `create_session` (app.rs ~1793) gains a new trailing parameter `initial_prompt: Option<String>`, and its own call to `materialize_node(app, record.clone(), toast_overlay)` becomes `materialize_node_inner(app, record.clone(), toast_overlay, initial_prompt.as_deref())`. It has exactly two call sites (grep confirmed): `create_agent` (the one this task is editing — pass `initial_prompt` straight through) and `main.rs`'s GUI "new session" dialog (~line 1341) — pass `None` there, preserving today's exact behavior.
+
+Do not add any field to `TerminalPayload`/`NodeRecord` for this — the prompt is transient, carried only as a function parameter from `create_agent` down to `discovery_prompt`'s `base`, exactly matching the Global Constraints' "do not serialize runtime handles into workspace state" principle (a one-shot launch prompt is the same kind of thing).
 
 Update every existing call site of `App::create_agent` (at minimum `control.rs`'s `AgentsCreate` arm — read it first; it currently computes its own cascade position inline right before calling `create_agent`, shown in the research as `let position = { let count = app.borrow().nodes.len() as f64; (120.0 + count * 40.0, 120.0 + count * 40.0) };`). Delete that inline computation — it is now `App::default_spawn_position`'s job — and change the call to pass `None` for `position` whenever the new `--x`/`--y` CLI flags are absent, `None, None` for `size`/`initial_prompt` when `--width`/`--height`/`--task` are absent, exactly preserving today's visual cascade behavior for the pre-existing non-spatial `duetctl agents create` (same numbers, now computed in one place instead of two).
 
@@ -2111,7 +2141,7 @@ git commit -m "docs: teach the duet skill the delegated canvas-control workflow"
 
 ## Self-Review Notes
 
-- **Spec coverage:** §1 (Task 4, 6), §2 (Task 1), §3 (Task 1/2 — in-memory-only, revoked on close/teardown/unload), §4 (Task 3), §5 (Task 3's dialog), §6 (Task 3's structural guarantee + test), §7 (Task 2's `require_control_capability` at every service boundary), §8 (Task 4 reuses `create_session`), §9 (Task 4's `initial_prompt` seam — flagged for the implementer to locate the exact existing field rather than guessing), §10 (Task 10), §11 (Task 6), §12 (Group remains visual-only — no code changes needed, nothing in this plan adds parent/child membership), §13 (Task 10 + 11), §14 (explicitly skipped, Global Constraints), §15 (Task 5's locked-node checks, `CanvasCommand` reuse), §16 (Task 8's reuse of `create_edge`'s existing defaulting table, no capability-assignment flag added), §17 (Task 3's revoke method + Task 12's UI), §18 (toast-per-completed-action folded into Tasks 4-10, no toast on intermediate drag-equivalent ticks since there are none — every service call here is already one atomic completed action), §19 (Task 13), §20 (Global Constraints note — "Lead" already exists, role alone never grants control, no code change required beyond documentation).
+- **Spec coverage:** §1 (Task 4, 6), §2 (Task 1), §3 (Task 1/2 — in-memory-only, revoked on close/teardown/unload), §4 (Task 3), §5 (Task 3's dialog), §6 (Task 3's structural guarantee + test), §7 (Task 2's `require_control_capability` at every service boundary), §8 (Task 4 reuses `create_session`), §9 (Task 4's `initial_prompt` seam — verified by direct inspection to be `build_terminal_launch`/`discovery_prompt`, not role-instruction-folding, which is dead for this purpose; threaded as a transient parameter, no new persisted field), §10 (Task 10), §11 (Task 6), §12 (Group remains visual-only — no code changes needed, nothing in this plan adds parent/child membership), §13 (Task 10 + 11), §14 (explicitly skipped, Global Constraints), §15 (Task 5's locked-node checks, `CanvasCommand` reuse), §16 (Task 8's reuse of `create_edge`'s existing defaulting table, no capability-assignment flag added), §17 (Task 3's revoke method + Task 12's UI), §18 (toast-per-completed-action folded into Tasks 4-10, no toast on intermediate drag-equivalent ticks since there are none — every service call here is already one atomic completed action), §19 (Task 13), §20 (Global Constraints note — "Lead" already exists, role alone never grants control, no code change required beyond documentation).
 - **Placeholder scan:** no TBD/"add later"/paraphrased-test steps remain; every code block is real Rust against verified signatures. Three places deliberately tell the implementer to verify one exact detail against the live source before finalizing a literal (Task 4's `initial_prompt` seam, Task 6's `Drawing` default size, Task 10's `kind_label` method name) — these are flagged, not guessed, because the research pass that grounded this plan did not pin those three specifics byte-for-byte; CLAUDE.md's "read it yourself before changing it" rule applies most directly to exactly these three spots.
 - **Type consistency:** `ControlCapability`, `DelegatedControlService`, `PendingGrantRequest` (Task 1) are used with identical names/fields through Tasks 2-13. `App::create_edge`'s and `App::create_agent`'s signature changes are each called out explicitly with a "grep every call site" instruction, since both are pre-existing public functions this plan changes rather than new ones.
 
