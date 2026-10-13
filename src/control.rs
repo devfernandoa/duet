@@ -1673,6 +1673,7 @@ const USAGE: &str = r#"usage:
   duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
                          --x <num> --y <num> [--width <num>] [--height <num>]
   duetctl canvas configure <id> [--name <text>] [--color <text>]
+  duetctl canvas connect <source-id> <target-id>
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
