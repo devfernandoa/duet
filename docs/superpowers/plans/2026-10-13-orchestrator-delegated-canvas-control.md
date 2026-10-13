@@ -1429,7 +1429,7 @@ fn default_size_for(kind: &NodeKind) -> (f64, f64) {
     match kind {
         NodeKind::Note(_) | NodeKind::Text(_) => (220.0, 160.0),
         NodeKind::Group(_) => (720.0, 460.0),
-        NodeKind::Drawing(_) => App::drawing_default_size(),
+        NodeKind::Drawing(_) => (420.0, 300.0),
         NodeKind::FileTree(_) => (320.0, 420.0),
         NodeKind::Portal(_) => (640.0, 480.0),
         _ => (320.0, 240.0),
@@ -1437,7 +1437,7 @@ fn default_size_for(kind: &NodeKind) -> (f64, f64) {
 }
 ```
 
-Before finalizing `default_size_for`'s `Drawing` arm, read `create_drawing`'s actual hard-coded size (app.rs ~2028) and either inline the same two numbers or call whatever existing constant/function it already uses — do not guess at a different default than the GUI's.
+`create_drawing`'s own hard-coded size is `(420.0, 300.0)` (app.rs:2232-2238, `App::add_simple_node(app, NodeKind::Drawing(Default::default()), position, (420.0, 300.0))`) — confirmed by reading it directly; no separate constant/function exists for it, so the literal above matches the GUI's default exactly.
 
 Add `ControlRequest::CanvasCreate { requested_by: Option<Uuid>, kind: String, name: Option<String>, x: f64, y: f64, width: Option<f64>, height: Option<f64> }`, where `kind` is one of `"note" | "text" | "filetree" | "group" | "drawing" | "portal"`. Its `handle_request` arm builds the right `NodeKind` (reuse `PortalPayload::new(name, "")` for `"portal"`, `GroupPayload { label: name.unwrap_or_default(), ..Default::default() }` for `"group"`, `FileTreePayload::default()` for `"filetree"` — read `model.rs`'s exact `Default` impls for each before writing the literal, per Task 3-style payload construction already verified for `Note`/`Text` in `create_note`/`create_text_node`) and calls `App::create_canvas_node`. Add CLI parsing for `duet canvas create --kind <kind> [--name <text>] --x <f64> --y <f64> [--width <f64>] [--height <f64>]`.
 
@@ -2171,7 +2171,7 @@ git commit -m "docs: teach the duet skill the delegated canvas-control workflow"
 ## Self-Review Notes
 
 - **Spec coverage:** §1 (Task 4, 6), §2 (Task 1), §3 (Task 1/2 — in-memory-only, revoked on close/teardown/unload), §4 (Task 3), §5 (Task 3's dialog), §6 (Task 3's structural guarantee + test), §7 (Task 2's `require_control_capability` at every service boundary), §8 (Task 4 reuses `create_session`), §9 (Task 4's `initial_prompt` seam — verified by direct inspection to be `build_terminal_launch`/`discovery_prompt`, not role-instruction-folding, which is dead for this purpose; threaded as a transient parameter, no new persisted field), §10 (Task 10), §11 (Task 6), §12 (Group remains visual-only — no code changes needed, nothing in this plan adds parent/child membership), §13 (Task 10 + 11), §14 (explicitly skipped, Global Constraints), §15 (Task 5's locked-node checks, `CanvasCommand` reuse), §16 (Task 8's reuse of `create_edge`'s existing defaulting table, no capability-assignment flag added), §17 (Task 3's revoke method + Task 12's UI), §18 (toast-per-completed-action folded into Tasks 4-10, no toast on intermediate drag-equivalent ticks since there are none — every service call here is already one atomic completed action), §19 (Task 13), §20 (Global Constraints note — "Lead" already exists, role alone never grants control, no code change required beyond documentation).
-- **Placeholder scan:** no TBD/"add later"/paraphrased-test steps remain; every code block is real Rust against verified signatures. Two places deliberately told the implementer to verify one exact detail against the live source before finalizing a literal (Task 4's `initial_prompt` seam, Task 6's `Drawing` default size); a third (Task 10's node-kind label method name) was resolved during Task 5's execution — it's `NodeKind::label()`, confirmed by reading the pre-existing `node_display_name` free function this plan now reuses rather than duplicates (see Task 5's post-review fix).
+- **Placeholder scan:** no TBD/"add later"/paraphrased-test steps remain; every code block is real Rust against verified signatures. Task 4's `initial_prompt` seam was resolved by the controller before dispatch (reading `role.rs`/`finish_hand_off`/`build_terminal_launch` directly). Task 6's `Drawing` default size and Task 10's node-kind label method name were both similarly resolved by direct inspection (`(420.0, 300.0)` from `create_drawing`; `NodeKind::label()` from the pre-existing `node_display_name` free function this plan now reuses rather than duplicates) — no placeholder literals remain anywhere in the plan.
 - **Type consistency:** `ControlCapability`, `DelegatedControlService`, `PendingGrantRequest` (Task 1) are used with identical names/fields through Tasks 2-13. `App::create_edge`'s and `App::create_agent`'s signature changes are each called out explicitly with a "grep every call site" instruction, since both are pre-existing public functions this plan changes rather than new ones.
 
 ## Execution Handoff
