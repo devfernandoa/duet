@@ -1156,9 +1156,9 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 Ok(kind) => kind,
                 Err(error) => return ControlResponse::Error { error },
             };
-            let size = match (width, height) {
-                (Some(width), Some(height)) => Some((width, height)),
-                _ => None,
+            let size = match canvas_create_size(width, height) {
+                Ok(size) => size,
+                Err(error) => return ControlResponse::Error { error },
             };
             respond(
                 App::create_canvas_node(app, requested_by, kind, (x, y), size),
@@ -2208,6 +2208,22 @@ fn canvas_create_kind(kind: &str, name: Option<String>) -> Result<NodeKind, Stri
     }
 }
 
+/// `ControlRequest::CanvasCreate`'s `width`/`height` pair, same
+/// both-or-neither rule `agents_create_position_and_size` already applies to
+/// its own optional size pair: a lone half silently falling back to `kind`'s
+/// default size would discard the agent's explicit input with no error, so
+/// it is rejected instead.
+fn canvas_create_size(
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<Option<(f64, f64)>, String> {
+    match (width, height) {
+        (Some(width), Some(height)) => Ok(Some((width, height))),
+        (None, None) => Ok(None),
+        _ => Err("canvas create needs both --width and --height, or neither".to_string()),
+    }
+}
+
 fn parse_canvas_move(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
     let (mut x, mut y) = (None, None);
     let mut i = 0;
@@ -3087,6 +3103,17 @@ mod tests {
                 "unexpected error for --x {bad}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn canvas_create_size_requires_the_pair_complete() {
+        assert_eq!(
+            canvas_create_size(Some(1.0), Some(2.0)),
+            Ok(Some((1.0, 2.0)))
+        );
+        assert_eq!(canvas_create_size(None, None), Ok(None));
+        assert!(canvas_create_size(Some(1.0), None).is_err());
+        assert!(canvas_create_size(None, Some(2.0)).is_err());
     }
 
     #[test]

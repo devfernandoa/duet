@@ -2191,7 +2191,7 @@ impl App {
             NodeKind::Note(_) | NodeKind::Text(_) => (220.0, 160.0),
             NodeKind::Group(_) => (720.0, 460.0),
             NodeKind::Drawing(_) => (420.0, 300.0),
-            NodeKind::FileTree(_) => (320.0, 420.0),
+            NodeKind::FileTree(_) => (320.0, 460.0),
             NodeKind::Portal(_) => (640.0, 480.0),
             _ => (320.0, 240.0),
         }
