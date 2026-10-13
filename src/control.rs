@@ -173,6 +173,19 @@ pub enum ControlRequest {
         #[serde(default)]
         height: Option<f64>,
     },
+    /// `duetctl canvas configure <id> [--name <text>] [--color <text>]`: a
+    /// Terminal's display name, or a Group's label/color — see
+    /// `App::configure_node`. Fails if `requested_by` lacks
+    /// `ConfigureCanvasNodes`.
+    CanvasConfigure {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+    },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
     /// as prompt text — see `orchestration::skill`. `agent_id` is resolved
@@ -1167,6 +1180,17 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 },
             )
         }
+        ControlRequest::CanvasConfigure {
+            requested_by,
+            id,
+            name,
+            color,
+        } => respond(
+            App::configure_node(app, requested_by, id, name, color),
+            |()| ControlResponse::CanvasDone {
+                message: format!("configured node {id}"),
+            },
+        ),
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -1623,6 +1647,7 @@ const USAGE: &str = r#"usage:
   duetctl canvas resize <id> --width <num> --height <num>
   duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
                          --x <num> --y <num> [--width <num>] [--height <num>]
+  duetctl canvas configure <id> [--name <text>] [--color <text>]
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -2161,16 +2186,21 @@ const CANVAS_USAGE: &str = r#"usage:
   duetctl canvas move <id> --x <num> --y <num>
   duetctl canvas resize <id> --width <num> --height <num>
   duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
-                         --x <num> --y <num> [--width <num>] [--height <num>]"#;
+                         --x <num> --y <num> [--width <num>] [--height <num>]
+  duetctl canvas configure <id> [--name <text>] [--color <text>]"#;
 
-/// `duetctl canvas move|resize|create <id> ...`: Milestone 7.6's delegated
-/// canvas-control move/resize/create — see `App::move_node`/
-/// `App::resize_node`/`App::create_canvas_node`.
+/// `duetctl canvas move|resize|create|configure <id> ...`: Milestone 7.6's
+/// delegated canvas-control move/resize/create/configure — see
+/// `App::move_node`/`App::resize_node`/`App::create_canvas_node`/
+/// `App::configure_node`.
 fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [cmd, id, rest @ ..] if cmd == "move" => parse_canvas_move(parse_uuid_arg(id)?, rest),
         [cmd, id, rest @ ..] if cmd == "resize" => parse_canvas_resize(parse_uuid_arg(id)?, rest),
         [cmd, rest @ ..] if cmd == "create" => parse_canvas_create(rest),
+        [cmd, id, rest @ ..] if cmd == "configure" => {
+            parse_canvas_configure(parse_uuid_arg(id)?, rest)
+        }
         _ => anyhow::bail!(CANVAS_USAGE),
     }
 }
@@ -2292,6 +2322,26 @@ fn parse_canvas_create(args: &[String]) -> anyhow::Result<ControlRequest> {
         y: y.ok_or_else(|| anyhow::anyhow!("canvas create needs --y\n\n{CANVAS_USAGE}"))?,
         width,
         height,
+    })
+}
+
+fn parse_canvas_configure(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut name, mut color) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--name" => name = Some(value.to_string()),
+            "--color" => color = Some(value.to_string()),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasConfigure {
+        requested_by: acting_agent_id(),
+        id,
+        name,
+        color,
     })
 }
 

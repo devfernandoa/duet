@@ -2182,6 +2182,69 @@ impl App {
         Ok(id)
     }
 
+    /// §11's "rename/configure node": a Terminal's display name or a Group's
+    /// label/color, as one undoable `SetProperties` edit. Deliberately narrow
+    /// — this is not a general property-bag setter, just the two fields the
+    /// spec calls out (§1's "rename/configure newly created Agents",
+    /// §10/§11's "rename/configure node").
+    pub fn configure_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        name: Option<String>,
+        color: Option<String>,
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::ConfigureCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let kind = app
+            .borrow()
+            .nodes
+            .get(&id)
+            .map(|entry| entry.record.kind.clone())
+            .ok_or_else(|| "that node no longer exists".to_string())?;
+        match kind {
+            NodeKind::Group(_) => App::update_group(app, id, name.as_deref(), color.as_deref())?,
+            NodeKind::Terminal(_) => {
+                let Some(name) = name else {
+                    return Err("a Terminal node only has a name to configure".to_string());
+                };
+                let (before, after) = {
+                    let mut app_mut = app.borrow_mut();
+                    let entry = app_mut
+                        .nodes
+                        .get_mut(&id)
+                        .ok_or("that node no longer exists")?;
+                    let before = entry.record.clone();
+                    let Some(terminal) = entry.record.as_terminal_mut() else {
+                        return Err("that node is not a Terminal".to_string());
+                    };
+                    terminal.name = name.trim().to_string();
+                    (before, entry.record.clone())
+                };
+                App::push_undo(
+                    app,
+                    CanvasCommand::SetProperties {
+                        before: vec![before],
+                        after: vec![after],
+                    },
+                );
+            }
+            _ => return Err("that node kind has nothing to configure yet".to_string()),
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(
+                app,
+                &format!(
+                    "{requester} configured {}",
+                    node_display_name(&app.borrow(), id)
+                ),
+            );
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
     /// The same per-kind default size `create_note`/`create_group`/
     /// `create_drawing` each hard-code today — centralized here so the
     /// orchestrator path and a future caller agree on one table instead of
@@ -6955,6 +7018,47 @@ mod tests {
         assert_eq!(
             app.borrow().nodes.get(&id).unwrap().record.position,
             (100.0, 200.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn configure_node_renames_a_terminal_when_authorized() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let id = node.id;
+        materialize_node(&app, node, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::ConfigureCanvasNodes]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        App::configure_node(&app, Some(agent), id, Some("Backend".to_string()), None).unwrap();
+
+        assert_eq!(
+            app.borrow()
+                .nodes
+                .get(&id)
+                .unwrap()
+                .record
+                .as_terminal()
+                .unwrap()
+                .name,
+            "Backend"
         );
     }
 }
