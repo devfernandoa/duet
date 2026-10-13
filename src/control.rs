@@ -131,6 +131,26 @@ pub enum ControlRequest {
         #[serde(default)]
         requested_by: Option<Uuid>,
     },
+    /// `duetctl canvas move <id> --x <num> --y <num>`: Milestone 7.6
+    /// delegated canvas-control, by stable id — see `App::move_node`. Fails
+    /// if `requested_by` lacks `MoveCanvasNodes`, or the node is locked.
+    CanvasMove {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        x: f64,
+        y: f64,
+    },
+    /// `duetctl canvas resize <id> --width <num> --height <num>`: see
+    /// `App::resize_node`. Fails if `requested_by` lacks
+    /// `ResizeCanvasNodes`, or the node is locked.
+    CanvasResize {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        width: f64,
+        height: f64,
+    },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
     /// as prompt text — see `orchestration::skill`. `agent_id` is resolved
@@ -474,6 +494,12 @@ pub enum ControlResponse {
     },
     Removed,
     RoleAssigned,
+    /// A canvas move/resize succeeded — same free-form-message shape as
+    /// `GitDone`, shared by `CanvasMove`/`CanvasResize` rather than one new
+    /// variant per canvas verb.
+    CanvasDone {
+        message: String,
+    },
     Whoami {
         info: WhoamiInfo,
     },
@@ -1074,6 +1100,27 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 },
             }
         }
+        ControlRequest::CanvasMove {
+            requested_by,
+            id,
+            x,
+            y,
+        } => respond(App::move_node(app, requested_by, id, (x, y)), |()| {
+            ControlResponse::CanvasDone {
+                message: format!("moved node {id}"),
+            }
+        }),
+        ControlRequest::CanvasResize {
+            requested_by,
+            id,
+            width,
+            height,
+        } => respond(
+            App::resize_node(app, requested_by, id, (width, height)),
+            |()| ControlResponse::CanvasDone {
+                message: format!("resized node {id}"),
+            },
+        ),
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -1361,6 +1408,7 @@ pub fn is_cli_verb(verb: &str) -> bool {
             | "portals"
             | "drawing"
             | "drawings"
+            | "canvas"
     )
 }
 
@@ -1469,6 +1517,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, rest @ ..] if cmd == "file" => parse_file(rest),
         [cmd, rest @ ..] if cmd == "git" => parse_git(rest),
         [cmd, rest @ ..] if cmd == "portal" || cmd == "portals" => parse_portal(rest),
+        [cmd, rest @ ..] if cmd == "canvas" => parse_canvas(rest),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -1524,6 +1573,8 @@ const USAGE: &str = r#"usage:
   duetctl portal click <portal> <selector>
   duetctl portal type <portal> <selector> <text> [--append] [--submit]
   duetctl portal evaluate <portal> [<script>]    (script read from stdin if omitted)
+  duetctl canvas move <id> --x <num> --y <num>
+  duetctl canvas resize <id> --width <num> --height <num>
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -2058,6 +2109,63 @@ fn parse_notes_patch(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest
     })
 }
 
+const CANVAS_USAGE: &str = r#"usage:
+  duetctl canvas move <id> --x <num> --y <num>
+  duetctl canvas resize <id> --width <num> --height <num>"#;
+
+/// `duetctl canvas move|resize <id> ...`: Milestone 7.6's delegated
+/// canvas-control move/resize, by stable id — see `App::move_node`/
+/// `App::resize_node`.
+fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [cmd, id, rest @ ..] if cmd == "move" => parse_canvas_move(parse_uuid_arg(id)?, rest),
+        [cmd, id, rest @ ..] if cmd == "resize" => parse_canvas_resize(parse_uuid_arg(id)?, rest),
+        _ => anyhow::bail!(CANVAS_USAGE),
+    }
+}
+
+fn parse_canvas_move(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut x, mut y) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--x" => x = Some(parse_f64_arg(value)?),
+            "--y" => y = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasMove {
+        requested_by: acting_agent_id(),
+        id,
+        x: x.ok_or_else(|| anyhow::anyhow!("canvas move needs --x\n\n{CANVAS_USAGE}"))?,
+        y: y.ok_or_else(|| anyhow::anyhow!("canvas move needs --y\n\n{CANVAS_USAGE}"))?,
+    })
+}
+
+fn parse_canvas_resize(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut width, mut height) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--width" => width = Some(parse_f64_arg(value)?),
+            "--height" => height = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasResize {
+        requested_by: acting_agent_id(),
+        id,
+        width: width
+            .ok_or_else(|| anyhow::anyhow!("canvas resize needs --width\n\n{CANVAS_USAGE}"))?,
+        height: height
+            .ok_or_else(|| anyhow::anyhow!("canvas resize needs --height\n\n{CANVAS_USAGE}"))?,
+    })
+}
+
 fn parse_legacy_agent(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [only] if only == "list" => Ok(ControlRequest::List),
@@ -2247,6 +2355,7 @@ fn print_response(response: &ControlResponse) {
         ControlResponse::Created { id } => println!("created agent {id}"),
         ControlResponse::Removed => println!("removed"),
         ControlResponse::RoleAssigned => println!("role assigned"),
+        ControlResponse::CanvasDone { message } => println!("{message}"),
         ControlResponse::Whoami { info } => {
             println!("id:       {}", info.agent.id);
             println!("name:     {}", info.agent.name);

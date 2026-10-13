@@ -2053,6 +2053,110 @@ impl App {
         }
     }
 
+    /// §13/§15's "move node" service: the same mutation the GTK drag handler
+    /// performs (position write, widget sync, `CanvasCommand::MoveNodes`
+    /// undo entry, persist), reachable by stable id instead of a pointer
+    /// gesture, respecting `locked` exactly like the drag handler does.
+    pub fn move_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        position: (f64, f64),
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::MoveCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let old_position = {
+            let mut app_mut = app.borrow_mut();
+            let canvas = app_mut.canvas.clone();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return Err("that node no longer exists".to_string());
+            };
+            if entry.record.locked {
+                return Err("that node is locked".to_string());
+            }
+            let old_position = entry.record.position;
+            entry.record.position = position;
+            canvas.reposition_node(entry.widget.container(), position);
+            old_position
+        };
+        if old_position != position {
+            App::push_undo(
+                app,
+                CanvasCommand::MoveNodes {
+                    moves: vec![(id, old_position, position)],
+                },
+            );
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            let node_name = App::node_display_name(app, id);
+            App::notify(app, &format!("{requester} moved {node_name}"));
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
+    /// §13/§15's "resize node" service, same shape as `move_node`.
+    pub fn resize_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        size: (f64, f64),
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::ResizeCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        // `size` is rebound here to the clamped value (not shadowed inside
+        // the block only) so the undo entry below records exactly what was
+        // written to `entry.record`/the widget, even when the caller asked
+        // for something below the node minimum.
+        let (old_size, size) = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return Err("that node no longer exists".to_string());
+            };
+            if entry.record.locked {
+                return Err("that node is locked".to_string());
+            }
+            let old_size = entry.record.size;
+            let size = (
+                size.0.max(crate::node::MIN_NODE_WIDTH),
+                size.1.max(crate::node::MIN_NODE_HEIGHT),
+            );
+            entry.record.size = size;
+            entry.widget.apply_resize(size);
+            (old_size, size)
+        };
+        if old_size != size {
+            App::push_undo(
+                app,
+                CanvasCommand::ResizeNode {
+                    id,
+                    old_size,
+                    new_size: size,
+                },
+            );
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            let node_name = App::node_display_name(app, id);
+            App::notify(app, &format!("{requester} resized {node_name}"));
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
+    /// A short human-readable label for activity toasts — a Terminal's/
+    /// Group's name, a generic kind label otherwise. Read-only, GTK-free.
+    fn node_display_name(app: &Rc<RefCell<App>>, id: Uuid) -> String {
+        let app_ref = app.borrow();
+        match app_ref.nodes.get(&id).map(|entry| &entry.record.kind) {
+            Some(NodeKind::Terminal(terminal)) => terminal.name.clone(),
+            Some(NodeKind::Group(group)) if !group.label.is_empty() => group.label.clone(),
+            Some(kind) => kind.label().to_string(),
+            None => id.to_string(),
+        }
+    }
+
     /// Spawns a blank Markdown note at `position`, wires it, and persists.
     pub fn create_note(app: &Rc<RefCell<App>>, position: (f64, f64)) {
         let record = NodeRecord {
@@ -6682,5 +6786,93 @@ mod tests {
         materialize_node(&app, shell, &adw::ToastOverlay::new()).unwrap();
         assert!(app.borrow().handoff_targets(shell_id).is_empty());
         let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn move_node_respects_a_locked_node() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut note = note_with_markdown("a");
+        note.locked = true;
+        let id = note.id;
+        let original = note.position;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+
+        let result = App::move_node(&app, None, id, (900.0, 900.0));
+
+        assert!(result.is_err());
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.position,
+            original
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn move_node_requires_move_canvas_nodes_capability_for_an_agent() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+
+        assert!(App::move_node(&app, Some(agent), id, (10.0, 10.0)).is_err());
+
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::MoveCanvasNodes].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        assert!(App::move_node(&app, Some(agent), id, (10.0, 10.0)).is_ok());
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.position,
+            (10.0, 10.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn resize_node_pushes_an_undo_entry() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        let old_size = note.size;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+
+        App::resize_node(&app, None, id, (500.0, 400.0)).unwrap();
+
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.size,
+            (500.0, 400.0)
+        );
+        assert!(matches!(
+            app.borrow().undo_stack.last(),
+            Some(CanvasCommand::ResizeNode { old_size: o, new_size: (500.0, 400.0), .. }) if *o == old_size
+        ));
     }
 }
