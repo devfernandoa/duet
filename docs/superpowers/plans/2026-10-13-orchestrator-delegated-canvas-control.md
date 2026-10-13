@@ -1314,6 +1314,8 @@ Before writing `node_display_name`, confirm `NodeKind`'s existing `&'static str`
 
 Add `ControlRequest::CanvasMove { requested_by: Option<Uuid>, id: Uuid, x: f64, y: f64 }` and `CanvasResize { requested_by: Option<Uuid>, id: Uuid, width: f64, height: f64 }`, their `handle_request` arms calling the two new services and mapping `Ok`/`Err` to `ControlResponse::Ok`/`ControlResponse::Error` (reuse whichever success-shaped `ControlResponse` variant the codebase already uses for a no-payload success, e.g. check how `NotesReplace`/`GitStage` report success before adding a new variant), and CLI parsing for `duet canvas move <id> --x <f64> --y <f64>` / `duet canvas resize <id> --width <f64> --height <f64>`.
 
+**Reuse `parse_f64_arg` for every float flag here** — Task 4's own fix round already added this exact helper to `control.rs` (parses an argv value as `f64` and rejects non-finite results with a clear error) to close a trust-boundary gap: an agent-supplied `nan`/`inf` coordinate can otherwise corrupt the persisted workspace store. `--x`/`--y`/`--width`/`--height` here must go through that same helper, not a fresh `.parse::<f64>()`/`str::parse` call — do not reintroduce the vulnerability Task 4 just closed. `resize_node`'s own `MIN_NODE_WIDTH`/`MIN_NODE_HEIGHT` clamp (already in this task's Step 3 code above) still applies on top of that, same division of labor as Task 4: the parser rejects non-finite, the service clamps to a sane minimum.
+
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `cargo test --lib app::tests::move_node_ app::tests::resize_node_`
@@ -1394,6 +1396,12 @@ pub fn create_canvas_node(
         return Err("use control request/agents create for Terminal nodes".to_string());
     }
     let size = size.unwrap_or_else(|| App::default_size_for(&kind));
+    // Same minimum clamp Task 5's `resize_node` applies — an agent-supplied
+    // `--width 0`/negative size must not create a degenerate node.
+    let size = (
+        size.0.max(crate::node::MIN_NODE_WIDTH),
+        size.1.max(crate::node::MIN_NODE_HEIGHT),
+    );
     let id = App::add_simple_node(app, kind, position, size);
     if let Some(agent_id) = requested_by {
         let requester = App::agent_display_name(app, agent_id);
@@ -1421,6 +1429,8 @@ fn default_size_for(kind: &NodeKind) -> (f64, f64) {
 Before finalizing `default_size_for`'s `Drawing` arm, read `create_drawing`'s actual hard-coded size (app.rs ~2028) and either inline the same two numbers or call whatever existing constant/function it already uses — do not guess at a different default than the GUI's.
 
 Add `ControlRequest::CanvasCreate { requested_by: Option<Uuid>, kind: String, name: Option<String>, x: f64, y: f64, width: Option<f64>, height: Option<f64> }`, where `kind` is one of `"note" | "text" | "filetree" | "group" | "drawing" | "portal"`. Its `handle_request` arm builds the right `NodeKind` (reuse `PortalPayload::new(name, "")` for `"portal"`, `GroupPayload { label: name.unwrap_or_default(), ..Default::default() }` for `"group"`, `FileTreePayload::default()` for `"filetree"` — read `model.rs`'s exact `Default` impls for each before writing the literal, per Task 3-style payload construction already verified for `Note`/`Text` in `create_note`/`create_text_node`) and calls `App::create_canvas_node`. Add CLI parsing for `duet canvas create --kind <kind> [--name <text>] --x <f64> --y <f64> [--width <f64>] [--height <f64>]`.
+
+**Reuse `parse_f64_arg`** (added by Task 4's fix round, in `control.rs`) for `--x`/`--y`/`--width`/`--height` here too — it rejects non-finite values at the CLI boundary before they ever reach `ControlRequest::CanvasCreate`'s fields, closing the same store-corruption risk Task 4 fixed. (The minimum-size clamp for a present-but-tiny `--width`/`--height` is already in `create_canvas_node`'s Step 3 code above.)
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -1953,10 +1963,16 @@ Expected: FAIL to compile.
 /// left-to-right, top-to-bottom, starting at the origin) whose
 /// `width`x`height` box doesn't overlap any existing node's bounding box.
 /// A plain O(nodes × candidates) scan — fine at canvas-sized node counts;
-/// this is deliberately not spatial-indexed.
+/// this is deliberately not spatial-indexed. Bounded by `MAX_ROWS` so a
+/// pathological case (an enormous `width`/`height`, or a canvas so densely
+/// packed every candidate on `MAX_ROWS` rows collides) returns a fallback
+/// instead of spinning forever on the GTK main thread — this runs
+/// synchronously inside `handle_request`, so an unbounded loop here would
+/// hang the whole app, not just return a bad answer.
 pub fn find_canvas_space(app: &Rc<RefCell<App>>, width: f64, height: f64) -> (f64, f64) {
     const STEP: f64 = 40.0;
     const MAX_COLUMNS: i64 = 60;
+    const MAX_ROWS: i64 = 500;
     let boxes: Vec<((f64, f64), (f64, f64))> = app
         .borrow()
         .nodes
@@ -1966,8 +1982,7 @@ pub fn find_canvas_space(app: &Rc<RefCell<App>>, width: f64, height: f64) -> (f6
     let overlaps = |x: f64, y: f64| {
         boxes.iter().any(|&((bx, by), (bw, bh))| x < bx + bw && x + width > bx && y < by + bh && y + height > by)
     };
-    let mut row = 0i64;
-    loop {
+    for row in 0..MAX_ROWS {
         for col in 0..MAX_COLUMNS {
             let x = col as f64 * STEP;
             let y = row as f64 * STEP;
@@ -1975,12 +1990,15 @@ pub fn find_canvas_space(app: &Rc<RefCell<App>>, width: f64, height: f64) -> (f6
                 return (x, y);
             }
         }
-        row += 1;
     }
+    // Every candidate in the bounded grid collided — fall back to the
+    // origin rather than loop forever; the caller (a human or an
+    // orchestrator) still gets an answer and can adjust from there.
+    (0.0, 0.0)
 }
 ```
 
-Add `ControlRequest::CanvasFindSpace { width: f64, height: f64 }`, its `handle_request` arm (`ControlResponse::CanvasPosition { x: f64, y: f64 }`), and `duet canvas find-space --width <f64> --height <f64>` CLI parsing.
+Add `ControlRequest::CanvasFindSpace { width: f64, height: f64 }`, its `handle_request` arm (`ControlResponse::CanvasPosition { x: f64, y: f64 }`), and `duet canvas find-space --width <f64> --height <f64>` CLI parsing. **Reuse `parse_f64_arg`** (Task 4's fix round, in `control.rs`) for both flags, and additionally reject a non-positive value (`<= 0.0`) for either — a zero/negative `width`/`height` is meaningless for this helper and should error at the CLI boundary rather than silently return `(0.0, 0.0)` on the first check.
 
 - [ ] **Step 4: Run to verify it passes**
 
