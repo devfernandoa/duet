@@ -2268,6 +2268,65 @@ impl App {
         Ok(())
     }
 
+    /// §2/§17's opt-in destructive capability: deletes a non-agent canvas
+    /// node. Never covers Terminal nodes — an Agent is only ever removed
+    /// through the existing `require_manager`-gated `remove_agent` (killing a
+    /// process is a different risk class than deleting a Note/Group; §2's
+    /// "must not automatically grant... terminating existing user Agents").
+    /// `RemoveCanvasNodes` is never in `ControlCapability::DEFAULT_SET`, so
+    /// this always requires its own explicit grant.
+    pub fn remove_canvas_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::RemoveCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let (removed, removed_edges) = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get(&id) else {
+                return Err("that node no longer exists".to_string());
+            };
+            if entry.record.as_terminal().is_some() {
+                return Err(
+                    "Terminal nodes cannot be removed this way — use agent removal".to_string(),
+                );
+            }
+            let canvas = app_mut.canvas.clone();
+            let removed = app_mut.nodes.remove(&id).expect("checked above");
+            canvas.remove_node(removed.widget.container());
+            // Collect the edges this node touches BEFORE dropping them from the
+            // live list — `delete_selected`'s existing pattern (app.rs ~3479-3491)
+            // does the same, specifically so undo restores the connections too,
+            // not just the node. Pushing `edges: Vec::new()` here instead would
+            // silently and permanently lose every connection this node had, even
+            // after the deletion is undone.
+            let removed_edges: Vec<EdgeRecord> = app_mut
+                .edges
+                .iter()
+                .filter(|edge| edge.source == id || edge.target == id)
+                .cloned()
+                .collect();
+            app_mut
+                .edges
+                .retain(|edge| edge.source != id && edge.target != id);
+            (removed.record, removed_edges)
+        };
+        App::push_undo(
+            app,
+            CanvasCommand::RemoveNodes {
+                nodes: vec![removed],
+                edges: removed_edges,
+            },
+        );
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(app, &format!("{requester} removed a node"));
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
     /// The same per-kind default size `create_note`/`create_group`/
     /// `create_drawing` each hard-code today — centralized here so the
     /// orchestrator path and a future caller agree on one table instead of
@@ -7217,5 +7276,62 @@ mod tests {
             panic!("expected a Terminal widget");
         };
         assert_eq!(node.title_label.text(), "t");
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn remove_canvas_node_refuses_terminal_nodes() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let id = node.id;
+        materialize_node(&app, node, &adw::ToastOverlay::new()).unwrap();
+
+        assert!(App::remove_canvas_node(&app, None, id).is_err());
+        assert!(app.borrow().nodes.contains_key(&id));
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn remove_canvas_node_requires_the_destructive_capability_explicitly() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+
+        // The default grant (everything in DEFAULT_SET) must NOT cover this.
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            ControlCapability::DEFAULT_SET.into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+        assert!(App::remove_canvas_node(&app, Some(agent), id).is_err());
+
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::RemoveCanvasNodes].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+        assert!(App::remove_canvas_node(&app, Some(agent), id).is_ok());
+        assert!(!app.borrow().nodes.contains_key(&id));
     }
 }

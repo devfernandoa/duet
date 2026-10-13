@@ -197,6 +197,18 @@ pub enum ControlRequest {
         source: Uuid,
         target: Uuid,
     },
+    /// `duetctl canvas remove <id>`: see `App::remove_canvas_node`. Refuses
+    /// Terminal nodes outright — an Agent is only ever removed through
+    /// `AgentsRemove`/`require_manager`. Fails if `requested_by` lacks
+    /// `RemoveCanvasNodes`, which (unlike every other canvas capability)
+    /// is never in `ControlCapability::DEFAULT_SET` and so is never
+    /// implied by an empty `--capability` list — it always needs its own
+    /// explicit `control request --capability remove-canvas-nodes`.
+    CanvasRemove {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
     /// as prompt text — see `orchestration::skill`. `agent_id` is resolved
@@ -1216,6 +1228,13 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 },
             },
         ),
+        ControlRequest::CanvasRemove { requested_by, id } => {
+            respond(App::remove_canvas_node(app, requested_by, id), |()| {
+                ControlResponse::CanvasDone {
+                    message: format!("removed node {id}"),
+                }
+            })
+        }
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -1674,6 +1693,9 @@ const USAGE: &str = r#"usage:
                          --x <num> --y <num> [--width <num>] [--height <num>]
   duetctl canvas configure <id> [--name <text>] [--color <text>]
   duetctl canvas connect <source-id> <target-id>
+  duetctl canvas remove <id>          (never Terminal nodes; needs an explicit
+                                        remove-canvas-nodes grant — not implied
+                                        by a default `control request`)
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -1684,7 +1706,9 @@ const CONTROL_USAGE: &str = r#"usage:
   duetctl control status
 <name> is one of: spawn-agents, create-canvas-nodes, move-canvas-nodes,
   resize-canvas-nodes, configure-canvas-nodes, connect-canvas-nodes,
-  remove-canvas-nodes"#;
+  remove-canvas-nodes
+omitting --capability grants every name above except remove-canvas-nodes,
+  which is opt-in only and must always be requested by name"#;
 
 /// `duetctl control request`/`status` — Milestone 7.6's delegated
 /// canvas-control. `request` only makes sense from inside an agent's own
@@ -2214,12 +2238,16 @@ const CANVAS_USAGE: &str = r#"usage:
   duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
                          --x <num> --y <num> [--width <num>] [--height <num>]
   duetctl canvas configure <id> [--name <text>] [--color <text>]
-  duetctl canvas connect <source-id> <target-id>"#;
+  duetctl canvas connect <source-id> <target-id>
+  duetctl canvas remove <id>          (never Terminal nodes; needs an explicit
+                                        remove-canvas-nodes grant — not implied
+                                        by a default `control request`)"#;
 
-/// `duetctl canvas move|resize|create|configure|connect <id> ...`: Milestone
-/// 7.6's delegated canvas-control move/resize/create/configure/connect — see
+/// `duetctl canvas move|resize|create|configure|connect|remove <id> ...`:
+/// Milestone 7.6's delegated canvas-control
+/// move/resize/create/configure/connect/remove — see
 /// `App::move_node`/`App::resize_node`/`App::create_canvas_node`/
-/// `App::configure_node`/`App::create_edge`.
+/// `App::configure_node`/`App::create_edge`/`App::remove_canvas_node`.
 fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [cmd, id, rest @ ..] if cmd == "move" => parse_canvas_move(parse_uuid_arg(id)?, rest),
@@ -2232,6 +2260,10 @@ fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
             requested_by: acting_agent_id(),
             source: parse_uuid_arg(source)?,
             target: parse_uuid_arg(target)?,
+        }),
+        [cmd, id] if cmd == "remove" => Ok(ControlRequest::CanvasRemove {
+            requested_by: acting_agent_id(),
+            id: parse_uuid_arg(id)?,
         }),
         _ => anyhow::bail!(CANVAS_USAGE),
     }
