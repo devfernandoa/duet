@@ -82,7 +82,7 @@ impl App {
         revoked
     }
 
-    fn agent_display_name(app: &Rc<RefCell<App>>, agent_id: Uuid) -> String {
+    pub(super) fn agent_display_name(app: &Rc<RefCell<App>>, agent_id: Uuid) -> String {
         app.borrow()
             .agent_registry()
             .get_agent(agent_id)

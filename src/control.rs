@@ -83,6 +83,21 @@ pub enum ControlRequest {
         role: Option<String>,
         #[serde(default)]
         requested_by: Option<Uuid>,
+        /// Milestone 7.6: `x`/`y` and `width`/`height` must each be either
+        /// both present or both absent — a partial pair is a request error
+        /// (see `handle_request`'s `AgentsCreate` arm). Using any of these,
+        /// or `task`, switches `App::create_agent`'s gate from
+        /// `require_manager` to a `SpawnAgents` delegated-control grant.
+        #[serde(default)]
+        x: Option<f64>,
+        #[serde(default)]
+        y: Option<f64>,
+        #[serde(default)]
+        width: Option<f64>,
+        #[serde(default)]
+        height: Option<f64>,
+        #[serde(default)]
+        task: Option<String>,
     },
     /// `duetctl control request`: an Agent asks for delegated canvas-control
     /// capabilities. Never approves anything by itself — see
@@ -921,6 +936,11 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             agent,
             role,
             requested_by,
+            x,
+            y,
+            width,
+            height,
+            task,
         } => {
             let provider = match parse_provider(&agent) {
                 Ok(provider) => provider,
@@ -930,16 +950,40 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 Ok(role_id) => role_id,
                 Err(error) => return ControlResponse::Error { error },
             };
-            // A CLI creation has no cursor position to spawn at (unlike the
-            // GUI's "New session" dialog, which uses the viewport center) —
-            // cascade by however many nodes already exist so agents created
-            // back-to-back (as the acceptance scenario's setup does) don't
-            // all land exactly on top of each other.
-            let position = {
-                let count = app.borrow().nodes.len() as f64;
-                (120.0 + count * 40.0, 120.0 + count * 40.0)
+            // `App::default_spawn_position` supplies the cascade position
+            // a CLI creation with no explicit `x`/`y` always used (the GUI's
+            // "New session" dialog passes its own viewport-center position
+            // instead, via `App::create_session` directly).
+            let position = match (x, y) {
+                (Some(x), Some(y)) => Some((x, y)),
+                (None, None) => None,
+                _ => {
+                    return ControlResponse::Error {
+                        error: "agents create needs both --x and --y, or neither".to_string(),
+                    };
+                }
             };
-            match App::create_agent(app, requested_by, name, cwd, provider, role_id, position) {
+            let size = match (width, height) {
+                (Some(width), Some(height)) => Some((width, height)),
+                (None, None) => None,
+                _ => {
+                    return ControlResponse::Error {
+                        error: "agents create needs both --width and --height, or neither"
+                            .to_string(),
+                    };
+                }
+            };
+            match App::create_agent(
+                app,
+                requested_by,
+                name,
+                cwd,
+                provider,
+                role_id,
+                position,
+                size,
+                task,
+            ) {
                 Ok(id) => ControlResponse::Created { id },
                 Err(error) => ControlResponse::Error {
                     error: error.to_string(),
@@ -2034,6 +2078,7 @@ fn parse_agents(args: &[String]) -> anyhow::Result<ControlRequest> {
 
 fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
     let (mut name, mut cwd, mut agent, mut role) = (None, None, None, None);
+    let (mut x, mut y, mut width, mut height, mut task) = (None, None, None, None, None);
     let mut i = 0;
     while i + 1 < args.len() {
         let (flag, value) = (args[i].as_str(), args[i + 1].clone());
@@ -2042,6 +2087,11 @@ fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
             "--cwd" => cwd = Some(value),
             "--agent" => agent = Some(value),
             "--role" => role = Some(value),
+            "--x" => x = Some(parse_f64_arg(&value)?),
+            "--y" => y = Some(parse_f64_arg(&value)?),
+            "--width" => width = Some(parse_f64_arg(&value)?),
+            "--height" => height = Some(parse_f64_arg(&value)?),
+            "--task" => task = Some(value),
             other => anyhow::bail!("unknown flag '{other}'\n\n{USAGE}"),
         }
         i += 2;
@@ -2054,7 +2104,18 @@ fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
         agent: agent.ok_or_else(|| anyhow::anyhow!("agents create needs --agent\n\n{USAGE}"))?,
         role,
         requested_by: acting_agent_id(),
+        x,
+        y,
+        width,
+        height,
+        task,
     })
+}
+
+fn parse_f64_arg(value: &str) -> anyhow::Result<f64> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected a number, got '{value}'"))
 }
 
 fn parse_send(args: &[String]) -> anyhow::Result<ControlRequest> {

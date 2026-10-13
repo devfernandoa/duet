@@ -1817,6 +1817,7 @@ impl App {
         role_id: Option<Uuid>,
         viewport_center_world: (f64, f64),
         toast_overlay: &adw::ToastOverlay,
+        initial_prompt: Option<String>,
     ) -> anyhow::Result<Uuid> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -1849,8 +1850,13 @@ impl App {
             )?
         };
         let id = record.id;
-        materialize_node(app, record.clone(), toast_overlay)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        materialize_node_inner(
+            app,
+            record.clone(),
+            toast_overlay,
+            initial_prompt.as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
         App::push_undo(
             app,
             CanvasCommand::AddNodes {
@@ -1867,6 +1873,12 @@ impl App {
     /// agent (section 11: "do not give recruitment permissions to every
     /// agent"). `requested_by: None` is the human operator via a bare shell
     /// or the GUI, trusted the same way `send_message`'s sourceless case is.
+    ///
+    /// Milestone 7.6: when `position`/`size`/`initial_prompt` is used, this
+    /// is the delegated-canvas-control surface instead — gated by a
+    /// `SpawnAgents` capability grant *instead of* `require_manager`, not in
+    /// addition to it (see this milestone's plan: a human-approved grant
+    /// must be sufficient on its own, independent of manager role).
     #[allow(clippy::too_many_arguments)]
     pub fn create_agent(
         app: &Rc<RefCell<App>>,
@@ -1875,10 +1887,20 @@ impl App {
         cwd: PathBuf,
         agent: Agent,
         role_id: Option<Uuid>,
-        viewport_center_world: (f64, f64),
+        position: Option<(f64, f64)>,
+        size: Option<(f64, f64)>,
+        initial_prompt: Option<String>,
     ) -> anyhow::Result<Uuid> {
-        App::require_manager(app, requested_by)?;
-        App::create_session(
+        let using_delegated_control =
+            position.is_some() || size.is_some() || initial_prompt.is_some();
+        if using_delegated_control {
+            App::require_control_capability(app, requested_by, ControlCapability::SpawnAgents)?;
+        } else {
+            App::require_manager(app, requested_by)?;
+        }
+        let name_for_toast = name.clone();
+        let viewport_center_world = position.unwrap_or_else(|| App::default_spawn_position(app));
+        let id = App::create_session(
             app,
             name,
             cwd,
@@ -1887,7 +1909,31 @@ impl App {
             role_id,
             viewport_center_world,
             &adw::ToastOverlay::new(),
-        )
+            initial_prompt,
+        )?;
+        if let Some(size) = size {
+            let mut app_mut = app.borrow_mut();
+            if let Some(entry) = app_mut.nodes.get_mut(&id) {
+                entry.record.size = size;
+                entry.widget.apply_resize(size);
+            }
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(app, &format!("{requester} created {name_for_toast}"));
+        }
+        Ok(id)
+    }
+
+    /// Where a spawned agent lands when the caller didn't ask for a specific
+    /// spot — the same "cascade so back-to-back creations don't stack exactly
+    /// on top of each other" default `duetctl agents create`'s `handle_request`
+    /// arm has always computed inline (see `src/control.rs`'s current
+    /// `AgentsCreate` handler); moved here so there is exactly one place that
+    /// owns it. Pure domain state (a node count) — no GTK/viewport coupling.
+    fn default_spawn_position(app: &Rc<RefCell<App>>) -> (f64, f64) {
+        let count = app.borrow().nodes.len() as f64;
+        (120.0 + count * 40.0, 120.0 + count * 40.0)
     }
 
     /// `duetctl agents remove`'s service: tears down `target`'s process and
@@ -1965,12 +2011,9 @@ impl App {
     /// workspace. Checked at the `App::` method boundary, not only in
     /// `control.rs`'s CLI parsing (§7).
     ///
-    /// Not yet called from production code — later tasks in Milestone 7.6's
-    /// plan wire it into the actual canvas-control methods this gates.
-    /// Exercised by tests now (including `control.rs`'s, hence
-    /// `pub(crate)`); `allow(dead_code)` keeps `cargo check` clean in the
-    /// meantime.
-    #[allow(dead_code)]
+    /// Called by `create_agent` whenever the delegated-control surface
+    /// (position/size/initial task) is used; `pub(crate)` since `control.rs`
+    /// also exercises it directly in tests.
     pub(crate) fn require_control_capability(
         app: &Rc<RefCell<App>>,
         requested_by: Option<Uuid>,
@@ -2946,7 +2989,7 @@ impl App {
             environment::terminate(&mut app.borrow_mut().runtime, id, terminal.environment);
             let spawn_result = {
                 let app_ref = app.borrow();
-                build_terminal_launch(&app_ref, id, &terminal)
+                build_terminal_launch(&app_ref, id, &terminal, None)
             }
             .and_then(|launch| {
                 let prepared = environment::prepare_launch(terminal.environment, id, launch);
@@ -4398,8 +4441,17 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
 /// once instead of five times.
 fn materialize_node(
     app: &Rc<RefCell<App>>,
+    record: NodeRecord,
+    toast_overlay: &adw::ToastOverlay,
+) -> Result<(), String> {
+    materialize_node_inner(app, record, toast_overlay, None)
+}
+
+fn materialize_node_inner(
+    app: &Rc<RefCell<App>>,
     mut record: NodeRecord,
     toast_overlay: &adw::ToastOverlay,
+    initial_task: Option<&str>,
 ) -> Result<(), String> {
     let id = record.id;
     let position = record.position;
@@ -4422,7 +4474,7 @@ fn materialize_node(
             if !app.borrow().runtime.is_alive(id) {
                 let launch = {
                     let app_ref = app.borrow();
-                    build_terminal_launch(&app_ref, id, terminal)
+                    build_terminal_launch(&app_ref, id, terminal, initial_task)
                         .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?
                 };
                 let prepared = environment::prepare_launch(terminal.environment, id, launch);
@@ -4727,6 +4779,7 @@ fn build_terminal_launch(
     app: &App,
     id: Uuid,
     terminal: &TerminalPayload,
+    initial_task: Option<&str>,
 ) -> anyhow::Result<Launch> {
     let claude = resolve_claude_account(app, &terminal.agent, terminal.claude_account.clone())?;
     let codex_home = ensure_codex_home(&terminal.agent, id)?;
@@ -4751,7 +4804,7 @@ fn build_terminal_launch(
             .is_some_and(|dir| orchestration::skill::install(dir).is_ok());
     let initial_prompt = terminal
         .never_launched
-        .then(|| orchestration::env::discovery_prompt(None, skill_installed))
+        .then(|| orchestration::env::discovery_prompt(initial_task, skill_installed))
         .flatten();
     let launch = with_session_env(
         terminal.agent.launch(LaunchRequest {
@@ -5179,6 +5232,77 @@ mod tests {
             App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_agent_denies_an_orchestrator_without_spawn_agents_capability() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        // Using the new `position` parameter exercises the NEW SpawnAgents
+        // gate, not the pre-existing require_manager one — `agent` here has
+        // no grant at all (and, deliberately, no registered identity either,
+        // to prove the capability check runs independently of manager status).
+        let result = App::create_agent(
+            &app,
+            Some(agent),
+            "Backend".to_string(),
+            tmp.clone(),
+            Agent::Shell,
+            None,
+            Some((100.0, 100.0)),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_agent_places_an_authorized_orchestrators_agent_at_the_requested_position() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let orchestrator = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            orchestrator,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        let id = App::create_agent(
+            &app,
+            Some(orchestrator),
+            "Backend".to_string(),
+            tmp,
+            Agent::Shell,
+            None,
+            Some((1200.0, 500.0)),
+            Some((420.0, 320.0)),
+            None,
+        )
+        .unwrap();
+
+        let app_ref = app.borrow();
+        let entry = app_ref.nodes.get(&id).unwrap();
+        assert_eq!(entry.record.position, (1200.0, 500.0));
+        assert_eq!(entry.record.size, (420.0, 320.0));
     }
 
     fn terminal_node(environment: EnvironmentKind) -> NodeRecord {
