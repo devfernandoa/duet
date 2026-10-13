@@ -2089,7 +2089,7 @@ impl App {
         }
         if let Some(agent_id) = requested_by {
             let requester = App::agent_display_name(app, agent_id);
-            let node_name = App::node_display_name(app, id);
+            let node_name = node_display_name(&app.borrow(), id);
             App::notify(app, &format!("{requester} moved {node_name}"));
         }
         let _ = app.borrow().persist();
@@ -2138,23 +2138,11 @@ impl App {
         }
         if let Some(agent_id) = requested_by {
             let requester = App::agent_display_name(app, agent_id);
-            let node_name = App::node_display_name(app, id);
+            let node_name = node_display_name(&app.borrow(), id);
             App::notify(app, &format!("{requester} resized {node_name}"));
         }
         let _ = app.borrow().persist();
         Ok(())
-    }
-
-    /// A short human-readable label for activity toasts — a Terminal's/
-    /// Group's name, a generic kind label otherwise. Read-only, GTK-free.
-    fn node_display_name(app: &Rc<RefCell<App>>, id: Uuid) -> String {
-        let app_ref = app.borrow();
-        match app_ref.nodes.get(&id).map(|entry| &entry.record.kind) {
-            Some(NodeKind::Terminal(terminal)) => terminal.name.clone(),
-            Some(NodeKind::Group(group)) if !group.label.is_empty() => group.label.clone(),
-            Some(kind) => kind.label().to_string(),
-            None => id.to_string(),
-        }
     }
 
     /// Spawns a blank Markdown note at `position`, wires it, and persists.
@@ -4138,14 +4126,15 @@ fn node_geometry(entry: &NodeEntry) -> NodeGeometry {
     (entry.record.position, entry.record.size)
 }
 
-/// A node's display name for toast messages: a terminal's own name, or its
-/// kind label for anything else.
+/// A node's display name for toast messages: a terminal's own name, a
+/// Group's custom label if it has one, or its kind label otherwise.
 fn node_display_name(app: &App, id: Uuid) -> String {
     app.nodes
         .get(&id)
-        .map(|entry| match entry.record.as_terminal() {
-            Some(terminal) => terminal.name.clone(),
-            None => entry.record.kind.label().to_string(),
+        .map(|entry| match &entry.record.kind {
+            NodeKind::Terminal(terminal) => terminal.name.clone(),
+            NodeKind::Group(group) if !group.label.is_empty() => group.label.clone(),
+            _ => entry.record.kind.label().to_string(),
         })
         .unwrap_or_default()
 }
