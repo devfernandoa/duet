@@ -328,6 +328,42 @@ impl SessionNode {
         });
         terminal.add_controller(motion);
 
+        // Explicit Ctrl+Shift+C/V, handled directly via VTE's own clipboard
+        // methods rather than left to VTE's implicit default shortcuts: some
+        // interactive CLIs running inside the PTY (observed with at least
+        // one agent provider) negotiate their own keyboard-protocol
+        // enhancements and bind Ctrl+Shift+V to their own "paste an image"
+        // feature, which fires instead of a plain text paste whenever the
+        // raw keystroke reaches them unconsumed. `Capture` phase plus
+        // `Propagation::Stop` guarantees this terminal's copy/paste always
+        // goes through VTE's clipboard API and the keystroke itself never
+        // reaches the child process, regardless of what any given CLI's own
+        // bindings expect.
+        let clipboard_keys = gtk4::EventControllerKey::new();
+        clipboard_keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        clipboard_keys.connect_key_pressed({
+            let terminal = terminal.clone();
+            move |_controller, key, _code, modifiers| {
+                let ctrl_shift = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                    && modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+                if !ctrl_shift {
+                    return gtk4::glib::Propagation::Proceed;
+                }
+                match key {
+                    gtk4::gdk::Key::C | gtk4::gdk::Key::c => {
+                        terminal.copy_clipboard_format(vte4::Format::Text);
+                        gtk4::glib::Propagation::Stop
+                    }
+                    gtk4::gdk::Key::V | gtk4::gdk::Key::v => {
+                        terminal.paste_clipboard();
+                        gtk4::glib::Propagation::Stop
+                    }
+                    _ => gtk4::glib::Propagation::Proceed,
+                }
+            }
+        });
+        terminal.add_controller(clipboard_keys);
+
         let resize_handle = resize_handle();
         let body = gtk4::Overlay::new();
         body.set_child(Some(&terminal));

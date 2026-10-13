@@ -223,6 +223,7 @@ impl Canvas {
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
+            let links_area = links_area.clone();
             let drag_start_pan = Rc::clone(&drag_start_pan);
             let marquee_start = Rc::clone(&marquee_start);
             let marquee = Rc::clone(&marquee);
@@ -251,7 +252,7 @@ impl Canvas {
                     start_pan.0 + offset_x / state.zoom,
                     start_pan.1 + offset_y / state.zoom,
                 );
-                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+                apply_view(&fixed, &grid_area, &links_area, &nodes.borrow(), &state);
             });
         }
         {
@@ -326,6 +327,7 @@ impl Canvas {
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
+            let links_area = links_area.clone();
             let pointer_position = Rc::clone(&pointer_position);
             zoom_scroll.connect_scroll(move |controller, _dx, dy| {
                 if !controller
@@ -348,7 +350,7 @@ impl Canvas {
                 state.zoom *= ZOOM_STEP.powf(-notches);
                 state.clamp_zoom();
                 state.pan = pan_keeping_anchor_fixed(cursor, state.pan, old_zoom, state.zoom);
-                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+                apply_view(&fixed, &grid_area, &links_area, &nodes.borrow(), &state);
                 glib::Propagation::Stop
             });
         }
@@ -366,6 +368,7 @@ impl Canvas {
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
+            let links_area = links_area.clone();
             let pointer_position = Rc::clone(&pointer_position);
             scroll.connect_scroll(move |controller, dx, dy| {
                 let wheel = controller.unit() == gtk4::gdk::ScrollUnit::Wheel;
@@ -380,7 +383,7 @@ impl Canvas {
                     let zoom = state.zoom;
                     state.pan = (state.pan.0 - dx / zoom, state.pan.1 - dy / zoom);
                 }
-                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+                apply_view(&fixed, &grid_area, &links_area, &nodes.borrow(), &state);
                 glib::Propagation::Stop
             });
         }
@@ -402,6 +405,7 @@ impl Canvas {
             let nodes = Rc::clone(&nodes);
             let fixed = fixed.clone();
             let grid_area = grid_area.clone();
+            let links_area = links_area.clone();
             let pinch_start = Rc::clone(&pinch_start);
             pinch.connect_scale_changed(move |_gesture, scale| {
                 let (start_zoom, center) = *pinch_start.borrow();
@@ -410,7 +414,7 @@ impl Canvas {
                 state.zoom = start_zoom * scale;
                 state.clamp_zoom();
                 state.pan = pan_keeping_anchor_fixed(center, state.pan, old_zoom, state.zoom);
-                apply_view(&fixed, &grid_area, &nodes.borrow(), &state);
+                apply_view(&fixed, &grid_area, &links_area, &nodes.borrow(), &state);
             });
         }
         fixed.add_controller(pinch);
@@ -465,7 +469,13 @@ impl Canvas {
         state.zoom *= ZOOM_STEP.powi(steps);
         state.clamp_zoom();
         state.pan = pan_keeping_anchor_fixed(center, state.pan, old_zoom, state.zoom);
-        apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
+        apply_view(
+            &self.fixed,
+            &self.grid_area,
+            &self.links_area,
+            &self.nodes.borrow(),
+            &state,
+        );
     }
 
     /// Back to 1:1 at the world origin (Ctrl+0) — the way out of "I zoomed
@@ -473,7 +483,13 @@ impl Canvas {
     pub fn reset_view(&self) {
         let mut state = self.state.borrow_mut();
         *state = CanvasState::new();
-        apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
+        apply_view(
+            &self.fixed,
+            &self.grid_area,
+            &self.links_area,
+            &self.nodes.borrow(),
+            &state,
+        );
     }
 
     /// Re-applies every tracked child's transform from `self.state` as it
@@ -482,7 +498,13 @@ impl Canvas {
     /// would otherwise call `apply_view` itself.
     pub fn refresh_view(&self) {
         let state = self.state.borrow();
-        apply_view(&self.fixed, &self.grid_area, &self.nodes.borrow(), &state);
+        apply_view(
+            &self.fixed,
+            &self.grid_area,
+            &self.links_area,
+            &self.nodes.borrow(),
+            &state,
+        );
     }
 
     pub fn add_node(&self, child: &impl IsA<gtk4::Widget>, world_pos: (f64, f64)) {
@@ -502,6 +524,12 @@ impl Canvas {
             }
         }
         apply_transform(&self.fixed, &widget, world_pos, &self.state.borrow());
+        // Any edge touching this node is drawn in world space from its
+        // live position (see `set_link_lines_source`) and goes just as
+        // stale as the node itself moves — unlike `apply_view`'s callers,
+        // a single-node move never repaints the grid (nothing moved
+        // relative to it), only the link-line overlay.
+        self.links_area.queue_draw();
     }
 
     /// Adds a child on the background layer (a Group): beneath every
@@ -1012,12 +1040,14 @@ fn apply_transform(
 /// `add_node`/`reposition_node`) rather than its current screen transform —
 /// this keeps both pan and zoom exact, including zoom re-centering on the
 /// canvas origin rather than the pointer (v1: simplest thing that works).
-/// Also repaints the grid, which is drawn in world space and so is only ever
-/// stale for exactly these changes — `reposition_node` moves one card and
-/// deliberately does not come through here.
+/// Also repaints the grid and the link-line overlay, both drawn in world
+/// space and so both stale for exactly these changes — `reposition_node`
+/// moves one card and deliberately does not come through here (it queues
+/// `links_area` itself instead, since a grid repaint isn't needed there).
 fn apply_view(
     fixed: &gtk4::Fixed,
     grid_area: &gtk4::DrawingArea,
+    links_area: &gtk4::DrawingArea,
     nodes: &[CanvasNode],
     state: &CanvasState,
 ) {
@@ -1025,6 +1055,7 @@ fn apply_view(
         apply_transform(fixed, child, *world_pos, state);
     }
     grid_area.queue_draw();
+    links_area.queue_draw();
 }
 
 /// A node body's real current size in pre-zoom pixels (GTK allocations are in

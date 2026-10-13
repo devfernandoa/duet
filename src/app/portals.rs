@@ -20,6 +20,7 @@
 //! signals whose handlers borrow `App` again (they defer to an idle
 //! callback for exactly that reason).
 
+use super::files::window_of;
 use super::{
     App, CanvasCommand, MenuItem, NodeWidget, check_label, materialize_node, next_z_order,
     separator,
@@ -38,6 +39,7 @@ use crate::portal_runtime::{self, LOAD_TIMEOUT};
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -280,6 +282,7 @@ impl App {
             .ensure(id, &payload.profile, &payload.url);
         if created {
             wire_view_sync(app, id, &view);
+            wire_tls_confirmation(&view, &App::toaster(app));
         }
         Ok(view)
     }
@@ -845,6 +848,61 @@ fn wire_view_sync(app: &Rc<RefCell<App>>, id: Uuid, view: &webkit6::WebView) {
     view.connect_is_loading_notify(sync);
 }
 
+/// WebKit refuses a TLS error outright by default — nothing in this
+/// codebase connected `load-failed-with-tls-errors` before this, so an
+/// invalid certificate (routinely a local/self-signed server) always
+/// surfaced as a generic, unrecoverable "Unacceptable TLS certificate"
+/// load failure. Asks a human before trusting anything; the exception is
+/// scoped to exactly this host within this portal's own `NetworkSession`
+/// (never a blanket `TLSErrorsPolicy::Ignore`, never silent, never
+/// reachable from `duetctl`/an agent — the same human-only shape every
+/// other destructive-ish confirmation in this app already uses). Wired
+/// exactly once per view, alongside `wire_view_sync`.
+fn wire_tls_confirmation(view: &webkit6::WebView, toast_overlay: &adw::ToastOverlay) {
+    let toast_overlay = toast_overlay.clone();
+    view.connect_load_failed_with_tls_errors(move |view, failing_uri, certificate, _flags| {
+        let Some(window) = window_of(&toast_overlay) else {
+            return false;
+        };
+        let Some(host) = gtk4::glib::Uri::parse(failing_uri, gtk4::glib::UriFlags::NONE)
+            .ok()
+            .and_then(|uri| uri.host().map(|host| host.to_string()))
+        else {
+            return false;
+        };
+        let dialog = adw::MessageDialog::new(
+            Some(&window),
+            Some("This connection isn't private"),
+            Some(&format!(
+                "{host} is using a security certificate Duet can't verify — often normal for a local or self-signed server, but it can also mean the connection isn't secure.\n\nTrust this certificate for {host} anyway?"
+            )),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("trust", "Trust Certificate");
+        dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let view = view.clone();
+            let certificate = certificate.clone();
+            let failing_uri = failing_uri.to_string();
+            move |_, response| {
+                if response == "trust"
+                    && let Some(session) = view.network_session()
+                {
+                    session.allow_tls_certificate_for_host(&certificate, &host);
+                    view.load_uri(&failing_uri);
+                }
+            }
+        });
+        dialog.present();
+        // Let this attempt fail (today's behavior) — a dialog can't answer
+        // synchronously; approval reloads the page once the exception is
+        // registered.
+        false
+    });
+}
+
 /// An `evaluate` call's raw result as its JSON value.
 fn evaluated(result: Result<String, String>) -> Result<serde_json::Value, String> {
     result
@@ -923,6 +981,7 @@ pub(super) fn materialize_portal(
         .ensure(id, &payload.profile, &payload.url);
     if created {
         wire_view_sync(app, id, &view);
+        wire_tls_confirmation(&view, toast_overlay);
     }
     node.attach_view(&view);
     node.show_url(
