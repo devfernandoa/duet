@@ -113,7 +113,7 @@ fn parse_root(raw: &str) -> ProjectPath {
 }
 
 /// The window a widget lives in, for parenting dialogs.
-fn window_of(widget: &impl IsA<gtk4::Widget>) -> Option<gtk4::Window> {
+pub(super) fn window_of(widget: &impl IsA<gtk4::Widget>) -> Option<gtk4::Window> {
     widget.root().and_downcast::<gtk4::Window>()
 }
 

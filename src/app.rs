@@ -27,6 +27,7 @@
 //! shape can't go (a headless remote-API process, say) — Milestone 14's
 //! problem, not this one's.
 
+mod delegated_control;
 mod drawings;
 mod files;
 mod portals;
@@ -1962,10 +1963,11 @@ impl App {
     ///
     /// Not yet called from production code — later tasks in Milestone 7.6's
     /// plan wire it into the actual canvas-control methods this gates.
-    /// Exercised by tests now; `allow(dead_code)` keeps `cargo check` clean
-    /// in the meantime.
+    /// Exercised by tests now (including `control.rs`'s, hence
+    /// `pub(crate)`); `allow(dead_code)` keeps `cargo check` clean in the
+    /// meantime.
     #[allow(dead_code)]
-    fn require_control_capability(
+    pub(crate) fn require_control_capability(
         app: &Rc<RefCell<App>>,
         requested_by: Option<Uuid>,
         capability: ControlCapability,
@@ -5113,6 +5115,65 @@ mod tests {
                 ControlCapability::MoveCanvasNodes
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn approving_a_request_grants_exactly_what_was_requested_and_denies_are_not_reachable_from_control_rs()
+     {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            Some("test".into()),
+        );
+        let approved = App::approve_control_grant(&app, request_id).unwrap();
+        assert_eq!(approved.agent_id, agent);
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_ok()
+        );
+        assert_eq!(
+            App::control_status(&app, agent),
+            [ControlCapability::SpawnAgents].into_iter().collect()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn revoke_control_grant_takes_effect_immediately() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            None,
+        );
+        App::approve_control_grant(&app, request_id).unwrap();
+        assert!(App::revoke_control_grant(&app, agent));
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_err()
         );
     }
 

@@ -27,6 +27,7 @@ use crate::message::{
     PortalAction, PortalInfo, PortalPage, PortalScreenshot, PortalSummary, WhoamiInfo,
     WorkspaceInfo,
 };
+use crate::orchestration::control_grant::ControlCapability;
 use crate::orchestration::resource::{ResolveOutcome, ResolvedResource, ResourceDetail};
 use crate::project::fs::DirEntry;
 use crate::project::git::{DiffScope, GitLogEntry, GitStatus};
@@ -80,6 +81,26 @@ pub enum ControlRequest {
         agent: String,
         #[serde(default)]
         role: Option<String>,
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+    },
+    /// `duetctl control request`: an Agent asks for delegated canvas-control
+    /// capabilities. Never approves anything by itself — see
+    /// `App::request_control_grant`; approval is only ever a GTK dialog
+    /// response (§6).
+    ControlRequestGrant {
+        requested_by: Uuid,
+        /// Kebab-case `ControlCapability` names (`spawn-agents`,
+        /// `create-canvas-nodes`, …) — see `parse_control_capability`.
+        capabilities: Vec<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// `duetctl control status`: capabilities currently granted to the caller
+    /// (or, with no acting agent, always reports every capability, since the
+    /// human operator is implicitly trusted — matches `require_manager`'s
+    /// `None` ⇒ `Ok` convention).
+    ControlStatus {
         #[serde(default)]
         requested_by: Option<Uuid>,
     },
@@ -415,6 +436,12 @@ pub enum ControlResponse {
     Sent {
         message: AgentMessage,
     },
+    ControlRequestPending {
+        request_id: Uuid,
+    },
+    ControlGrantStatus {
+        granted: Vec<String>,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },
@@ -614,6 +641,22 @@ fn parse_provider(name: &str) -> Result<Agent, String> {
         other => Err(format!(
             "unknown provider '{other}' (expected claude, codex, opencode, or shell)"
         )),
+    }
+}
+
+/// A `ControlCapability` as `duetctl control request --capability <...>`
+/// accepts it — the same kebab-case the enum's `serde` rename uses, so
+/// this list must track `ControlCapability`'s variants exactly.
+fn parse_control_capability(name: &str) -> Result<ControlCapability, String> {
+    match name {
+        "spawn-agents" => Ok(ControlCapability::SpawnAgents),
+        "create-canvas-nodes" => Ok(ControlCapability::CreateCanvasNodes),
+        "move-canvas-nodes" => Ok(ControlCapability::MoveCanvasNodes),
+        "resize-canvas-nodes" => Ok(ControlCapability::ResizeCanvasNodes),
+        "configure-canvas-nodes" => Ok(ControlCapability::ConfigureCanvasNodes),
+        "connect-canvas-nodes" => Ok(ControlCapability::ConnectCanvasNodes),
+        "remove-canvas-nodes" => Ok(ControlCapability::RemoveCanvasNodes),
+        other => Err(format!("unknown capability '{other}'")),
     }
 }
 
@@ -889,6 +932,40 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                     error: error.to_string(),
                 },
             }
+        }
+        ControlRequest::ControlRequestGrant {
+            requested_by,
+            capabilities,
+            reason,
+        } => {
+            let mut parsed = std::collections::BTreeSet::new();
+            for name in &capabilities {
+                match parse_control_capability(name) {
+                    Ok(cap) => {
+                        parsed.insert(cap);
+                    }
+                    Err(error) => return ControlResponse::Error { error },
+                }
+            }
+            if parsed.is_empty() {
+                parsed = ControlCapability::DEFAULT_SET.into_iter().collect();
+            }
+            let request_id = App::request_control_grant(app, requested_by, parsed, reason);
+            ControlResponse::ControlRequestPending { request_id }
+        }
+        ControlRequest::ControlStatus { requested_by } => {
+            let granted = match requested_by {
+                None => ControlCapability::DEFAULT_SET
+                    .into_iter()
+                    .chain([ControlCapability::RemoveCanvasNodes])
+                    .map(|cap| format!("{cap:?}"))
+                    .collect(),
+                Some(agent_id) => App::control_status(app, agent_id)
+                    .into_iter()
+                    .map(|cap| format!("{cap:?}"))
+                    .collect(),
+            };
+            ControlResponse::ControlGrantStatus { granted }
         }
         ControlRequest::AgentsRemove {
             target,
@@ -1201,6 +1278,7 @@ pub fn is_cli_verb(verb: &str) -> bool {
         "agent"
             | "agents"
             | "send"
+            | "control"
             | "connections"
             | "workspace"
             | "whoami"
@@ -1301,6 +1379,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, rest @ ..] if cmd == "agent" => parse_legacy_agent(rest),
         [cmd, rest @ ..] if cmd == "agents" => parse_agents(rest),
         [cmd, rest @ ..] if cmd == "send" => parse_send(rest),
+        [cmd, rest @ ..] if cmd == "control" => parse_control(rest),
         [cmd, only] if cmd == "connections" && only == "list" => {
             Ok(ControlRequest::ConnectionsList)
         }
@@ -1331,6 +1410,8 @@ const USAGE: &str = r#"usage:
   duetctl agents remove <id-or-name>
   duetctl agents assign-role <id-or-name> <role-or-none>
   duetctl send --from <id> --to <id-or-name> "<message>"
+  duetctl control request --capability <name> [--capability <name> ...] [--reason "<text>"]
+  duetctl control status
   duetctl connections list
   duetctl workspace inspect
   duetctl whoami
@@ -1376,6 +1457,54 @@ const USAGE: &str = r#"usage:
 
 const RESOURCE_USAGE: &str = r#"usage:
   duetctl resource inspect <id>"#;
+
+const CONTROL_USAGE: &str = r#"usage:
+  duetctl control request --capability <name> [--capability <name> ...] [--reason "<text>"]
+  duetctl control status
+<name> is one of: spawn-agents, create-canvas-nodes, move-canvas-nodes,
+  resize-canvas-nodes, configure-canvas-nodes, connect-canvas-nodes,
+  remove-canvas-nodes"#;
+
+/// `duetctl control request`/`status` — Milestone 7.6's delegated
+/// canvas-control. `request` only makes sense from inside an agent's own
+/// launched shell (there is no human-side "request yourself a grant"); the
+/// request is never approved here — see `ControlRequest::ControlRequestGrant`'s
+/// doc comment.
+fn parse_control(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [cmd, rest @ ..] if cmd == "request" => parse_control_request(rest),
+        [only] if only == "status" => Ok(ControlRequest::ControlStatus {
+            requested_by: acting_agent_id(),
+        }),
+        _ => anyhow::bail!(CONTROL_USAGE),
+    }
+}
+
+fn parse_control_request(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let requested_by = acting_agent_id().ok_or_else(|| {
+        anyhow::anyhow!(
+            "control request needs an agent identity (DUET_AGENT_ID) — run this from \
+             inside an agent's shell\n\n{CONTROL_USAGE}"
+        )
+    })?;
+    let mut capabilities = Vec::new();
+    let mut reason = None;
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].clone());
+        match flag {
+            "--capability" => capabilities.push(value),
+            "--reason" => reason = Some(value),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CONTROL_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::ControlRequestGrant {
+        requested_by,
+        capabilities,
+        reason,
+    })
+}
 
 fn parse_resource(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
@@ -1959,6 +2088,19 @@ fn print_response(response: &ControlResponse) {
         ControlResponse::Sent { message } => {
             println!("{:?} (message {})", message.status, message.id);
         }
+        ControlResponse::ControlRequestPending { request_id } => {
+            println!(
+                "request {request_id} is pending human approval (run `duetctl control status` to check)"
+            );
+        }
+        ControlResponse::ControlGrantStatus { granted } => {
+            if granted.is_empty() {
+                println!("no capabilities granted");
+            }
+            for capability in granted {
+                println!("{capability}");
+            }
+        }
         ControlResponse::AgentList { agents } => {
             if agents.is_empty() {
                 println!("no agents running");
@@ -2343,6 +2485,48 @@ fn print_resolve_outcome(outcome: &ResolveOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::AccountStore;
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn control_request_grant_never_grants_anything_by_itself() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let response = handle_request(
+            &app,
+            ControlRequest::ControlRequestGrant {
+                requested_by: agent,
+                capabilities: vec!["spawn-agents".to_string()],
+                reason: None,
+            },
+        );
+        assert!(matches!(
+            response,
+            ControlResponse::ControlRequestPending { .. }
+        ));
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_err()
+        );
+
+        let status = handle_request(
+            &app,
+            ControlRequest::ControlStatus {
+                requested_by: Some(agent),
+            },
+        );
+        assert!(matches!(
+            status,
+            ControlResponse::ControlGrantStatus { granted } if granted.is_empty()
+        ));
+    }
 
     #[test]
     fn legacy_list_still_parses_with_no_arguments() {
