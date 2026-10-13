@@ -2208,6 +2208,20 @@ impl App {
                 let Some(name) = name else {
                     return Err("a Terminal node only has a name to configure".to_string());
                 };
+                let name = name.trim().to_string();
+                // Same uniqueness invariant `rename_session`/`create_session`
+                // already enforce: a Terminal's name doubles as its agent
+                // identity for name-based resolution (`orchestration::registry`,
+                // `duet agent send <name>`), so a collision here would make
+                // that resolution ambiguous.
+                {
+                    let app_ref = app.borrow();
+                    if app_ref.nodes.iter().any(|(&other, entry)| {
+                        other != id && entry.record.as_terminal().is_some_and(|t| t.name == name)
+                    }) {
+                        return Err(format!("a session named '{name}' already exists"));
+                    }
+                }
                 let (before, after) = {
                     let mut app_mut = app.borrow_mut();
                     let entry = app_mut
@@ -2215,10 +2229,19 @@ impl App {
                         .get_mut(&id)
                         .ok_or("that node no longer exists")?;
                     let before = entry.record.clone();
-                    let Some(terminal) = entry.record.as_terminal_mut() else {
+                    // Keep the widget and the record in sync in the same
+                    // borrow, the same way `rename_session` does — otherwise
+                    // the card's title bar keeps showing the stale name until
+                    // Duet restarts and rebuilds widgets from disk.
+                    let NodeWidget::Terminal(node) = &entry.widget else {
                         return Err("that node is not a Terminal".to_string());
                     };
-                    terminal.name = name.trim().to_string();
+                    node.set_name(&name);
+                    entry
+                        .record
+                        .as_terminal_mut()
+                        .ok_or("that node is not a Terminal")?
+                        .name = name.clone();
                     (before, entry.record.clone())
                 };
                 App::push_undo(
@@ -7060,5 +7083,50 @@ mod tests {
                 .name,
             "Backend"
         );
+        let app_ref = app.borrow();
+        let NodeWidget::Terminal(node) = &app_ref.nodes.get(&id).unwrap().widget else {
+            panic!("expected a Terminal widget");
+        };
+        assert_eq!(node.title_label.text(), "Backend");
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn configure_node_rejects_a_colliding_terminal_name() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut taken = terminal_node(EnvironmentKind::LocalPty);
+        taken.as_terminal_mut().unwrap().name = "Taken".to_string();
+        materialize_node(&app, taken, &adw::ToastOverlay::new()).unwrap();
+
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let id = node.id;
+        materialize_node(&app, node, &adw::ToastOverlay::new()).unwrap();
+
+        let result = App::configure_node(&app, None, id, Some("Taken".to_string()), None);
+        assert!(result.is_err());
+
+        assert_eq!(
+            app.borrow()
+                .nodes
+                .get(&id)
+                .unwrap()
+                .record
+                .as_terminal()
+                .unwrap()
+                .name,
+            "t"
+        );
+        let app_ref = app.borrow();
+        let NodeWidget::Terminal(node) = &app_ref.nodes.get(&id).unwrap().widget else {
+            panic!("expected a Terminal widget");
+        };
+        assert_eq!(node.title_label.text(), "t");
     }
 }
