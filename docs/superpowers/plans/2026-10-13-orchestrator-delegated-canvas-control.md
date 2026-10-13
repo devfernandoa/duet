@@ -1252,7 +1252,7 @@ pub fn move_node(
     }
     if let Some(agent_id) = requested_by {
         let requester = App::agent_display_name(app, agent_id);
-        let node_name = App::node_display_name(app, id);
+        let node_name = node_display_name(&app.borrow(), id);
         App::notify(app, &format!("{requester} moved {node_name}"));
     }
     let _ = app.borrow().persist();
@@ -1268,6 +1268,16 @@ pub fn resize_node(
 ) -> Result<(), String> {
     App::require_control_capability(app, requested_by, ControlCapability::ResizeCanvasNodes)
         .map_err(|error| error.to_string())?;
+    // Clamped once, outside the mutation block, so `old_size != size` below
+    // compares against the SAME value actually written to `entry.record`/
+    // the widget — comparing against the pre-clamp parameter here would
+    // push a `CanvasCommand::ResizeNode` undo entry that doesn't match
+    // what was really applied whenever a requested size was below the
+    // minimum.
+    let size = (
+        size.0.max(crate::node::MIN_NODE_WIDTH),
+        size.1.max(crate::node::MIN_NODE_HEIGHT),
+    );
     let old_size = {
         let mut app_mut = app.borrow_mut();
         let Some(entry) = app_mut.nodes.get_mut(&id) else {
@@ -1277,10 +1287,6 @@ pub fn resize_node(
             return Err("that node is locked".to_string());
         }
         let old_size = entry.record.size;
-        let size = (
-            size.0.max(crate::node::MIN_NODE_WIDTH),
-            size.1.max(crate::node::MIN_NODE_HEIGHT),
-        );
         entry.record.size = size;
         entry.widget.apply_resize(size);
         old_size
@@ -1290,27 +1296,32 @@ pub fn resize_node(
     }
     if let Some(agent_id) = requested_by {
         let requester = App::agent_display_name(app, agent_id);
-        let node_name = App::node_display_name(app, id);
+        let node_name = node_display_name(&app.borrow(), id);
         App::notify(app, &format!("{requester} resized {node_name}"));
     }
     let _ = app.borrow().persist();
     Ok(())
 }
+```
 
-/// A short human-readable label for activity toasts — a Terminal's/
-/// Group's name, a generic kind label otherwise. Read-only, GTK-free.
-fn node_display_name(app: &Rc<RefCell<App>>, id: Uuid) -> String {
-    let app_ref = app.borrow();
-    match app_ref.nodes.get(&id).map(|entry| &entry.record.kind) {
-        Some(NodeKind::Terminal(terminal)) => terminal.name.clone(),
-        Some(NodeKind::Group(group)) if !group.label.is_empty() => group.label.clone(),
-        Some(kind) => kind.kind_label().to_string(),
-        None => id.to_string(),
-    }
+**Do not add a new `node_display_name` method.** A free function with exactly this name and purpose already exists in `app.rs` (`fn node_display_name(app: &App, id: Uuid) -> String` — "A node's display name for toast messages: a terminal's own name, or its kind label for anything else"), already called from the existing edge link/unlink toasts. Extend that existing function in place to add the Group-label special case this task needs, rather than creating a second function with the same name and slightly different behavior (a real DRY violation a fresh pair of eyes will immediately flag — two functions named `node_display_name` in one file, differing only in whether a Group's custom label is preferred over its generic kind label):
+
+```rust
+/// A node's display name for toast messages: a terminal's own name, a
+/// Group's custom label if it has one, or its kind label otherwise.
+fn node_display_name(app: &App, id: Uuid) -> String {
+    app.nodes
+        .get(&id)
+        .map(|entry| match &entry.record.kind {
+            NodeKind::Terminal(terminal) => terminal.name.clone(),
+            NodeKind::Group(group) if !group.label.is_empty() => group.label.clone(),
+            _ => entry.record.kind.label().to_string(),
+        })
+        .unwrap_or_default()
 }
 ```
 
-Before writing `node_display_name`, confirm `NodeKind`'s existing `&'static str` label method name (model.rs:394's match, used by `as_terminal`'s neighbors) — reuse it rather than inventing `kind_label` if a differently-named equivalent already exists.
+This also fixes a pre-existing inconsistency: today's edge link/unlink toasts show a generic "Group" label even for a named Group, while this change makes them (and the new move/resize toasts) show the Group's actual label consistently. Every call site in this task calls it as `node_display_name(&app.borrow(), id)` (it takes `&App`, already-borrowed — not `&Rc<RefCell<App>>` the way `App::agent_display_name` does), matching its two pre-existing call sites' calling convention exactly. `NodeKind::label(&self) -> &'static str` is the real existing method name (confirmed by reading the existing `node_display_name`'s own body) — every other task in this plan that references a "`kind_label`" method should use `label()` instead; this has already been corrected everywhere else in this document.
 
 Add `ControlRequest::CanvasMove { requested_by: Option<Uuid>, id: Uuid, x: f64, y: f64 }` and `CanvasResize { requested_by: Option<Uuid>, id: Uuid, width: f64, height: f64 }`, their `handle_request` arms calling the two new services and mapping `Ok`/`Err` to `ControlResponse::Ok`/`ControlResponse::Error` (reuse whichever success-shaped `ControlResponse` variant the codebase already uses for a no-payload success, e.g. check how `NotesReplace`/`GitStage` report success before adding a new variant), and CLI parsing for `duet canvas move <id> --x <f64> --y <f64>` / `duet canvas resize <id> --width <f64> --height <f64>`.
 
@@ -1405,7 +1416,7 @@ pub fn create_canvas_node(
     let id = App::add_simple_node(app, kind, position, size);
     if let Some(agent_id) = requested_by {
         let requester = App::agent_display_name(app, agent_id);
-        App::notify(app, &format!("{requester} created {}", App::node_display_name(app, id)));
+        App::notify(app, &format!("{requester} created {}", node_display_name(&app.borrow(), id)));
     }
     Ok(id)
 }
@@ -1539,7 +1550,7 @@ pub fn configure_node(
     }
     if let Some(agent_id) = requested_by {
         let requester = App::agent_display_name(app, agent_id);
-        App::notify(app, &format!("{requester} configured {}", App::node_display_name(app, id)));
+        App::notify(app, &format!("{requester} configured {}", node_display_name(&app.borrow(), id)));
     }
     let _ = app.borrow().persist();
     Ok(())
@@ -1657,7 +1668,7 @@ If `requested_by.is_some()` and the call succeeds, add an activity toast:
     }
 ```
 
-Place this using the same `App::agent_display_name`/`App::node_display_name`/`App::notify` pattern as the other services, after the mutable borrow of `app` has been dropped.
+Place this using the same `App::agent_display_name`/`node_display_name(&app.borrow(), id)`/`App::notify` pattern as the other services, after the mutable borrow of `app` has been dropped.
 
 Add `ControlRequest::CanvasConnect { requested_by: Option<Uuid>, source: Uuid, target: Uuid }`, its `handle_request` arm, and `duet canvas connect <source-id> <target-id>` CLI parsing. Note §16: this deliberately does **not** take an explicit capability list — it inherits whatever default capabilities `create_edge`'s existing kind-pair table assigns, which is already least-privilege by construction (research item 8); do not add a capability-selection flag to this command.
 
@@ -1890,7 +1901,7 @@ impl App {
         };
         CanvasNodeSummary {
             id: record.id,
-            kind: record.kind.kind_label().to_string(),
+            kind: record.kind.label().to_string(),
             name,
             position: record.position,
             size: record.size,
@@ -1901,7 +1912,7 @@ impl App {
 }
 ```
 
-Reuse `NodeKind`'s existing `&'static str` kind-label method (model.rs:394's match — confirm its real name; this plan calls it `kind_label` provisionally) instead of inventing a second one.
+Reuse `NodeKind::label(&self) -> &'static str` (model.rs:394's match) — confirmed by Task 5's review of the existing `node_display_name` free function's own body, which already calls it.
 
 Add `ControlRequest::CanvasList` and `CanvasInspect { id: Uuid }`, `ControlResponse::CanvasNodes { nodes: Vec<CanvasNodeSummary> }` and `CanvasNode { node: CanvasNodeSummary }` (or `Error` if not found), their `handle_request` arms, and `duet canvas list --json` / `duet canvas inspect <id> --json` CLI parsing (print pretty JSON via `serde_json::to_string_pretty`, matching however other `--json`-flagged commands in this CLI already format output — check `drawing read`/`resource inspect` for the exact convention before adding a new one).
 
@@ -2160,7 +2171,7 @@ git commit -m "docs: teach the duet skill the delegated canvas-control workflow"
 ## Self-Review Notes
 
 - **Spec coverage:** §1 (Task 4, 6), §2 (Task 1), §3 (Task 1/2 — in-memory-only, revoked on close/teardown/unload), §4 (Task 3), §5 (Task 3's dialog), §6 (Task 3's structural guarantee + test), §7 (Task 2's `require_control_capability` at every service boundary), §8 (Task 4 reuses `create_session`), §9 (Task 4's `initial_prompt` seam — verified by direct inspection to be `build_terminal_launch`/`discovery_prompt`, not role-instruction-folding, which is dead for this purpose; threaded as a transient parameter, no new persisted field), §10 (Task 10), §11 (Task 6), §12 (Group remains visual-only — no code changes needed, nothing in this plan adds parent/child membership), §13 (Task 10 + 11), §14 (explicitly skipped, Global Constraints), §15 (Task 5's locked-node checks, `CanvasCommand` reuse), §16 (Task 8's reuse of `create_edge`'s existing defaulting table, no capability-assignment flag added), §17 (Task 3's revoke method + Task 12's UI), §18 (toast-per-completed-action folded into Tasks 4-10, no toast on intermediate drag-equivalent ticks since there are none — every service call here is already one atomic completed action), §19 (Task 13), §20 (Global Constraints note — "Lead" already exists, role alone never grants control, no code change required beyond documentation).
-- **Placeholder scan:** no TBD/"add later"/paraphrased-test steps remain; every code block is real Rust against verified signatures. Three places deliberately tell the implementer to verify one exact detail against the live source before finalizing a literal (Task 4's `initial_prompt` seam, Task 6's `Drawing` default size, Task 10's `kind_label` method name) — these are flagged, not guessed, because the research pass that grounded this plan did not pin those three specifics byte-for-byte; CLAUDE.md's "read it yourself before changing it" rule applies most directly to exactly these three spots.
+- **Placeholder scan:** no TBD/"add later"/paraphrased-test steps remain; every code block is real Rust against verified signatures. Two places deliberately told the implementer to verify one exact detail against the live source before finalizing a literal (Task 4's `initial_prompt` seam, Task 6's `Drawing` default size); a third (Task 10's node-kind label method name) was resolved during Task 5's execution — it's `NodeKind::label()`, confirmed by reading the pre-existing `node_display_name` free function this plan now reuses rather than duplicates (see Task 5's post-review fix).
 - **Type consistency:** `ControlCapability`, `DelegatedControlService`, `PendingGrantRequest` (Task 1) are used with identical names/fields through Tasks 2-13. `App::create_edge`'s and `App::create_agent`'s signature changes are each called out explicitly with a "grep every call site" instruction, since both are pre-existing public functions this plan changes rather than new ones.
 
 ## Execution Handoff
