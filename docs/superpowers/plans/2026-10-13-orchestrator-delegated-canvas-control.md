@@ -517,6 +517,7 @@ Add to `src/app.rs`'s test module:
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn approving_a_request_grants_exactly_what_was_requested_and_denies_are_not_reachable_from_control_rs() {
     if gtk4::init().is_err() {
         return;
@@ -540,6 +541,7 @@ fn approving_a_request_grants_exactly_what_was_requested_and_denies_are_not_reac
 }
 
 #[test]
+#[ignore = "needs a display"]
 fn revoke_control_grant_takes_effect_immediately() {
     if gtk4::init().is_err() {
         return;
@@ -833,6 +835,7 @@ ControlRequest::ControlStatus { requested_by } => {
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn control_request_grant_never_grants_anything_by_itself() {
     if gtk4::init().is_err() {
         return;
@@ -891,6 +894,7 @@ git commit -m "feat: add control request/status CLI and the human-only approval 
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn create_agent_denies_an_orchestrator_without_spawn_agents_capability() {
     if gtk4::init().is_err() {
         return;
@@ -917,6 +921,7 @@ fn create_agent_denies_an_orchestrator_without_spawn_agents_capability() {
 }
 
 #[test]
+#[ignore = "needs a display"]
 fn create_agent_places_an_authorized_orchestrators_agent_at_the_requested_position() {
     if gtk4::init().is_err() {
         return;
@@ -1104,6 +1109,7 @@ git commit -m "feat: let an authorized orchestrator place a spawned agent and gi
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn move_node_respects_a_locked_node() {
     if gtk4::init().is_err() {
         return;
@@ -1123,6 +1129,7 @@ fn move_node_respects_a_locked_node() {
 }
 
 #[test]
+#[ignore = "needs a display"]
 fn move_node_requires_move_canvas_nodes_capability_for_an_agent() {
     if gtk4::init().is_err() {
         return;
@@ -1150,6 +1157,7 @@ fn move_node_requires_move_canvas_nodes_capability_for_an_agent() {
 }
 
 #[test]
+#[ignore = "needs a display"]
 fn resize_node_pushes_an_undo_entry() {
     if gtk4::init().is_err() {
         return;
@@ -1304,6 +1312,7 @@ git commit -m "feat: add authorized move/resize canvas services and duetctl canv
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn create_canvas_node_requires_create_canvas_nodes_capability() {
     if gtk4::init().is_err() {
         return;
@@ -1411,6 +1420,7 @@ git commit -m "feat: add authorized generic canvas node creation and duetctl can
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn configure_node_renames_a_terminal_when_authorized() {
     if gtk4::init().is_err() {
         return;
@@ -1528,6 +1538,7 @@ git commit -m "feat: add authorized node rename/configure service and duetctl ca
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn create_edge_requires_connect_canvas_nodes_capability_for_an_agent() {
     if gtk4::init().is_err() {
         return;
@@ -1556,6 +1567,7 @@ fn create_edge_requires_connect_canvas_nodes_capability_for_an_agent() {
 }
 
 #[test]
+#[ignore = "needs a display"]
 fn create_edge_still_works_unauthenticated_for_the_human_operator() {
     if gtk4::init().is_err() {
         return;
@@ -1642,6 +1654,7 @@ git commit -m "feat: gate node connection behind ConnectCanvasNodes for agent-or
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn remove_canvas_node_refuses_terminal_nodes() {
     if gtk4::init().is_err() {
         return;
@@ -1657,6 +1670,7 @@ fn remove_canvas_node_refuses_terminal_nodes() {
 }
 
 #[test]
+#[ignore = "needs a display"]
 fn remove_canvas_node_requires_the_destructive_capability_explicitly() {
     if gtk4::init().is_err() {
         return;
@@ -1772,6 +1786,7 @@ Not capability-gated — mirrors `AgentsList`/`ConnectionsList`'s existing prece
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn list_canvas_nodes_reports_every_live_node() {
     if gtk4::init().is_err() {
         return;
@@ -1877,6 +1892,7 @@ git commit -m "feat: add read-only canvas list/inspect service and duetctl canva
 
 ```rust
 #[test]
+#[ignore = "needs a display"]
 fn find_canvas_space_avoids_an_existing_nodes_bounding_box() {
     if gtk4::init().is_err() {
         return;
