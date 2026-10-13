@@ -27,6 +27,9 @@ use crate::message::{
     PortalAction, PortalInfo, PortalPage, PortalScreenshot, PortalSummary, WhoamiInfo,
     WorkspaceInfo,
 };
+use crate::model::{
+    FileTreePayload, GroupPayload, NodeKind, NotePayload, NoteViewMode, PortalPayload, TextPayload,
+};
 use crate::orchestration::control_grant::ControlCapability;
 use crate::orchestration::resource::{ResolveOutcome, ResolvedResource, ResourceDetail};
 use crate::project::fs::DirEntry;
@@ -150,6 +153,25 @@ pub enum ControlRequest {
         id: Uuid,
         width: f64,
         height: f64,
+    },
+    /// `duetctl canvas create --kind <kind> [--name <text>] --x <num> --y
+    /// <num> [--width <num>] [--height <num>]`: Milestone 7.6's generic
+    /// node-creation surface — see `App::create_canvas_node`. `kind` is one
+    /// of `note | text | filetree | group | drawing | portal`; `Terminal`
+    /// stays behind `AgentsCreate`/`duetctl agents create`. Fails if
+    /// `requested_by` lacks `CreateCanvasNodes`.
+    CanvasCreate {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        kind: String,
+        #[serde(default)]
+        name: Option<String>,
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        width: Option<f64>,
+        #[serde(default)]
+        height: Option<f64>,
     },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
@@ -1121,6 +1143,30 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 message: format!("resized node {id}"),
             },
         ),
+        ControlRequest::CanvasCreate {
+            requested_by,
+            kind,
+            name,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let kind = match canvas_create_kind(&kind, name) {
+                Ok(kind) => kind,
+                Err(error) => return ControlResponse::Error { error },
+            };
+            let size = match (width, height) {
+                (Some(width), Some(height)) => Some((width, height)),
+                _ => None,
+            };
+            respond(
+                App::create_canvas_node(app, requested_by, kind, (x, y), size),
+                |id| ControlResponse::CanvasDone {
+                    message: format!("created node {id}"),
+                },
+            )
+        }
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -1575,6 +1621,8 @@ const USAGE: &str = r#"usage:
   duetctl portal evaluate <portal> [<script>]    (script read from stdin if omitted)
   duetctl canvas move <id> --x <num> --y <num>
   duetctl canvas resize <id> --width <num> --height <num>
+  duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
+                         --x <num> --y <num> [--width <num>] [--height <num>]
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -2111,16 +2159,52 @@ fn parse_notes_patch(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest
 
 const CANVAS_USAGE: &str = r#"usage:
   duetctl canvas move <id> --x <num> --y <num>
-  duetctl canvas resize <id> --width <num> --height <num>"#;
+  duetctl canvas resize <id> --width <num> --height <num>
+  duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
+                         --x <num> --y <num> [--width <num>] [--height <num>]"#;
 
-/// `duetctl canvas move|resize <id> ...`: Milestone 7.6's delegated
-/// canvas-control move/resize, by stable id — see `App::move_node`/
-/// `App::resize_node`.
+/// `duetctl canvas move|resize|create <id> ...`: Milestone 7.6's delegated
+/// canvas-control move/resize/create — see `App::move_node`/
+/// `App::resize_node`/`App::create_canvas_node`.
 fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [cmd, id, rest @ ..] if cmd == "move" => parse_canvas_move(parse_uuid_arg(id)?, rest),
         [cmd, id, rest @ ..] if cmd == "resize" => parse_canvas_resize(parse_uuid_arg(id)?, rest),
+        [cmd, rest @ ..] if cmd == "create" => parse_canvas_create(rest),
         _ => anyhow::bail!(CANVAS_USAGE),
+    }
+}
+
+/// Builds the `NodeKind` for `ControlRequest::CanvasCreate`'s `kind` string —
+/// the same payload literals `create_note`/`create_text_node`/`create_group`/
+/// `create_drawing` already use, so this orchestrator path produces exactly
+/// the same kind of node the GUI buttons do. `name` seeds a Note's/Text's
+/// initial content, a Group's label, or a Portal's display name; it is
+/// ignored for `filetree`/`drawing`, which have no name field.
+fn canvas_create_kind(kind: &str, name: Option<String>) -> Result<NodeKind, String> {
+    match kind {
+        "note" => Ok(NodeKind::Note(NotePayload {
+            markdown: name.unwrap_or_default(),
+            color: "yellow".to_string(),
+            view_mode: NoteViewMode::Edit,
+            file: None,
+        })),
+        "text" => Ok(NodeKind::Text(TextPayload {
+            content: name.unwrap_or_default(),
+        })),
+        "filetree" => Ok(NodeKind::FileTree(FileTreePayload::default())),
+        "group" => Ok(NodeKind::Group(GroupPayload {
+            label: name.unwrap_or_default(),
+            ..Default::default()
+        })),
+        "drawing" => Ok(NodeKind::Drawing(Default::default())),
+        "portal" => Ok(NodeKind::Portal(PortalPayload::new(
+            &name.unwrap_or_default(),
+            "",
+        ))),
+        other => Err(format!(
+            "unknown canvas kind '{other}' (expected note|text|filetree|group|drawing|portal)"
+        )),
     }
 }
 
@@ -2163,6 +2247,35 @@ fn parse_canvas_resize(id: Uuid, args: &[String]) -> anyhow::Result<ControlReque
             .ok_or_else(|| anyhow::anyhow!("canvas resize needs --width\n\n{CANVAS_USAGE}"))?,
         height: height
             .ok_or_else(|| anyhow::anyhow!("canvas resize needs --height\n\n{CANVAS_USAGE}"))?,
+    })
+}
+
+fn parse_canvas_create(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut kind, mut name, mut x, mut y, mut width, mut height) =
+        (None, None, None, None, None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--kind" => kind = Some(value.to_string()),
+            "--name" => name = Some(value.to_string()),
+            "--x" => x = Some(parse_f64_arg(value)?),
+            "--y" => y = Some(parse_f64_arg(value)?),
+            "--width" => width = Some(parse_f64_arg(value)?),
+            "--height" => height = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasCreate {
+        requested_by: acting_agent_id(),
+        kind: kind
+            .ok_or_else(|| anyhow::anyhow!("canvas create needs --kind\n\n{CANVAS_USAGE}"))?,
+        name,
+        x: x.ok_or_else(|| anyhow::anyhow!("canvas create needs --x\n\n{CANVAS_USAGE}"))?,
+        y: y.ok_or_else(|| anyhow::anyhow!("canvas create needs --y\n\n{CANVAS_USAGE}"))?,
+        width,
+        height,
     })
 }
 

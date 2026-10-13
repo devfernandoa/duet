@@ -2145,6 +2145,58 @@ impl App {
         Ok(())
     }
 
+    /// §11's orchestrator-facing node creation: the exact same
+    /// `add_simple_node` the GUI's Note/Group/Drawing buttons already use,
+    /// gated by `CreateCanvasNodes` — never a second, parallel creation path.
+    /// `size` falls back to `kind`'s usual default when omitted.
+    pub fn create_canvas_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        kind: NodeKind,
+        position: (f64, f64),
+        size: Option<(f64, f64)>,
+    ) -> Result<Uuid, String> {
+        App::require_control_capability(app, requested_by, ControlCapability::CreateCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        if matches!(kind, NodeKind::Terminal(_)) {
+            return Err("use control request/agents create for Terminal nodes".to_string());
+        }
+        let size = size.unwrap_or_else(|| App::default_size_for(&kind));
+        // Same minimum clamp Task 5's `resize_node` applies — an agent-supplied
+        // `--width 0`/negative size must not create a degenerate node.
+        let size = (
+            size.0.max(crate::node::MIN_NODE_WIDTH),
+            size.1.max(crate::node::MIN_NODE_HEIGHT),
+        );
+        let id = App::add_simple_node(app, kind, position, size);
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(
+                app,
+                &format!(
+                    "{requester} created {}",
+                    node_display_name(&app.borrow(), id)
+                ),
+            );
+        }
+        Ok(id)
+    }
+
+    /// The same per-kind default size `create_note`/`create_group`/
+    /// `create_drawing` each hard-code today — centralized here so the
+    /// orchestrator path and a future caller agree on one table instead of
+    /// guessing a size.
+    fn default_size_for(kind: &NodeKind) -> (f64, f64) {
+        match kind {
+            NodeKind::Note(_) | NodeKind::Text(_) => (220.0, 160.0),
+            NodeKind::Group(_) => (720.0, 460.0),
+            NodeKind::Drawing(_) => (420.0, 300.0),
+            NodeKind::FileTree(_) => (320.0, 420.0),
+            NodeKind::Portal(_) => (640.0, 480.0),
+            _ => (320.0, 240.0),
+        }
+    }
+
     /// Spawns a blank Markdown note at `position`, wires it, and persists.
     pub fn create_note(app: &Rc<RefCell<App>>, position: (f64, f64)) {
         let record = NodeRecord {
@@ -6863,5 +6915,46 @@ mod tests {
             app.borrow().undo_stack.last(),
             Some(CanvasCommand::ResizeNode { old_size: o, new_size: (500.0, 400.0), .. }) if *o == old_size
         ));
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_canvas_node_requires_create_canvas_nodes_capability() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let kind = NodeKind::Group(GroupPayload::default());
+
+        assert!(
+            App::create_canvas_node(&app, Some(agent), kind.clone(), (0.0, 0.0), None).is_err()
+        );
+
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::CreateCanvasNodes].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        let id = App::create_canvas_node(
+            &app,
+            Some(agent),
+            kind,
+            (100.0, 200.0),
+            Some((300.0, 150.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.position,
+            (100.0, 200.0)
+        );
     }
 }
