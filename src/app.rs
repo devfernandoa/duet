@@ -52,7 +52,10 @@ use crate::node::{GroupNode, NoteNode, SessionNode, TextNode};
 use crate::node_drawing::DrawingNode;
 use crate::node_files::{EditorNode, FileTreeNode};
 use crate::node_portal::PortalNode;
-use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
+use crate::orchestration::{
+    self, AgentIdentity, AgentRegistry, MessageBus, adapter_for,
+    control_grant::{ControlCapability, DelegatedControlService},
+};
 use crate::portal_runtime::PortalRuntime;
 use crate::role::Role;
 use crate::runtime::{AgentActivity, SessionRuntime};
@@ -382,6 +385,10 @@ pub struct App {
     /// Every live `Terminal` node's PTY/process, keyed by the same id as
     /// `nodes`. See `runtime.rs`'s module doc for why this is a separate map.
     pub runtime: SessionRuntime,
+    /// Milestone 7.6: delegated canvas-control grants for this process's
+    /// agents. Never persisted — see `orchestration::control_grant`'s module
+    /// doc.
+    pub control: DelegatedControlService,
     pub edges: Vec<EdgeRecord>,
     /// Routing, permissions and per-agent queueing for agent-to-agent
     /// messages — see `orchestration::bus`. Not persisted: a message is a
@@ -470,6 +477,7 @@ impl App {
             runtime: SessionRuntime::new(),
             edges: Vec::new(),
             bus: MessageBus::new(),
+            control: DelegatedControlService::new(),
             pending_edge_source: None,
             link_hint: None,
             selected_edge: None,
@@ -792,6 +800,8 @@ impl App {
             app_mut.redo_stack.clear();
             app_mut.file_sync.clear();
             app_mut.tree_state.clear();
+            let workspace_id = app_mut.workspace_id;
+            app_mut.control.clear_workspace(workspace_id);
         }
     }
 
@@ -805,6 +815,8 @@ impl App {
     /// `detach_active_workspace` for the far more common "just switching
     /// away" case.
     fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
+        let workspace_id = app.borrow().workspace_id;
+        app.borrow_mut().control.clear_workspace(workspace_id);
         let terminals: Vec<(Uuid, EnvironmentKind)> = app
             .borrow()
             .nodes
@@ -1110,6 +1122,7 @@ impl App {
         for node_id in portals {
             app.borrow_mut().portals.remove(node_id);
         }
+        app.borrow_mut().control.clear_workspace(id);
         Ok(())
     }
 
@@ -1938,6 +1951,38 @@ impl App {
             Ok(())
         } else {
             anyhow::bail!("not authorized: {requested_by} does not have a manager role")
+        }
+    }
+
+    /// The Milestone 7.6 analogue of `require_manager`, for delegated
+    /// canvas-control actions: `None` is the trusted human operator (always
+    /// `Ok`); `Some(agent_id)` must hold `capability` over the active
+    /// workspace. Checked at the `App::` method boundary, not only in
+    /// `control.rs`'s CLI parsing (§7).
+    ///
+    /// Not yet called from production code — later tasks in Milestone 7.6's
+    /// plan wire it into the actual canvas-control methods this gates.
+    /// Exercised by tests now; `allow(dead_code)` keeps `cargo check` clean
+    /// in the meantime.
+    #[allow(dead_code)]
+    fn require_control_capability(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        capability: ControlCapability,
+    ) -> anyhow::Result<()> {
+        let Some(agent_id) = requested_by else {
+            return Ok(());
+        };
+        let app_ref = app.borrow();
+        if app_ref
+            .control
+            .has_capability(app_ref.workspace_id, agent_id, capability)
+        {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "not authorized: {agent_id} lacks delegated control capability {capability:?}"
+            )
         }
     }
 
@@ -2813,6 +2858,8 @@ impl App {
             files::forget_node(&mut app_mut, id);
             portals::forget_node(&mut app_mut, id);
             app_mut.refresh_link_highlight();
+            let workspace_id = app_mut.workspace_id;
+            app_mut.control.revoke(workspace_id, id);
             (canvas, removed)
         };
         if let Some(entry) = removed {
@@ -4986,6 +5033,83 @@ mod tests {
                 .unwrap()
                 .markdown,
             "hello"
+        );
+    }
+
+    #[test]
+    fn require_control_capability_allows_the_human_operator() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        assert!(
+            App::require_control_capability(&app, None, ControlCapability::SpawnAgents).is_ok()
+        );
+    }
+
+    #[test]
+    fn require_control_capability_denies_an_ungranted_agent() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn closing_a_node_revokes_that_agents_control_grant() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent_node = terminal_node(EnvironmentKind::LocalPty);
+        let agent_id = agent_node.id;
+        materialize_node(&app, agent_node, &adw::ToastOverlay::new()).unwrap();
+        let workspace_id = app.borrow().workspace_id;
+        {
+            let mut app_mut = app.borrow_mut();
+            let request_id = app_mut.control.request_grant(
+                agent_id,
+                workspace_id,
+                [ControlCapability::MoveCanvasNodes].into_iter().collect(),
+                None,
+            );
+            app_mut.control.approve(request_id).unwrap();
+        }
+        assert!(
+            App::require_control_capability(
+                &app,
+                Some(agent_id),
+                ControlCapability::MoveCanvasNodes
+            )
+            .is_ok()
+        );
+
+        App::close_node(&app, agent_id);
+
+        assert!(
+            App::require_control_capability(
+                &app,
+                Some(agent_id),
+                ControlCapability::MoveCanvasNodes
+            )
+            .is_err()
         );
     }
 
