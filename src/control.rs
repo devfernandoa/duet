@@ -711,6 +711,34 @@ fn resolve_optional_role(app: &App, role: Option<String>) -> Result<Option<Uuid>
     }
 }
 
+/// Builds `App::create_agent`'s `position`/`size` arguments from
+/// `ControlRequest::AgentsCreate`'s `x`/`y`/`width`/`height` fields — each
+/// pair must be both present or both absent (a partial pair is a request
+/// error); `(None, None)` means "use the defaults" the same way a plain
+/// `duetctl agents create` always has. Pure logic, factored out of
+/// `handle_request`'s `AgentsCreate` arm so it's unit-testable without a
+/// GTK display (every `handle_request` test needs one, via `App::new`).
+fn agents_create_position_and_size(
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<(Option<(f64, f64)>, Option<(f64, f64)>), String> {
+    let position = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => return Err("agents create needs both --x and --y, or neither".to_string()),
+    };
+    let size = match (width, height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        (None, None) => None,
+        _ => {
+            return Err("agents create needs both --width and --height, or neither".to_string());
+        }
+    };
+    Ok((position, size))
+}
+
 /// Answers one accepted request — called from `main.rs`'s poll loop, on
 /// the GTK main thread. Most requests are answered right away by
 /// `handle_request`; a portal operation that needs the page (navigation,
@@ -954,24 +982,9 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             // a CLI creation with no explicit `x`/`y` always used (the GUI's
             // "New session" dialog passes its own viewport-center position
             // instead, via `App::create_session` directly).
-            let position = match (x, y) {
-                (Some(x), Some(y)) => Some((x, y)),
-                (None, None) => None,
-                _ => {
-                    return ControlResponse::Error {
-                        error: "agents create needs both --x and --y, or neither".to_string(),
-                    };
-                }
-            };
-            let size = match (width, height) {
-                (Some(width), Some(height)) => Some((width, height)),
-                (None, None) => None,
-                _ => {
-                    return ControlResponse::Error {
-                        error: "agents create needs both --width and --height, or neither"
-                            .to_string(),
-                    };
-                }
+            let (position, size) = match agents_create_position_and_size(x, y, width, height) {
+                Ok(pair) => pair,
+                Err(error) => return ControlResponse::Error { error },
             };
             match App::create_agent(
                 app,
@@ -1464,6 +1477,7 @@ const USAGE: &str = r#"usage:
   duetctl agents list
   duetctl agents inspect <id-or-name>
   duetctl agents create --name <name> --cwd <dir> --agent <claude|codex|opencode|shell> [--role <role>]
+                         [--x <num> --y <num>] [--width <num> --height <num>] [--task <text>]
   duetctl agents remove <id-or-name>
   duetctl agents assign-role <id-or-name> <role-or-none>
   duetctl send --from <id> --to <id-or-name> "<message>"
@@ -2112,10 +2126,20 @@ fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
     })
 }
 
+/// Parses a `--x`/`--y`/`--width`/`--height` value. Rejects non-finite
+/// input (`nan`/`inf`/`-inf`) at this trust boundary — an agent-supplied
+/// non-finite float would otherwise land in `NodeRecord.position`/`size`,
+/// serialize as JSON `null`, and fail to deserialize on the next launch,
+/// triggering `backup_corrupt_file` and silently discarding the user's
+/// workspace (CLAUDE.md: "never silently discard or reset persisted data").
 fn parse_f64_arg(value: &str) -> anyhow::Result<f64> {
-    value
+    let parsed: f64 = value
         .parse()
-        .map_err(|_| anyhow::anyhow!("expected a number, got '{value}'"))
+        .map_err(|_| anyhow::anyhow!("expected a number, got '{value}'"))?;
+    if !parsed.is_finite() {
+        anyhow::bail!("expected a finite number, got '{value}'");
+    }
+    Ok(parsed)
 }
 
 fn parse_send(args: &[String]) -> anyhow::Result<ControlRequest> {
@@ -2750,12 +2774,27 @@ mod tests {
             "claude".to_string(),
             "--role".to_string(),
             "Developer".to_string(),
+            "--x".to_string(),
+            "1200".to_string(),
+            "--y".to_string(),
+            "500".to_string(),
+            "--width".to_string(),
+            "420".to_string(),
+            "--height".to_string(),
+            "320".to_string(),
+            "--task".to_string(),
+            "implement the thing".to_string(),
         ];
         let ControlRequest::AgentsCreate {
             name,
             cwd,
             agent,
             role,
+            x,
+            y,
+            width,
+            height,
+            task,
             ..
         } = parse_cli_request(&args).unwrap()
         else {
@@ -2765,6 +2804,89 @@ mod tests {
         assert_eq!(cwd, PathBuf::from("/tmp"));
         assert_eq!(agent, "claude");
         assert_eq!(role, Some("Developer".to_string()));
+        assert_eq!(x, Some(1200.0));
+        assert_eq!(y, Some(500.0));
+        assert_eq!(width, Some(420.0));
+        assert_eq!(height, Some(320.0));
+        assert_eq!(task, Some("implement the thing".to_string()));
+    }
+
+    #[test]
+    fn agents_create_defaults_the_new_delegated_control_fields_to_none() {
+        let args = [
+            "agents".to_string(),
+            "create".to_string(),
+            "--name".to_string(),
+            "backend".to_string(),
+            "--cwd".to_string(),
+            "/tmp".to_string(),
+            "--agent".to_string(),
+            "claude".to_string(),
+        ];
+        let ControlRequest::AgentsCreate {
+            x,
+            y,
+            width,
+            height,
+            task,
+            ..
+        } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected AgentsCreate");
+        };
+        assert_eq!(x, None);
+        assert_eq!(y, None);
+        assert_eq!(width, None);
+        assert_eq!(height, None);
+        assert_eq!(task, None);
+    }
+
+    #[test]
+    fn agents_create_rejects_non_finite_coordinates() {
+        for bad in ["nan", "inf", "-inf"] {
+            let args = [
+                "agents".to_string(),
+                "create".to_string(),
+                "--name".to_string(),
+                "backend".to_string(),
+                "--cwd".to_string(),
+                "/tmp".to_string(),
+                "--agent".to_string(),
+                "claude".to_string(),
+                "--x".to_string(),
+                bad.to_string(),
+                "--y".to_string(),
+                "0".to_string(),
+            ];
+            let error = parse_cli_request(&args)
+                .expect_err(&format!("--x {bad} should have been rejected"));
+            assert!(
+                error.to_string().contains("finite"),
+                "unexpected error for --x {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_create_position_and_size_requires_each_pair_complete() {
+        // A whole pair, or a whole pair plus the other whole pair: fine.
+        assert_eq!(
+            agents_create_position_and_size(Some(1.0), Some(2.0), None, None),
+            Ok((Some((1.0, 2.0)), None))
+        );
+        assert_eq!(
+            agents_create_position_and_size(None, None, Some(3.0), Some(4.0)),
+            Ok((None, Some((3.0, 4.0))))
+        );
+        assert_eq!(
+            agents_create_position_and_size(None, None, None, None),
+            Ok((None, None))
+        );
+        // A lone half of either pair is rejected.
+        assert!(agents_create_position_and_size(Some(1.0), None, None, None).is_err());
+        assert!(agents_create_position_and_size(None, Some(2.0), None, None).is_err());
+        assert!(agents_create_position_and_size(None, None, Some(3.0), None).is_err());
+        assert!(agents_create_position_and_size(None, None, None, Some(4.0)).is_err());
     }
 
     #[test]

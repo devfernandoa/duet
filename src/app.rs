@@ -1912,11 +1912,29 @@ impl App {
             initial_prompt,
         )?;
         if let Some(size) = size {
-            let mut app_mut = app.borrow_mut();
-            if let Some(entry) = app_mut.nodes.get_mut(&id) {
-                entry.record.size = size;
-                entry.widget.apply_resize(size);
+            // Same floor the GUI's own resize-drag handler enforces (see
+            // `resize.connect_drag_update` above) — the delegated-control
+            // surface must not be the one path that can create a
+            // degenerate node.
+            let size = (
+                size.0.max(crate::node::MIN_NODE_WIDTH),
+                size.1.max(crate::node::MIN_NODE_HEIGHT),
+            );
+            {
+                let mut app_mut = app.borrow_mut();
+                if let Some(entry) = app_mut.nodes.get_mut(&id) {
+                    entry.record.size = size;
+                    entry.widget.apply_resize(size);
+                }
             }
+            // `create_session` already persisted once above, before this
+            // resize happened — without a second flush here, a requested
+            // size is correct in memory but silently reverts to the
+            // default on the next launch/reload. Synchronous (not
+            // `schedule_persist`) to match `create_session`'s own
+            // convention in this same call chain, and so a disk error is
+            // actually propagated via `?` rather than swallowed.
+            app.borrow().persist()?;
         }
         if let Some(agent_id) = requested_by {
             let requester = App::agent_display_name(app, agent_id);
@@ -5248,8 +5266,11 @@ mod tests {
         let agent = Uuid::new_v4();
         // Using the new `position` parameter exercises the NEW SpawnAgents
         // gate, not the pre-existing require_manager one — `agent` here has
-        // no grant at all (and, deliberately, no registered identity either,
-        // to prove the capability check runs independently of manager status).
+        // no grant at all, so this alone only proves the new gate denies an
+        // ungranted agent. The companion test below (granting SpawnAgents
+        // to an agent with no manager role, and succeeding) is the one that
+        // actually proves the capability check runs independently of
+        // manager status.
         let result = App::create_agent(
             &app,
             Some(agent),
@@ -5290,7 +5311,7 @@ mod tests {
             &app,
             Some(orchestrator),
             "Backend".to_string(),
-            tmp,
+            tmp.clone(),
             Agent::Shell,
             None,
             Some((1200.0, 500.0)),
@@ -5299,10 +5320,75 @@ mod tests {
         )
         .unwrap();
 
+        {
+            let app_ref = app.borrow();
+            let entry = app_ref.nodes.get(&id).unwrap();
+            assert_eq!(entry.record.position, (1200.0, 500.0));
+            assert_eq!(entry.record.size, (420.0, 320.0));
+        }
+
+        // The requested size must actually reach disk, not just the
+        // in-memory record — `create_session` already persists once
+        // *before* `create_agent` applies the resize, so without a second
+        // flush after the resize the requested size would silently revert
+        // to the default on the next launch/reload.
+        let store_path = app.borrow().store_path.clone();
+        let loaded = Store::load(&store_path);
+        let persisted = loaded
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.nodes.iter().find(|node| node.id == id))
+            .expect("the new agent's node to be persisted");
+        assert_eq!(persisted.size, (420.0, 320.0));
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_agent_clamps_a_requested_size_below_the_node_minimum() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let orchestrator = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            orchestrator,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        // Tiny/negative, like a hallucinated or malicious `--width`/
+        // `--height` — the GUI's own resize-drag handler already floors at
+        // `MIN_NODE_WIDTH`/`MIN_NODE_HEIGHT`; the delegated-control surface
+        // must not be the one path that can bypass that and create a
+        // degenerate node.
+        let id = App::create_agent(
+            &app,
+            Some(orchestrator),
+            "Backend".to_string(),
+            tmp,
+            Agent::Shell,
+            None,
+            None,
+            Some((1.0, -5.0)),
+            None,
+        )
+        .unwrap();
+
         let app_ref = app.borrow();
         let entry = app_ref.nodes.get(&id).unwrap();
-        assert_eq!(entry.record.position, (1200.0, 500.0));
-        assert_eq!(entry.record.size, (420.0, 320.0));
+        assert_eq!(
+            entry.record.size,
+            (crate::node::MIN_NODE_WIDTH, crate::node::MIN_NODE_HEIGHT)
+        );
     }
 
     fn terminal_node(environment: EnvironmentKind) -> NodeRecord {
