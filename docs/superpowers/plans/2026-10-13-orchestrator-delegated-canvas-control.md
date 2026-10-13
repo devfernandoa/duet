@@ -1780,7 +1780,7 @@ Expected: FAIL to compile.
 pub fn remove_canvas_node(app: &Rc<RefCell<App>>, requested_by: Option<Uuid>, id: Uuid) -> Result<(), String> {
     App::require_control_capability(app, requested_by, ControlCapability::RemoveCanvasNodes)
         .map_err(|error| error.to_string())?;
-    let removed = {
+    let (removed, removed_edges) = {
         let mut app_mut = app.borrow_mut();
         let Some(entry) = app_mut.nodes.get(&id) else {
             return Err("that node no longer exists".to_string());
@@ -1791,14 +1791,26 @@ pub fn remove_canvas_node(app: &Rc<RefCell<App>>, requested_by: Option<Uuid>, id
         let canvas = app_mut.canvas.clone();
         let removed = app_mut.nodes.remove(&id).expect("checked above");
         canvas.remove_node(removed.widget.container());
+        // Collect the edges this node touches BEFORE dropping them from the
+        // live list — `delete_selected`'s existing pattern (app.rs ~3479-3491)
+        // does the same, specifically so undo restores the connections too,
+        // not just the node. Pushing `edges: Vec::new()` here instead would
+        // silently and permanently lose every connection this node had, even
+        // after the deletion is undone.
+        let removed_edges: Vec<EdgeRecord> = app_mut
+            .edges
+            .iter()
+            .filter(|edge| edge.source == id || edge.target == id)
+            .cloned()
+            .collect();
         app_mut.edges.retain(|edge| edge.source != id && edge.target != id);
-        removed.record
+        (removed.record, removed_edges)
     };
     App::push_undo(
         app,
         CanvasCommand::RemoveNodes {
             nodes: vec![removed],
-            edges: Vec::new(),
+            edges: removed_edges,
         },
     );
     if let Some(agent_id) = requested_by {
@@ -1810,7 +1822,7 @@ pub fn remove_canvas_node(app: &Rc<RefCell<App>>, requested_by: Option<Uuid>, id
 }
 ```
 
-Before finalizing, read `close_node`'s existing teardown (app.rs ~2788) and `request_delete`'s multi-node deletion path (app.rs ~3040) to confirm there isn't already a reusable non-terminal removal helper you'd otherwise duplicate — if one exists, call it instead of hand-rolling the block above.
+**Verified against the real precedent, not guessed:** `App::delete_selected` (app.rs ~3474-3504) is the existing undoable-deletion path this one must match. It collects `edges` touching the deleted ids *before* calling `close_node` (which internally does the same `retain()`), then includes those edges in its own `CanvasCommand::RemoveNodes` push — exactly the pattern folded into the snippet above. Read `request_delete`/`delete_selected` (app.rs ~3410-3504) yourself regardless before finalizing, in case anything else differs. `close_node` (app.rs ~3156) is a *different* precedent that doesn't push undo at all (terminating a process isn't undoable) — don't copy its "just retain, don't collect" shape for this task, that shape is specifically wrong here.
 
 Add `ControlRequest::CanvasRemove { requested_by: Option<Uuid>, id: Uuid }`, its `handle_request` arm, and `duet canvas remove <id>` CLI parsing. Add `--capability remove-nodes` as a valid (but never implied) value to `parse_control_capability`/`duet control request`'s `--capability` flag (already covered by Task 1's enum and Task 3's parser — this task just confirms the CLI help text/docs mention it is opt-in-only).
 
