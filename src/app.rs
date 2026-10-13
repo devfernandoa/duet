@@ -2295,6 +2295,13 @@ impl App {
             let canvas = app_mut.canvas.clone();
             let removed = app_mut.nodes.remove(&id).expect("checked above");
             canvas.remove_node(removed.widget.container());
+            // Tear down runtime state `close_node` also clears for every node
+            // it removes — a no-op for kinds these don't apply to, but for a
+            // removed Portal, `portals::forget_node` is what actually stops
+            // and detaches its live WebKit view; skipping it would leak that
+            // view (and its network session) indefinitely.
+            portals::forget_node(&mut app_mut, id);
+            files::forget_node(&mut app_mut, id);
             // Collect the edges this node touches BEFORE dropping them from the
             // live list — `delete_selected`'s existing pattern (app.rs ~3479-3491)
             // does the same, specifically so undo restores the connections too,
