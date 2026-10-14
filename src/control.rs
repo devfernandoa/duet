@@ -219,6 +219,14 @@ pub enum ControlRequest {
     CanvasInspect {
         id: Uuid,
     },
+    /// `duetctl canvas find-space --width <num> --height <num>`: the first
+    /// grid position whose box doesn't overlap an existing node — see
+    /// `App::find_canvas_space`. Not capability-gated, same as `CanvasList`/
+    /// `CanvasInspect` — it only reads existing geometry.
+    CanvasFindSpace {
+        width: f64,
+        height: f64,
+    },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
     /// as prompt text — see `orchestration::skill`. `agent_id` is resolved
@@ -573,6 +581,10 @@ pub enum ControlResponse {
     },
     CanvasNode {
         node: CanvasNodeSummary,
+    },
+    CanvasPosition {
+        x: f64,
+        y: f64,
     },
     Whoami {
         info: WhoamiInfo,
@@ -1260,6 +1272,10 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 error: format!("no such node {id}"),
             },
         },
+        ControlRequest::CanvasFindSpace { width, height } => {
+            let (x, y) = App::find_canvas_space(app, width, height);
+            ControlResponse::CanvasPosition { x, y }
+        }
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -1723,6 +1739,8 @@ const USAGE: &str = r#"usage:
                                         by a default `control request`)
   duetctl canvas list                 (every live node's geometry; not gated)
   duetctl canvas inspect <id>         (one node's geometry; not gated)
+  duetctl canvas find-space --width <num> --height <num>
+                                       (first free grid position; not gated)
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -2270,7 +2288,9 @@ const CANVAS_USAGE: &str = r#"usage:
                                         remove-canvas-nodes grant — not implied
                                         by a default `control request`)
   duetctl canvas list                 (every live node's geometry; not gated)
-  duetctl canvas inspect <id>         (one node's geometry; not gated)"#;
+  duetctl canvas inspect <id>         (one node's geometry; not gated)
+  duetctl canvas find-space --width <num> --height <num>
+                                       (first free grid position; not gated)"#;
 
 /// `duetctl canvas move|resize|create|configure|connect|remove <id> ...`:
 /// Milestone 7.6's delegated canvas-control
@@ -2298,6 +2318,7 @@ fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, id] if cmd == "inspect" => Ok(ControlRequest::CanvasInspect {
             id: parse_uuid_arg(id)?,
         }),
+        [cmd, rest @ ..] if cmd == "find-space" => parse_canvas_find_space(rest),
         _ => anyhow::bail!(CANVAS_USAGE),
     }
 }
@@ -2440,6 +2461,31 @@ fn parse_canvas_configure(id: Uuid, args: &[String]) -> anyhow::Result<ControlRe
         name,
         color,
     })
+}
+
+fn parse_canvas_find_space(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut width, mut height) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--width" => width = Some(parse_f64_arg(value)?),
+            "--height" => height = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    let width = width
+        .ok_or_else(|| anyhow::anyhow!("canvas find-space needs --width\n\n{CANVAS_USAGE}"))?;
+    let height = height
+        .ok_or_else(|| anyhow::anyhow!("canvas find-space needs --height\n\n{CANVAS_USAGE}"))?;
+    if width <= 0.0 {
+        anyhow::bail!("canvas find-space --width must be a positive number, got '{width}'");
+    }
+    if height <= 0.0 {
+        anyhow::bail!("canvas find-space --height must be a positive number, got '{height}'");
+    }
+    Ok(ControlRequest::CanvasFindSpace { width, height })
 }
 
 fn parse_legacy_agent(args: &[String]) -> anyhow::Result<ControlRequest> {
@@ -2641,6 +2687,7 @@ fn print_response(response: &ControlResponse) {
             }
         }
         ControlResponse::CanvasNode { node } => print_canvas_node_summary(node),
+        ControlResponse::CanvasPosition { x, y } => println!("{x}\t{y}"),
         ControlResponse::Whoami { info } => {
             println!("id:       {}", info.agent.id);
             println!("name:     {}", info.agent.name);
@@ -3275,6 +3322,65 @@ mod tests {
             assert!(
                 error.to_string().contains("finite"),
                 "unexpected error for --x {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_find_space_parses_width_and_height() {
+        let args = [
+            "canvas".to_string(),
+            "find-space".to_string(),
+            "--width".to_string(),
+            "200".to_string(),
+            "--height".to_string(),
+            "150".to_string(),
+        ];
+        let ControlRequest::CanvasFindSpace { width, height } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected CanvasFindSpace");
+        };
+        assert_eq!(width, 200.0);
+        assert_eq!(height, 150.0);
+    }
+
+    #[test]
+    fn canvas_find_space_rejects_non_positive_width_or_height() {
+        for (width, height) in [("0", "150"), ("-5", "150"), ("200", "0"), ("200", "-5")] {
+            let args = [
+                "canvas".to_string(),
+                "find-space".to_string(),
+                "--width".to_string(),
+                width.to_string(),
+                "--height".to_string(),
+                height.to_string(),
+            ];
+            let error = parse_cli_request(&args).expect_err(&format!(
+                "--width {width} --height {height} should be rejected"
+            ));
+            assert!(
+                error.to_string().contains("positive"),
+                "unexpected error for --width {width} --height {height}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_find_space_rejects_non_finite_width_or_height() {
+        for bad in ["nan", "inf", "-inf"] {
+            let args = [
+                "canvas".to_string(),
+                "find-space".to_string(),
+                "--width".to_string(),
+                bad.to_string(),
+                "--height".to_string(),
+                "150".to_string(),
+            ];
+            let error = parse_cli_request(&args)
+                .expect_err(&format!("--width {bad} should have been rejected"));
+            assert!(
+                error.to_string().contains("finite"),
+                "unexpected error for --width {bad}: {error}"
             );
         }
     }

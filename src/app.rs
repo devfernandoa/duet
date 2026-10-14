@@ -2369,6 +2369,46 @@ impl App {
             .map(|entry| App::summarize_node(&entry.record))
     }
 
+    /// §13's optional-but-simple helper: the first position (scanning a grid
+    /// left-to-right, top-to-bottom, starting at the origin) whose
+    /// `width`x`height` box doesn't overlap any existing node's bounding box.
+    /// A plain O(nodes × candidates) scan — fine at canvas-sized node counts;
+    /// this is deliberately not spatial-indexed. Bounded by `MAX_ROWS` so a
+    /// pathological case (an enormous `width`/`height`, or a canvas so densely
+    /// packed every candidate on `MAX_ROWS` rows collides) returns a fallback
+    /// instead of spinning forever on the GTK main thread — this runs
+    /// synchronously inside `handle_request`, so an unbounded loop here would
+    /// hang the whole app, not just return a bad answer.
+    pub fn find_canvas_space(app: &Rc<RefCell<App>>, width: f64, height: f64) -> (f64, f64) {
+        const STEP: f64 = 40.0;
+        const MAX_COLUMNS: i64 = 60;
+        const MAX_ROWS: i64 = 500;
+        let boxes: Vec<((f64, f64), (f64, f64))> = app
+            .borrow()
+            .nodes
+            .values()
+            .map(|entry| (entry.record.position, entry.record.size))
+            .collect();
+        let overlaps = |x: f64, y: f64| {
+            boxes.iter().any(|&((bx, by), (bw, bh))| {
+                x < bx + bw && x + width > bx && y < by + bh && y + height > by
+            })
+        };
+        for row in 0..MAX_ROWS {
+            for col in 0..MAX_COLUMNS {
+                let x = col as f64 * STEP;
+                let y = row as f64 * STEP;
+                if !overlaps(x, y) {
+                    return (x, y);
+                }
+            }
+        }
+        // Every candidate in the bounded grid collided — fall back to the
+        // origin rather than loop forever; the caller (a human or an
+        // orchestrator) still gets an answer and can adjust from there.
+        (0.0, 0.0)
+    }
+
     fn summarize_node(record: &NodeRecord) -> CanvasNodeSummary {
         let name = match &record.kind {
             NodeKind::Terminal(terminal) => Some(terminal.name.clone()),
@@ -6137,6 +6177,31 @@ mod tests {
         let inspected = App::inspect_canvas_node(&app, id).unwrap();
         assert_eq!(inspected.id, id);
         assert!(App::inspect_canvas_node(&app, Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn find_canvas_space_avoids_an_existing_nodes_bounding_box() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut existing = note_with_markdown("a");
+        existing.position = (0.0, 0.0);
+        existing.size = (300.0, 200.0);
+        materialize_node(&app, existing, &adw::ToastOverlay::new()).unwrap();
+
+        let (x, y) = App::find_canvas_space(&app, 200.0, 150.0);
+
+        let overlaps = x < 300.0 && x + 200.0 > 0.0 && y < 200.0 && y + 150.0 > 0.0;
+        assert!(
+            !overlaps,
+            "found space ({x}, {y}) overlaps the existing node"
+        );
     }
 
     /// Milestone 4 section 8: a service-driven write must be immediately
