@@ -2350,10 +2350,12 @@ fn canvas_create_kind(kind: &str, name: Option<String>) -> Result<NodeKind, Stri
             ..Default::default()
         })),
         "drawing" => Ok(NodeKind::Drawing(Default::default())),
-        "portal" => Ok(NodeKind::Portal(PortalPayload::new(
-            &name.unwrap_or_default(),
-            "",
-        ))),
+        "portal" => {
+            let name =
+                name.ok_or_else(|| "canvas create --kind portal requires --name".to_string())?;
+            let name = crate::orchestration::portal::validate_portal_name(&name)?;
+            Ok(NodeKind::Portal(PortalPayload::new(&name, "")))
+        }
         other => Err(format!(
             "unknown canvas kind '{other}' (expected note|text|filetree|group|drawing|portal)"
         )),

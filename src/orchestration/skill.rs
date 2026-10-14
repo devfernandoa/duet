@@ -205,8 +205,10 @@ NOT have that authority by default, even as a manager/Lead role:
 3. Request exactly the capabilities the task needs, with a short reason:
    `duetctl control request --capability spawn-agents --capability
    create-canvas-nodes --capability move-canvas-nodes --reason "Set up a
-   frontend/backend/reviewer team for this task"`.
-4. wait for approval — this requires a human clicking "Allow" in Duet's
+   frontend/backend/reviewer team for this task"`. A new approval replaces
+   your previous grant for this workspace, so always request the full set
+   of capabilities you still need, not just what's new.
+4. Wait for approval — this requires a human clicking "Allow" in Duet's
    own dialog; nothing you do grants it. Poll `duetctl control status`
    until the capabilities you need appear, or ask the user directly.
 5. Once granted, use `duetctl agents create` (with `--x/--y/--width/--height
@@ -297,7 +299,7 @@ mod tests {
         assert!(content.contains("duetctl canvas configure"));
         assert!(content.contains("duetctl canvas connect"));
         assert!(content.contains("duetctl canvas remove"));
-        assert!(content.contains("wait for approval"));
+        assert!(content.contains("Wait for approval"));
         assert!(content.contains("locked"));
     }
 }

@@ -7,6 +7,20 @@
 //! the exact `(workspace_id, agent_id)` pair that asked, and vanish on
 //! revoke, that agent stopping, its workspace closing/unloading, or Duet
 //! exiting (nothing here is persisted, so exit clears everything for free).
+//!
+//! Trust boundary: a grant *request*'s `requested_by: Option<Uuid>` (like
+//! every other acting-agent-identified field in this protocol, e.g.
+//! `AgentsCreate`/`AgentsRemove`/`require_manager`) is filled in by
+//! `duetctl` from `$DUET_AGENT_ID` before it ever reaches the control
+//! socket. The socket itself (`handle_connection` in `src/control.rs`) does
+//! no peer authentication, so a process writing JSON to it directly
+//! (bypassing `duetctl`) could omit `requested_by` entirely — read as the
+//! trusted human — or claim to be a different agent. This is a pre-existing
+//! trust model, not something this milestone changes, but delegated control
+//! makes it the sole enforcement point for canvas mutation, not just
+//! agent-roster management. Socket-level peer authentication (e.g. binding
+//! the acting agent to the connection itself rather than trusting a payload
+//! field) is a hardening-milestone concern, not addressed here.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -303,5 +317,25 @@ mod tests {
         assert!(!ControlCapability::DEFAULT_SET.contains(&ControlCapability::RemoveCanvasNodes));
         assert!(ControlCapability::RemoveCanvasNodes.is_destructive());
         assert!(!ControlCapability::SpawnAgents.is_destructive());
+    }
+
+    /// Global Constraints (see the milestone plan): no `ControlRequest`
+    /// handler in `src/control.rs` may ever cause a delegated-control grant
+    /// to become approved or denied — that must only happen from the
+    /// human's own approval dialog in `src/app/delegated_control.rs`. This
+    /// is enforced structurally here by scanning `control.rs`'s source text
+    /// for the two function names that would do it. Plain string check, no
+    /// GTK involved, so it runs in every `cargo test`, not just `--ignored`.
+    #[test]
+    fn control_rs_never_approves_or_denies_a_control_grant() {
+        let source = include_str!("../control.rs");
+        for forbidden in ["approve_control_grant", "deny_control_grant"] {
+            assert!(
+                !source.contains(forbidden),
+                "src/control.rs must never call `{forbidden}` — approving/denying a \
+                 delegated-control grant must only happen from the human's own \
+                 approval dialog in src/app/delegated_control.rs"
+            );
+        }
     }
 }

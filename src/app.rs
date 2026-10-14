@@ -1947,9 +1947,14 @@ impl App {
             // size is correct in memory but silently reverts to the
             // default on the next launch/reload. Synchronous (not
             // `schedule_persist`) to match `create_session`'s own
-            // convention in this same call chain, and so a disk error is
-            // actually propagated via `?` rather than swallowed.
-            app.borrow().persist()?;
+            // convention in this same call chain. A disk error here is
+            // swallowed, not propagated: the agent already exists with the
+            // correct in-memory state by this point, and returning `Err`
+            // for a genuinely successful spawn would make an orchestrator
+            // retry and create a duplicate agent — the same convention
+            // `move_node`/`resize_node` and this milestone's other services
+            // already follow for their own post-mutation persist calls.
+            let _ = app.borrow().persist();
         }
         if let Some(agent_id) = requested_by {
             let requester = App::agent_display_name(app, agent_id);
@@ -2297,7 +2302,7 @@ impl App {
     ) -> Result<(), String> {
         App::require_control_capability(app, requested_by, ControlCapability::RemoveCanvasNodes)
             .map_err(|error| error.to_string())?;
-        let (removed, removed_edges) = {
+        let (removed, removed_edges, node_name) = {
             let mut app_mut = app.borrow_mut();
             let Some(entry) = app_mut.nodes.get(&id) else {
                 return Err("that node no longer exists".to_string());
@@ -2307,6 +2312,7 @@ impl App {
                     "Terminal nodes cannot be removed this way — use agent removal".to_string(),
                 );
             }
+            let node_name = node_display_name(&app_mut, id);
             let canvas = app_mut.canvas.clone();
             let removed = app_mut.nodes.remove(&id).expect("checked above");
             canvas.remove_node(removed.widget.container());
@@ -2332,7 +2338,7 @@ impl App {
             app_mut
                 .edges
                 .retain(|edge| edge.source != id && edge.target != id);
-            (removed.record, removed_edges)
+            (removed.record, removed_edges, node_name)
         };
         App::push_undo(
             app,
@@ -2343,7 +2349,7 @@ impl App {
         );
         if let Some(agent_id) = requested_by {
             let requester = App::agent_display_name(app, agent_id);
-            App::notify(app, &format!("{requester} removed a node"));
+            App::notify(app, &format!("{requester} removed {node_name}"));
         }
         let _ = app.borrow().persist();
         Ok(())
@@ -3381,6 +3387,8 @@ impl App {
                 }
                 entry.exit_shown = true;
             }
+            let workspace_id = app_mut.workspace_id;
+            app_mut.control.revoke(workspace_id, id);
         }
     }
 
