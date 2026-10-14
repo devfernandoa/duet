@@ -192,6 +192,32 @@ read <id>` renders it to a PNG and prints the image's path — open that image
 to see the sketch — plus each stroke's color and points in pixels.
 `duetctl drawing list` shows the drawings you can read. Drawings are the
 user's: you can read them, not draw on them.
+
+## Organizing or expanding a workspace
+
+If asked to organize or expand this Duet workspace — set up a team of
+agents, create supporting notes/file trees, arrange the canvas — you do
+NOT have that authority by default, even as a manager/Lead role:
+
+1. Inspect the current canvas first: `duetctl canvas list --json`.
+2. Decide what would actually help; prefer reusing an existing agent or
+   node over creating a duplicate.
+3. Request exactly the capabilities the task needs, with a short reason:
+   `duetctl control request --capability spawn-agents --capability
+   create-canvas-nodes --capability move-canvas-nodes --reason "Set up a
+   frontend/backend/reviewer team for this task"`.
+4. wait for approval — this requires a human clicking "Allow" in Duet's
+   own dialog; nothing you do grants it. Poll `duetctl control status`
+   until the capabilities you need appear, or ask the user directly.
+5. Once granted, use `duetctl agents create` (with `--x/--y/--width/--height
+   /--task` to place and task a new agent), `duetctl canvas create`,
+   `duetctl canvas move`, `duetctl canvas connect`, and `duetctl canvas find-space`
+   to lay things out, by stable node id (`duetctl canvas list --json`).
+6. If a request is denied, or a specific node is locked, or an action
+   fails as "not authorized", stop and explain — never try another path
+   to the same end.
+7. Deleting a canvas item needs a separate `remove-canvas-nodes`
+   capability, never implied by the capabilities above.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)
@@ -252,5 +278,22 @@ mod tests {
                 .join("SKILL.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn install_writes_the_delegated_control_workflow() {
+        let tmp = tempdir().unwrap();
+        install(tmp.path()).unwrap();
+        let content =
+            std::fs::read_to_string(tmp.path().join("skills").join(SKILL_NAME).join("SKILL.md"))
+                .unwrap();
+        assert!(content.contains("duetctl control request"));
+        assert!(content.contains("duetctl control status"));
+        assert!(content.contains("duetctl canvas list"));
+        assert!(content.contains("duetctl canvas create"));
+        assert!(content.contains("duetctl canvas move"));
+        assert!(content.contains("duetctl canvas connect"));
+        assert!(content.contains("wait for approval"));
+        assert!(content.contains("locked"));
     }
 }
