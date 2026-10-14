@@ -211,13 +211,14 @@ NOT have that authority by default, even as a manager/Lead role:
    until the capabilities you need appear, or ask the user directly.
 5. Once granted, use `duetctl agents create` (with `--x/--y/--width/--height
    /--task` to place and task a new agent), `duetctl canvas create`,
-   `duetctl canvas move`, `duetctl canvas connect`, and `duetctl canvas find-space`
-   to lay things out, by stable node id (`duetctl canvas list --json`).
+   `duetctl canvas move`, `duetctl canvas resize`, `duetctl canvas configure`,
+   `duetctl canvas connect`, and `duetctl canvas find-space` to lay things out,
+   by stable node id (`duetctl canvas list --json`).
 6. If a request is denied, or a specific node is locked, or an action
    fails as "not authorized", stop and explain — never try another path
    to the same end.
-7. Deleting a canvas item needs a separate `remove-canvas-nodes`
-   capability, never implied by the capabilities above.
+7. Deleting a canvas item with `duetctl canvas remove <id>` needs a separate
+   `remove-canvas-nodes` capability, never implied by the capabilities above.
 "#;
 
 /// Writes (or overwrites, to pick up a newer version of this skill)
@@ -292,7 +293,10 @@ mod tests {
         assert!(content.contains("duetctl canvas list"));
         assert!(content.contains("duetctl canvas create"));
         assert!(content.contains("duetctl canvas move"));
+        assert!(content.contains("duetctl canvas resize"));
+        assert!(content.contains("duetctl canvas configure"));
         assert!(content.contains("duetctl canvas connect"));
+        assert!(content.contains("duetctl canvas remove"));
         assert!(content.contains("wait for approval"));
         assert!(content.contains("locked"));
     }
