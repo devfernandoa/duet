@@ -811,7 +811,13 @@ impl App {
                 };
                 let id = App::create_portal(app, name.as_deref(), "", position)?;
                 if let Some(terminal) = terminal {
-                    App::create_edge(app, terminal, id);
+                    // Best-effort: a failed/no-op connect (e.g. the two
+                    // nodes are already linked) shouldn't fail portal
+                    // creation, matching this call's pre-existing
+                    // discard-the-result behavior. `requested_by: None`
+                    // since this is the human "Open in Portal" gesture, so
+                    // `create_edge` can't itself error here.
+                    let _ = App::create_edge(app, None, terminal, id);
                 }
                 id
             }
@@ -1395,7 +1401,7 @@ mod tests {
         let frontend = App::create_portal(&app, Some("Frontend"), "", (600.0, 0.0)).unwrap();
         let docs_a = App::create_portal(&app, Some("Docs"), "", (600.0, 500.0)).unwrap();
         let docs_b = App::create_portal(&app, Some("Docs"), "", (1300.0, 500.0)).unwrap();
-        assert!(App::create_edge(&app, frontend_agent, frontend));
+        assert!(App::create_edge(&app, None, frontend_agent, frontend).unwrap());
         // The connect gesture grants ControlPortal between agent and portal.
         let edge = app.borrow().edges.last().cloned().unwrap();
         assert!(edge.capabilities.contains(&EdgeCapability::ControlPortal));
@@ -1709,7 +1715,7 @@ mod tests {
         let app = test_app(project.path());
         let agent = add_shell_agent(&app, "Frontend", project.path());
         let portal = App::create_portal(&app, Some("Frontend"), "", (600.0, 0.0)).unwrap();
-        assert!(App::create_edge(&app, agent, portal));
+        assert!(App::create_edge(&app, None, agent, portal).unwrap());
         let me = Some(agent);
 
         // 1. Resolve @portal:frontend through the shared resolver.

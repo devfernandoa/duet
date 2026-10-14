@@ -27,6 +27,7 @@
 //! shape can't go (a headless remote-API process, say) — Milestone 14's
 //! problem, not this one's.
 
+mod delegated_control;
 mod drawings;
 mod files;
 mod portals;
@@ -52,7 +53,10 @@ use crate::node::{GroupNode, NoteNode, SessionNode, TextNode};
 use crate::node_drawing::DrawingNode;
 use crate::node_files::{EditorNode, FileTreeNode};
 use crate::node_portal::PortalNode;
-use crate::orchestration::{self, AgentIdentity, AgentRegistry, MessageBus, adapter_for};
+use crate::orchestration::{
+    self, AgentIdentity, AgentRegistry, MessageBus, adapter_for,
+    control_grant::{ControlCapability, DelegatedControlService},
+};
 use crate::portal_runtime::PortalRuntime;
 use crate::role::Role;
 use crate::runtime::{AgentActivity, SessionRuntime};
@@ -61,6 +65,7 @@ use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -351,6 +356,20 @@ pub enum WorkspaceRuntimeState {
     Unloaded,
 }
 
+/// §10/§13's read model for an orchestrator's spatial reasoning: enough
+/// structured geometry to place/avoid-colliding-with other nodes, never
+/// a screenshot (§13's explicit "do NOT give agents screenshots").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasNodeSummary {
+    pub id: Uuid,
+    pub kind: String,
+    pub name: Option<String>,
+    pub position: (f64, f64),
+    pub size: (f64, f64),
+    pub locked: bool,
+    pub z_order: i64,
+}
+
 pub struct App {
     pub accounts: AccountStore,
     pub store_path: PathBuf,
@@ -382,6 +401,14 @@ pub struct App {
     /// Every live `Terminal` node's PTY/process, keyed by the same id as
     /// `nodes`. See `runtime.rs`'s module doc for why this is a separate map.
     pub runtime: SessionRuntime,
+    /// Milestone 7.6: delegated canvas-control grants for this process's
+    /// agents. Never persisted — see `orchestration::control_grant`'s module
+    /// doc. Deliberately not `pub`: every mutating method
+    /// (`approve`/`deny` above all) must stay reachable only from inside
+    /// the `app` module tree — see `app/delegated_control.rs`'s module
+    /// doc — and a `pub` field would make that a convention instead of a
+    /// compiler-enforced guarantee.
+    control: DelegatedControlService,
     pub edges: Vec<EdgeRecord>,
     /// Routing, permissions and per-agent queueing for agent-to-agent
     /// messages — see `orchestration::bus`. Not persisted: a message is a
@@ -470,6 +497,7 @@ impl App {
             runtime: SessionRuntime::new(),
             edges: Vec::new(),
             bus: MessageBus::new(),
+            control: DelegatedControlService::new(),
             pending_edge_source: None,
             link_hint: None,
             selected_edge: None,
@@ -792,6 +820,8 @@ impl App {
             app_mut.redo_stack.clear();
             app_mut.file_sync.clear();
             app_mut.tree_state.clear();
+            let workspace_id = app_mut.workspace_id;
+            app_mut.control.clear_workspace(workspace_id);
         }
     }
 
@@ -805,6 +835,8 @@ impl App {
     /// `detach_active_workspace` for the far more common "just switching
     /// away" case.
     fn teardown_active_workspace(app: &Rc<RefCell<App>>) {
+        let workspace_id = app.borrow().workspace_id;
+        app.borrow_mut().control.clear_workspace(workspace_id);
         let terminals: Vec<(Uuid, EnvironmentKind)> = app
             .borrow()
             .nodes
@@ -1110,6 +1142,7 @@ impl App {
         for node_id in portals {
             app.borrow_mut().portals.remove(node_id);
         }
+        app.borrow_mut().control.clear_workspace(id);
         Ok(())
     }
 
@@ -1799,6 +1832,7 @@ impl App {
         role_id: Option<Uuid>,
         viewport_center_world: (f64, f64),
         toast_overlay: &adw::ToastOverlay,
+        initial_prompt: Option<String>,
     ) -> anyhow::Result<Uuid> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -1831,8 +1865,13 @@ impl App {
             )?
         };
         let id = record.id;
-        materialize_node(app, record.clone(), toast_overlay)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        materialize_node_inner(
+            app,
+            record.clone(),
+            toast_overlay,
+            initial_prompt.as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
         App::push_undo(
             app,
             CanvasCommand::AddNodes {
@@ -1849,6 +1888,12 @@ impl App {
     /// agent (section 11: "do not give recruitment permissions to every
     /// agent"). `requested_by: None` is the human operator via a bare shell
     /// or the GUI, trusted the same way `send_message`'s sourceless case is.
+    ///
+    /// Milestone 7.6: when `position`/`size`/`initial_prompt` is used, this
+    /// is the delegated-canvas-control surface instead — gated by a
+    /// `SpawnAgents` capability grant *instead of* `require_manager`, not in
+    /// addition to it (see this milestone's plan: a human-approved grant
+    /// must be sufficient on its own, independent of manager role).
     #[allow(clippy::too_many_arguments)]
     pub fn create_agent(
         app: &Rc<RefCell<App>>,
@@ -1857,10 +1902,20 @@ impl App {
         cwd: PathBuf,
         agent: Agent,
         role_id: Option<Uuid>,
-        viewport_center_world: (f64, f64),
+        position: Option<(f64, f64)>,
+        size: Option<(f64, f64)>,
+        initial_prompt: Option<String>,
     ) -> anyhow::Result<Uuid> {
-        App::require_manager(app, requested_by)?;
-        App::create_session(
+        let using_delegated_control =
+            position.is_some() || size.is_some() || initial_prompt.is_some();
+        if using_delegated_control {
+            App::require_control_capability(app, requested_by, ControlCapability::SpawnAgents)?;
+        } else {
+            App::require_manager(app, requested_by)?;
+        }
+        let name_for_toast = name.clone();
+        let viewport_center_world = position.unwrap_or_else(|| App::default_spawn_position(app));
+        let id = App::create_session(
             app,
             name,
             cwd,
@@ -1869,7 +1924,54 @@ impl App {
             role_id,
             viewport_center_world,
             &adw::ToastOverlay::new(),
-        )
+            initial_prompt,
+        )?;
+        if let Some(size) = size {
+            // Same floor the GUI's own resize-drag handler enforces (see
+            // `resize.connect_drag_update` above) — the delegated-control
+            // surface must not be the one path that can create a
+            // degenerate node.
+            let size = (
+                size.0.max(crate::node::MIN_NODE_WIDTH),
+                size.1.max(crate::node::MIN_NODE_HEIGHT),
+            );
+            {
+                let mut app_mut = app.borrow_mut();
+                if let Some(entry) = app_mut.nodes.get_mut(&id) {
+                    entry.record.size = size;
+                    entry.widget.apply_resize(size);
+                }
+            }
+            // `create_session` already persisted once above, before this
+            // resize happened — without a second flush here, a requested
+            // size is correct in memory but silently reverts to the
+            // default on the next launch/reload. Synchronous (not
+            // `schedule_persist`) to match `create_session`'s own
+            // convention in this same call chain. A disk error here is
+            // swallowed, not propagated: the agent already exists with the
+            // correct in-memory state by this point, and returning `Err`
+            // for a genuinely successful spawn would make an orchestrator
+            // retry and create a duplicate agent — the same convention
+            // `move_node`/`resize_node` and this milestone's other services
+            // already follow for their own post-mutation persist calls.
+            let _ = app.borrow().persist();
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(app, &format!("{requester} created {name_for_toast}"));
+        }
+        Ok(id)
+    }
+
+    /// Where a spawned agent lands when the caller didn't ask for a specific
+    /// spot — the same "cascade so back-to-back creations don't stack exactly
+    /// on top of each other" default `duetctl agents create`'s `handle_request`
+    /// arm has always computed inline (see `src/control.rs`'s current
+    /// `AgentsCreate` handler); moved here so there is exactly one place that
+    /// owns it. Pure domain state (a node count) — no GTK/viewport coupling.
+    fn default_spawn_position(app: &Rc<RefCell<App>>) -> (f64, f64) {
+        let count = app.borrow().nodes.len() as f64;
+        (120.0 + count * 40.0, 120.0 + count * 40.0)
     }
 
     /// `duetctl agents remove`'s service: tears down `target`'s process and
@@ -1938,6 +2040,411 @@ impl App {
             Ok(())
         } else {
             anyhow::bail!("not authorized: {requested_by} does not have a manager role")
+        }
+    }
+
+    /// The Milestone 7.6 analogue of `require_manager`, for delegated
+    /// canvas-control actions: `None` is the trusted human operator (always
+    /// `Ok`); `Some(agent_id)` must hold `capability` over the active
+    /// workspace. Checked at the `App::` method boundary, not only in
+    /// `control.rs`'s CLI parsing (§7).
+    ///
+    /// Called by `create_agent` whenever the delegated-control surface
+    /// (position/size/initial task) is used; `pub(crate)` since `control.rs`
+    /// also exercises it directly in tests.
+    pub(crate) fn require_control_capability(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        capability: ControlCapability,
+    ) -> anyhow::Result<()> {
+        let Some(agent_id) = requested_by else {
+            return Ok(());
+        };
+        let app_ref = app.borrow();
+        if app_ref
+            .control
+            .has_capability(app_ref.workspace_id, agent_id, capability)
+        {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "not authorized: {agent_id} lacks delegated control capability {capability:?}"
+            )
+        }
+    }
+
+    /// §13/§15's "move node" service: the same mutation the GTK drag handler
+    /// performs (position write, widget sync, `CanvasCommand::MoveNodes`
+    /// undo entry, persist), reachable by stable id instead of a pointer
+    /// gesture, respecting `locked` exactly like the drag handler does.
+    pub fn move_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        position: (f64, f64),
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::MoveCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let old_position = {
+            let mut app_mut = app.borrow_mut();
+            let canvas = app_mut.canvas.clone();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return Err("that node no longer exists".to_string());
+            };
+            if entry.record.locked {
+                return Err("that node is locked".to_string());
+            }
+            let old_position = entry.record.position;
+            entry.record.position = position;
+            canvas.reposition_node(entry.widget.container(), position);
+            old_position
+        };
+        if old_position != position {
+            App::push_undo(
+                app,
+                CanvasCommand::MoveNodes {
+                    moves: vec![(id, old_position, position)],
+                },
+            );
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            let node_name = node_display_name(&app.borrow(), id);
+            App::notify(app, &format!("{requester} moved {node_name}"));
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
+    /// §13/§15's "resize node" service, same shape as `move_node`.
+    pub fn resize_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        size: (f64, f64),
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::ResizeCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        // `size` is rebound here to the clamped value (not shadowed inside
+        // the block only) so the undo entry below records exactly what was
+        // written to `entry.record`/the widget, even when the caller asked
+        // for something below the node minimum.
+        let (old_size, size) = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get_mut(&id) else {
+                return Err("that node no longer exists".to_string());
+            };
+            if entry.record.locked {
+                return Err("that node is locked".to_string());
+            }
+            let old_size = entry.record.size;
+            let size = (
+                size.0.max(crate::node::MIN_NODE_WIDTH),
+                size.1.max(crate::node::MIN_NODE_HEIGHT),
+            );
+            entry.record.size = size;
+            entry.widget.apply_resize(size);
+            (old_size, size)
+        };
+        if old_size != size {
+            App::push_undo(
+                app,
+                CanvasCommand::ResizeNode {
+                    id,
+                    old_size,
+                    new_size: size,
+                },
+            );
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            let node_name = node_display_name(&app.borrow(), id);
+            App::notify(app, &format!("{requester} resized {node_name}"));
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
+    /// §11's orchestrator-facing node creation: the exact same
+    /// `add_simple_node` the GUI's Note/Group/Drawing buttons already use,
+    /// gated by `CreateCanvasNodes` — never a second, parallel creation path.
+    /// `size` falls back to `kind`'s usual default when omitted.
+    pub fn create_canvas_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        kind: NodeKind,
+        position: (f64, f64),
+        size: Option<(f64, f64)>,
+    ) -> Result<Uuid, String> {
+        App::require_control_capability(app, requested_by, ControlCapability::CreateCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        if matches!(kind, NodeKind::Terminal(_)) {
+            return Err("use control request/agents create for Terminal nodes".to_string());
+        }
+        let size = size.unwrap_or_else(|| App::default_size_for(&kind));
+        // Same minimum clamp Task 5's `resize_node` applies — an agent-supplied
+        // `--width 0`/negative size must not create a degenerate node.
+        let size = (
+            size.0.max(crate::node::MIN_NODE_WIDTH),
+            size.1.max(crate::node::MIN_NODE_HEIGHT),
+        );
+        let id = App::add_simple_node(app, kind, position, size);
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(
+                app,
+                &format!(
+                    "{requester} created {}",
+                    node_display_name(&app.borrow(), id)
+                ),
+            );
+        }
+        Ok(id)
+    }
+
+    /// §11's "rename/configure node": a Terminal's display name or a Group's
+    /// label/color, as one undoable `SetProperties` edit. Deliberately narrow
+    /// — this is not a general property-bag setter, just the two fields the
+    /// spec calls out (§1's "rename/configure newly created Agents",
+    /// §10/§11's "rename/configure node").
+    pub fn configure_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        name: Option<String>,
+        color: Option<String>,
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::ConfigureCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let kind = app
+            .borrow()
+            .nodes
+            .get(&id)
+            .map(|entry| entry.record.kind.clone())
+            .ok_or_else(|| "that node no longer exists".to_string())?;
+        match kind {
+            NodeKind::Group(_) => App::update_group(app, id, name.as_deref(), color.as_deref())?,
+            NodeKind::Terminal(_) => {
+                let Some(name) = name else {
+                    return Err("a Terminal node only has a name to configure".to_string());
+                };
+                let name = name.trim().to_string();
+                // Same uniqueness invariant `rename_session`/`create_session`
+                // already enforce: a Terminal's name doubles as its agent
+                // identity for name-based resolution (`orchestration::registry`,
+                // `duet agent send <name>`), so a collision here would make
+                // that resolution ambiguous.
+                {
+                    let app_ref = app.borrow();
+                    if app_ref.nodes.iter().any(|(&other, entry)| {
+                        other != id && entry.record.as_terminal().is_some_and(|t| t.name == name)
+                    }) {
+                        return Err(format!("a session named '{name}' already exists"));
+                    }
+                }
+                let (before, after) = {
+                    let mut app_mut = app.borrow_mut();
+                    let entry = app_mut
+                        .nodes
+                        .get_mut(&id)
+                        .ok_or("that node no longer exists")?;
+                    let before = entry.record.clone();
+                    // Keep the widget and the record in sync in the same
+                    // borrow, the same way `rename_session` does — otherwise
+                    // the card's title bar keeps showing the stale name until
+                    // Duet restarts and rebuilds widgets from disk.
+                    let NodeWidget::Terminal(node) = &entry.widget else {
+                        return Err("that node is not a Terminal".to_string());
+                    };
+                    node.set_name(&name);
+                    entry
+                        .record
+                        .as_terminal_mut()
+                        .ok_or("that node is not a Terminal")?
+                        .name = name.clone();
+                    (before, entry.record.clone())
+                };
+                App::push_undo(
+                    app,
+                    CanvasCommand::SetProperties {
+                        before: vec![before],
+                        after: vec![after],
+                    },
+                );
+            }
+            _ => return Err("that node kind has nothing to configure yet".to_string()),
+        }
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(
+                app,
+                &format!(
+                    "{requester} configured {}",
+                    node_display_name(&app.borrow(), id)
+                ),
+            );
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
+    /// §2/§17's opt-in destructive capability: deletes a non-agent canvas
+    /// node. Never covers Terminal nodes — an Agent is only ever removed
+    /// through the existing `require_manager`-gated `remove_agent` (killing a
+    /// process is a different risk class than deleting a Note/Group; §2's
+    /// "must not automatically grant... terminating existing user Agents").
+    /// `RemoveCanvasNodes` is never in `ControlCapability::DEFAULT_SET`, so
+    /// this always requires its own explicit grant.
+    pub fn remove_canvas_node(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    ) -> Result<(), String> {
+        App::require_control_capability(app, requested_by, ControlCapability::RemoveCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let (removed, removed_edges, node_name) = {
+            let mut app_mut = app.borrow_mut();
+            let Some(entry) = app_mut.nodes.get(&id) else {
+                return Err("that node no longer exists".to_string());
+            };
+            if entry.record.as_terminal().is_some() {
+                return Err(
+                    "Terminal nodes cannot be removed this way — use agent removal".to_string(),
+                );
+            }
+            let node_name = node_display_name(&app_mut, id);
+            let canvas = app_mut.canvas.clone();
+            let removed = app_mut.nodes.remove(&id).expect("checked above");
+            canvas.remove_node(removed.widget.container());
+            // Tear down runtime state `close_node` also clears for every node
+            // it removes — a no-op for kinds these don't apply to, but for a
+            // removed Portal, `portals::forget_node` is what actually stops
+            // and detaches its live WebKit view; skipping it would leak that
+            // view (and its network session) indefinitely.
+            portals::forget_node(&mut app_mut, id);
+            files::forget_node(&mut app_mut, id);
+            // Collect the edges this node touches BEFORE dropping them from the
+            // live list — `delete_selected`'s existing pattern (app.rs ~3479-3491)
+            // does the same, specifically so undo restores the connections too,
+            // not just the node. Pushing `edges: Vec::new()` here instead would
+            // silently and permanently lose every connection this node had, even
+            // after the deletion is undone.
+            let removed_edges: Vec<EdgeRecord> = app_mut
+                .edges
+                .iter()
+                .filter(|edge| edge.source == id || edge.target == id)
+                .cloned()
+                .collect();
+            app_mut
+                .edges
+                .retain(|edge| edge.source != id && edge.target != id);
+            (removed.record, removed_edges, node_name)
+        };
+        App::push_undo(
+            app,
+            CanvasCommand::RemoveNodes {
+                nodes: vec![removed],
+                edges: removed_edges,
+            },
+        );
+        if let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            App::notify(app, &format!("{requester} removed {node_name}"));
+        }
+        let _ = app.borrow().persist();
+        Ok(())
+    }
+
+    /// §10/§13's read model for an orchestrator's spatial reasoning: enough
+    /// structured geometry to place/avoid-colliding-with other nodes, never
+    /// a screenshot (§13's explicit "do NOT give agents screenshots"). Not
+    /// capability-gated, same as `agent_infos`/`connection_infos` — plain
+    /// discovery, needed to make spatial decisions at all.
+    pub fn list_canvas_nodes(app: &Rc<RefCell<App>>) -> Vec<CanvasNodeSummary> {
+        app.borrow()
+            .nodes
+            .values()
+            .map(|entry| App::summarize_node(&entry.record))
+            .collect()
+    }
+
+    pub fn inspect_canvas_node(app: &Rc<RefCell<App>>, id: Uuid) -> Option<CanvasNodeSummary> {
+        app.borrow()
+            .nodes
+            .get(&id)
+            .map(|entry| App::summarize_node(&entry.record))
+    }
+
+    /// §13's optional-but-simple helper: the first position (scanning a grid
+    /// left-to-right, top-to-bottom, starting at the origin) whose
+    /// `width`x`height` box doesn't overlap any existing node's bounding box.
+    /// A plain O(nodes × candidates) scan — fine at canvas-sized node counts;
+    /// this is deliberately not spatial-indexed. Bounded by `MAX_ROWS` so a
+    /// pathological case (an enormous `width`/`height`, or a canvas so densely
+    /// packed every candidate on `MAX_ROWS` rows collides) returns a fallback
+    /// instead of spinning forever on the GTK main thread — this runs
+    /// synchronously inside `handle_request`, so an unbounded loop here would
+    /// hang the whole app, not just return a bad answer.
+    pub fn find_canvas_space(app: &Rc<RefCell<App>>, width: f64, height: f64) -> (f64, f64) {
+        const STEP: f64 = 40.0;
+        const MAX_COLUMNS: i64 = 60;
+        const MAX_ROWS: i64 = 500;
+        let boxes: Vec<((f64, f64), (f64, f64))> = app
+            .borrow()
+            .nodes
+            .values()
+            .map(|entry| (entry.record.position, entry.record.size))
+            .collect();
+        let overlaps = |x: f64, y: f64| {
+            boxes.iter().any(|&((bx, by), (bw, bh))| {
+                x < bx + bw && x + width > bx && y < by + bh && y + height > by
+            })
+        };
+        for row in 0..MAX_ROWS {
+            for col in 0..MAX_COLUMNS {
+                let x = col as f64 * STEP;
+                let y = row as f64 * STEP;
+                if !overlaps(x, y) {
+                    return (x, y);
+                }
+            }
+        }
+        // Every candidate in the bounded grid collided — fall back to the
+        // origin rather than loop forever; the caller (a human or an
+        // orchestrator) still gets an answer and can adjust from there.
+        (0.0, 0.0)
+    }
+
+    fn summarize_node(record: &NodeRecord) -> CanvasNodeSummary {
+        let name = match &record.kind {
+            NodeKind::Terminal(terminal) => Some(terminal.name.clone()),
+            NodeKind::Group(group) if !group.label.is_empty() => Some(group.label.clone()),
+            NodeKind::Portal(portal) => Some(portal.name.clone()),
+            _ => None,
+        };
+        CanvasNodeSummary {
+            id: record.id,
+            kind: record.kind.label().to_string(),
+            name,
+            position: record.position,
+            size: record.size,
+            locked: record.locked,
+            z_order: record.z_order,
+        }
+    }
+
+    /// The same per-kind default size `create_note`/`create_group`/
+    /// `create_drawing` each hard-code today — centralized here so the
+    /// orchestrator path and a future caller agree on one table instead of
+    /// guessing a size.
+    fn default_size_for(kind: &NodeKind) -> (f64, f64) {
+        match kind {
+            NodeKind::Note(_) | NodeKind::Text(_) => (220.0, 160.0),
+            NodeKind::Group(_) => (720.0, 460.0),
+            NodeKind::Drawing(_) => (420.0, 300.0),
+            NodeKind::FileTree(_) => (320.0, 460.0),
+            NodeKind::Portal(_) => (640.0, 480.0),
+            _ => (320.0, 240.0),
         }
     }
 
@@ -2174,45 +2681,53 @@ impl App {
     /// granting it no `WriteNote`). A future pass can expose revoking/editing
     /// capabilities explicitly; until then these are the defaults that make
     /// the connect gesture actually do what it visually promises.
-    pub fn create_edge(app: &Rc<RefCell<App>>, source: Uuid, target: Uuid) -> bool {
-        let mut app = app.borrow_mut();
+    pub fn create_edge(
+        app: &Rc<RefCell<App>>,
+        requested_by: Option<Uuid>,
+        source: Uuid,
+        target: Uuid,
+    ) -> Result<bool, String> {
+        App::require_control_capability(app, requested_by, ControlCapability::ConnectCanvasNodes)
+            .map_err(|error| error.to_string())?;
+        let mut app_mut = app.borrow_mut();
         // Groups are visual sections: never an endpoint of a connection.
         let is_group = |id: &Uuid| {
-            app.nodes
+            app_mut
+                .nodes
                 .get(id)
                 .is_some_and(|e| e.record.kind.is_background())
         };
         if is_group(&source) || is_group(&target) {
-            return false;
+            return Ok(false);
         }
-        if source != target
-            && app.nodes.contains_key(&source)
-            && app.nodes.contains_key(&target)
-            && !app
+        let created = source != target
+            && app_mut.nodes.contains_key(&source)
+            && app_mut.nodes.contains_key(&target)
+            && !app_mut
                 .edges
                 .iter()
-                .any(|e| e.source == source && e.target == target)
-        {
+                .any(|e| e.source == source && e.target == target);
+        if created {
             let mut edge = EdgeRecord::visual(Uuid::new_v4(), source, target);
-            let source_is_terminal = app
+            let source_is_terminal = app_mut
                 .nodes
                 .get(&source)
                 .is_some_and(|e| e.record.as_terminal().is_some());
-            let target_is_terminal = app
+            let target_is_terminal = app_mut
                 .nodes
                 .get(&target)
                 .is_some_and(|e| e.record.as_terminal().is_some());
-            let source_is_note = app
+            let source_is_note = app_mut
                 .nodes
                 .get(&source)
                 .is_some_and(|e| e.record.as_note().is_some());
-            let target_is_note = app
+            let target_is_note = app_mut
                 .nodes
                 .get(&target)
                 .is_some_and(|e| e.record.as_note().is_some());
             // Files, folders and drawings handed to an agent as context.
             let is_file_view = |id: Uuid| {
-                app.nodes.get(&id).is_some_and(|e| {
+                app_mut.nodes.get(&id).is_some_and(|e| {
                     matches!(
                         e.record.kind,
                         NodeKind::Editor(_) | NodeKind::FileTree(_) | NodeKind::Drawing(_)
@@ -2233,7 +2748,8 @@ impl App {
                 // in the agent's `duetctl whoami` as context to start from
                 // (a drawing is then readable with `duetctl drawing read`).
                 edge.capabilities.insert(EdgeCapability::ShareContext);
-            } else if let (Some(a), Some(b)) = (app.nodes.get(&source), app.nodes.get(&target))
+            } else if let (Some(a), Some(b)) =
+                (app_mut.nodes.get(&source), app_mut.nodes.get(&target))
                 && let Some(capability) =
                     portals::default_portal_capability(&a.record.kind, &b.record.kind)
             {
@@ -2242,13 +2758,27 @@ impl App {
                 // nothing.
                 edge.capabilities.insert(capability);
             }
-            app.edges.push(edge.clone());
-            app.undo_stack.push(CanvasCommand::AddEdge { edge });
-            app.redo_stack.clear();
-            let _ = app.persist();
-            return true;
+            app_mut.edges.push(edge.clone());
+            app_mut.undo_stack.push(CanvasCommand::AddEdge { edge });
+            app_mut.redo_stack.clear();
+            let _ = app_mut.persist();
         }
-        false
+        drop(app_mut);
+        if created && let Some(agent_id) = requested_by {
+            let requester = App::agent_display_name(app, agent_id);
+            let (source_name, target_name) = {
+                let app_ref = app.borrow();
+                (
+                    node_display_name(&app_ref, source),
+                    node_display_name(&app_ref, target),
+                )
+            };
+            App::notify(
+                app,
+                &format!("{requester} connected {source_name} -> {target_name}"),
+            );
+        }
+        Ok(created)
     }
 
     /// Puts the `link-source` CSS class on exactly the node named by
@@ -2480,7 +3010,10 @@ impl App {
             app.borrow().refresh_link_highlight();
             return Some("Groups are visual sections and can't be connected".to_string());
         }
-        let created = App::create_edge(app, source, target);
+        let created = match App::create_edge(app, None, source, target) {
+            Ok(created) => created,
+            Err(error) => return Some(error),
+        };
         let app_ref = app.borrow();
         app_ref.refresh_link_highlight();
         if !created {
@@ -2813,6 +3346,8 @@ impl App {
             files::forget_node(&mut app_mut, id);
             portals::forget_node(&mut app_mut, id);
             app_mut.refresh_link_highlight();
+            let workspace_id = app_mut.workspace_id;
+            app_mut.control.revoke(workspace_id, id);
             (canvas, removed)
         };
         if let Some(entry) = removed {
@@ -2852,6 +3387,8 @@ impl App {
                 }
                 entry.exit_shown = true;
             }
+            let workspace_id = app_mut.workspace_id;
+            app_mut.control.revoke(workspace_id, id);
         }
     }
 
@@ -2893,7 +3430,7 @@ impl App {
             environment::terminate(&mut app.borrow_mut().runtime, id, terminal.environment);
             let spawn_result = {
                 let app_ref = app.borrow();
-                build_terminal_launch(&app_ref, id, &terminal)
+                build_terminal_launch(&app_ref, id, &terminal, None)
             }
             .and_then(|launch| {
                 let prepared = environment::prepare_launch(terminal.environment, id, launch);
@@ -3766,6 +4303,17 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
                 items.push(separator());
                 items.extend(open_in_portal);
             }
+            let workspace_id = app.borrow().workspace_id;
+            if app.borrow().control.has_any_grant(workspace_id, id) {
+                items.push(separator());
+                let app_c = Rc::clone(app);
+                items.push((
+                    "! Revoke canvas control".to_string(),
+                    Box::new(move || {
+                        App::revoke_control_grant(&app_c, id);
+                    }),
+                ));
+            }
             items
         }
         NodeKind::Note(note) => {
@@ -3920,14 +4468,15 @@ fn node_geometry(entry: &NodeEntry) -> NodeGeometry {
     (entry.record.position, entry.record.size)
 }
 
-/// A node's display name for toast messages: a terminal's own name, or its
-/// kind label for anything else.
+/// A node's display name for toast messages: a terminal's own name, a
+/// Group's custom label if it has one, or its kind label otherwise.
 fn node_display_name(app: &App, id: Uuid) -> String {
     app.nodes
         .get(&id)
-        .map(|entry| match entry.record.as_terminal() {
-            Some(terminal) => terminal.name.clone(),
-            None => entry.record.kind.label().to_string(),
+        .map(|entry| match &entry.record.kind {
+            NodeKind::Terminal(terminal) => terminal.name.clone(),
+            NodeKind::Group(group) if !group.label.is_empty() => group.label.clone(),
+            _ => entry.record.kind.label().to_string(),
         })
         .unwrap_or_default()
 }
@@ -4345,8 +4894,17 @@ fn wire_node_chrome(app: &Rc<RefCell<App>>, id: Uuid) {
 /// once instead of five times.
 fn materialize_node(
     app: &Rc<RefCell<App>>,
+    record: NodeRecord,
+    toast_overlay: &adw::ToastOverlay,
+) -> Result<(), String> {
+    materialize_node_inner(app, record, toast_overlay, None)
+}
+
+fn materialize_node_inner(
+    app: &Rc<RefCell<App>>,
     mut record: NodeRecord,
     toast_overlay: &adw::ToastOverlay,
+    initial_task: Option<&str>,
 ) -> Result<(), String> {
     let id = record.id;
     let position = record.position;
@@ -4369,7 +4927,7 @@ fn materialize_node(
             if !app.borrow().runtime.is_alive(id) {
                 let launch = {
                     let app_ref = app.borrow();
-                    build_terminal_launch(&app_ref, id, terminal)
+                    build_terminal_launch(&app_ref, id, terminal, initial_task)
                         .map_err(|error| format!("couldn't restore {}: {error}", terminal.name))?
                 };
                 let prepared = environment::prepare_launch(terminal.environment, id, launch);
@@ -4674,6 +5232,7 @@ fn build_terminal_launch(
     app: &App,
     id: Uuid,
     terminal: &TerminalPayload,
+    initial_task: Option<&str>,
 ) -> anyhow::Result<Launch> {
     let claude = resolve_claude_account(app, &terminal.agent, terminal.claude_account.clone())?;
     let codex_home = ensure_codex_home(&terminal.agent, id)?;
@@ -4698,7 +5257,7 @@ fn build_terminal_launch(
             .is_some_and(|dir| orchestration::skill::install(dir).is_ok());
     let initial_prompt = terminal
         .never_launched
-        .then(|| orchestration::env::discovery_prompt(None, skill_installed))
+        .then(|| orchestration::env::discovery_prompt(initial_task, skill_installed))
         .flatten();
     let launch = with_session_env(
         terminal.agent.launch(LaunchRequest {
@@ -4986,6 +5545,284 @@ mod tests {
                 .unwrap()
                 .markdown,
             "hello"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn require_control_capability_allows_the_human_operator() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        assert!(
+            App::require_control_capability(&app, None, ControlCapability::SpawnAgents).is_ok()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn require_control_capability_denies_an_ungranted_agent() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn closing_a_node_revokes_that_agents_control_grant() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent_node = terminal_node(EnvironmentKind::LocalPty);
+        let agent_id = agent_node.id;
+        materialize_node(&app, agent_node, &adw::ToastOverlay::new()).unwrap();
+        let workspace_id = app.borrow().workspace_id;
+        {
+            let mut app_mut = app.borrow_mut();
+            let request_id = app_mut.control.request_grant(
+                agent_id,
+                workspace_id,
+                [ControlCapability::MoveCanvasNodes].into_iter().collect(),
+                None,
+            );
+            app_mut.control.approve(request_id).unwrap();
+        }
+        assert!(
+            App::require_control_capability(
+                &app,
+                Some(agent_id),
+                ControlCapability::MoveCanvasNodes
+            )
+            .is_ok()
+        );
+
+        App::close_node(&app, agent_id);
+
+        assert!(
+            App::require_control_capability(
+                &app,
+                Some(agent_id),
+                ControlCapability::MoveCanvasNodes
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn approving_a_request_grants_exactly_what_was_requested_and_denies_are_not_reachable_from_control_rs()
+     {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            Some("test".into()),
+        );
+        let approved = App::approve_control_grant(&app, request_id).unwrap();
+        assert_eq!(approved.agent_id, agent);
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_ok()
+        );
+        assert_eq!(
+            App::control_status(&app, agent),
+            [ControlCapability::SpawnAgents].into_iter().collect()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn revoke_control_grant_takes_effect_immediately() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            None,
+        );
+        App::approve_control_grant(&app, request_id).unwrap();
+        assert!(App::revoke_control_grant(&app, agent));
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_agent_denies_an_orchestrator_without_spawn_agents_capability() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        // Using the new `position` parameter exercises the NEW SpawnAgents
+        // gate, not the pre-existing require_manager one — `agent` here has
+        // no grant at all, so this alone only proves the new gate denies an
+        // ungranted agent. The companion test below (granting SpawnAgents
+        // to an agent with no manager role, and succeeding) is the one that
+        // actually proves the capability check runs independently of
+        // manager status.
+        let result = App::create_agent(
+            &app,
+            Some(agent),
+            "Backend".to_string(),
+            tmp.clone(),
+            Agent::Shell,
+            None,
+            Some((100.0, 100.0)),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_agent_places_an_authorized_orchestrators_agent_at_the_requested_position() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let orchestrator = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            orchestrator,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        let id = App::create_agent(
+            &app,
+            Some(orchestrator),
+            "Backend".to_string(),
+            tmp.clone(),
+            Agent::Shell,
+            None,
+            Some((1200.0, 500.0)),
+            Some((420.0, 320.0)),
+            None,
+        )
+        .unwrap();
+
+        {
+            let app_ref = app.borrow();
+            let entry = app_ref.nodes.get(&id).unwrap();
+            assert_eq!(entry.record.position, (1200.0, 500.0));
+            assert_eq!(entry.record.size, (420.0, 320.0));
+        }
+
+        // The requested size must actually reach disk, not just the
+        // in-memory record — `create_session` already persists once
+        // *before* `create_agent` applies the resize, so without a second
+        // flush after the resize the requested size would silently revert
+        // to the default on the next launch/reload.
+        let store_path = app.borrow().store_path.clone();
+        let loaded = Store::load(&store_path);
+        let persisted = loaded
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.nodes.iter().find(|node| node.id == id))
+            .expect("the new agent's node to be persisted");
+        assert_eq!(persisted.size, (420.0, 320.0));
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_agent_clamps_a_requested_size_below_the_node_minimum() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let orchestrator = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            orchestrator,
+            workspace_id,
+            [ControlCapability::SpawnAgents].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        // Tiny/negative, like a hallucinated or malicious `--width`/
+        // `--height` — the GUI's own resize-drag handler already floors at
+        // `MIN_NODE_WIDTH`/`MIN_NODE_HEIGHT`; the delegated-control surface
+        // must not be the one path that can bypass that and create a
+        // degenerate node.
+        let id = App::create_agent(
+            &app,
+            Some(orchestrator),
+            "Backend".to_string(),
+            tmp,
+            Agent::Shell,
+            None,
+            None,
+            Some((1.0, -5.0)),
+            None,
+        )
+        .unwrap();
+
+        let app_ref = app.borrow();
+        let entry = app_ref.nodes.get(&id).unwrap();
+        assert_eq!(
+            entry.record.size,
+            (crate::node::MIN_NODE_WIDTH, crate::node::MIN_NODE_HEIGHT)
         );
     }
 
@@ -5338,6 +6175,54 @@ mod tests {
         )
     }
 
+    #[test]
+    #[ignore = "needs a display"]
+    fn list_canvas_nodes_reports_every_live_node() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+
+        let nodes = App::list_canvas_nodes(&app);
+        assert!(nodes.iter().any(|n| n.id == id && n.kind == "Note"));
+
+        let inspected = App::inspect_canvas_node(&app, id).unwrap();
+        assert_eq!(inspected.id, id);
+        assert!(App::inspect_canvas_node(&app, Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn find_canvas_space_avoids_an_existing_nodes_bounding_box() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut existing = note_with_markdown("a");
+        existing.position = (0.0, 0.0);
+        existing.size = (300.0, 200.0);
+        materialize_node(&app, existing, &adw::ToastOverlay::new()).unwrap();
+
+        let (x, y) = App::find_canvas_space(&app, 200.0, 150.0);
+
+        let overlaps = x < 300.0 && x + 200.0 > 0.0 && y < 200.0 && y + 150.0 > 0.0;
+        assert!(
+            !overlaps,
+            "found space ({x}, {y}) overlaps the existing node"
+        );
+    }
+
     /// Milestone 4 section 8: a service-driven write must be immediately
     /// visible on the canvas, not just in the persisted record — reads back
     /// both `NodeRecord::as_note` and the live `NoteNode::edit_view`
@@ -5441,9 +6326,9 @@ mod tests {
         materialize_node(&app, note_a.clone(), &toast).unwrap();
         materialize_node(&app, note_b.clone(), &toast).unwrap();
 
-        assert!(App::create_edge(&app, agent_a.id, agent_b.id));
-        assert!(App::create_edge(&app, agent_a.id, note_a.id));
-        assert!(App::create_edge(&app, note_a.id, note_b.id));
+        assert!(App::create_edge(&app, None, agent_a.id, agent_b.id).unwrap());
+        assert!(App::create_edge(&app, None, agent_a.id, note_a.id).unwrap());
+        assert!(App::create_edge(&app, None, note_a.id, note_b.id).unwrap());
 
         let capabilities_between =
             |a: Uuid, b: Uuid| -> std::collections::BTreeSet<EdgeCapability> {
@@ -5469,6 +6354,69 @@ mod tests {
 
         app.borrow_mut().runtime.terminate(agent_a.id);
         app.borrow_mut().runtime.terminate(agent_b.id);
+    }
+
+    /// §7.6's delegated-control gate on `App::create_edge`: an agent needs
+    /// `ConnectCanvasNodes` over the active workspace before it may connect
+    /// two nodes.
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_edge_requires_connect_canvas_nodes_capability_for_an_agent() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let a = terminal_node(EnvironmentKind::LocalPty);
+        let b = terminal_node(EnvironmentKind::LocalPty);
+        let (id_a, id_b) = (a.id, b.id);
+        materialize_node(&app, a, &adw::ToastOverlay::new()).unwrap();
+        materialize_node(&app, b, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+
+        assert!(
+            App::create_edge(&app, Some(agent), id_a, id_b)
+                .unwrap_err()
+                .contains("not authorized")
+        );
+
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::ConnectCanvasNodes]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        assert!(App::create_edge(&app, Some(agent), id_a, id_b).unwrap());
+    }
+
+    /// The human operator (`requested_by: None`) is always authorized,
+    /// unaffected by the new gate.
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_edge_still_works_unauthenticated_for_the_human_operator() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let a = terminal_node(EnvironmentKind::LocalPty);
+        let b = terminal_node(EnvironmentKind::LocalPty);
+        let (id_a, id_b) = (a.id, b.id);
+        materialize_node(&app, a, &adw::ToastOverlay::new()).unwrap();
+        materialize_node(&app, b, &adw::ToastOverlay::new()).unwrap();
+
+        assert!(App::create_edge(&app, None, id_a, id_b).unwrap());
     }
 
     /// Milestone 4's full acceptance scenario, exercised at the service
@@ -5895,8 +6843,8 @@ mod tests {
         assert!(message.contains("can't be connected"), "{message}");
         assert!(app.borrow().edges.is_empty());
         // Enforced by the shared service, not just the GUI gesture.
-        assert!(!App::create_edge(&app, note, group));
-        assert!(!App::create_edge(&app, group, drawing));
+        assert!(!App::create_edge(&app, None, note, group).unwrap());
+        assert!(!App::create_edge(&app, None, group, drawing).unwrap());
         assert!(app.borrow().edges.is_empty());
         let labels: Vec<String> = node_menu_items(&app, group)
             .into_iter()
@@ -6108,7 +7056,7 @@ mod tests {
             .unwrap_err();
         assert!(refused.contains("not authorized"), "{refused}");
 
-        assert!(App::create_edge(&app, agent.id, drawing));
+        assert!(App::create_edge(&app, None, agent.id, drawing).unwrap());
         assert_eq!(
             app.borrow().edges[0].capabilities,
             [EdgeCapability::ShareContext].into_iter().collect()
@@ -6280,5 +7228,277 @@ mod tests {
         materialize_node(&app, shell, &adw::ToastOverlay::new()).unwrap();
         assert!(app.borrow().handoff_targets(shell_id).is_empty());
         let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn move_node_respects_a_locked_node() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut note = note_with_markdown("a");
+        note.locked = true;
+        let id = note.id;
+        let original = note.position;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+
+        let result = App::move_node(&app, None, id, (900.0, 900.0));
+
+        assert!(result.is_err());
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.position,
+            original
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn move_node_requires_move_canvas_nodes_capability_for_an_agent() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+
+        assert!(App::move_node(&app, Some(agent), id, (10.0, 10.0)).is_err());
+
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::MoveCanvasNodes].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        assert!(App::move_node(&app, Some(agent), id, (10.0, 10.0)).is_ok());
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.position,
+            (10.0, 10.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn resize_node_pushes_an_undo_entry() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        let old_size = note.size;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+
+        App::resize_node(&app, None, id, (500.0, 400.0)).unwrap();
+
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.size,
+            (500.0, 400.0)
+        );
+        assert!(matches!(
+            app.borrow().undo_stack.last(),
+            Some(CanvasCommand::ResizeNode { old_size: o, new_size: (500.0, 400.0), .. }) if *o == old_size
+        ));
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn create_canvas_node_requires_create_canvas_nodes_capability() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let kind = NodeKind::Group(GroupPayload::default());
+
+        assert!(
+            App::create_canvas_node(&app, Some(agent), kind.clone(), (0.0, 0.0), None).is_err()
+        );
+
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::CreateCanvasNodes].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        let id = App::create_canvas_node(
+            &app,
+            Some(agent),
+            kind,
+            (100.0, 200.0),
+            Some((300.0, 150.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            app.borrow().nodes.get(&id).unwrap().record.position,
+            (100.0, 200.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn configure_node_renames_a_terminal_when_authorized() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let id = node.id;
+        materialize_node(&app, node, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::ConfigureCanvasNodes]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+
+        App::configure_node(&app, Some(agent), id, Some("Backend".to_string()), None).unwrap();
+
+        assert_eq!(
+            app.borrow()
+                .nodes
+                .get(&id)
+                .unwrap()
+                .record
+                .as_terminal()
+                .unwrap()
+                .name,
+            "Backend"
+        );
+        let app_ref = app.borrow();
+        let NodeWidget::Terminal(node) = &app_ref.nodes.get(&id).unwrap().widget else {
+            panic!("expected a Terminal widget");
+        };
+        assert_eq!(node.title_label.text(), "Backend");
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn configure_node_rejects_a_colliding_terminal_name() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let mut taken = terminal_node(EnvironmentKind::LocalPty);
+        taken.as_terminal_mut().unwrap().name = "Taken".to_string();
+        materialize_node(&app, taken, &adw::ToastOverlay::new()).unwrap();
+
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let id = node.id;
+        materialize_node(&app, node, &adw::ToastOverlay::new()).unwrap();
+
+        let result = App::configure_node(&app, None, id, Some("Taken".to_string()), None);
+        assert!(result.is_err());
+
+        assert_eq!(
+            app.borrow()
+                .nodes
+                .get(&id)
+                .unwrap()
+                .record
+                .as_terminal()
+                .unwrap()
+                .name,
+            "t"
+        );
+        let app_ref = app.borrow();
+        let NodeWidget::Terminal(node) = &app_ref.nodes.get(&id).unwrap().widget else {
+            panic!("expected a Terminal widget");
+        };
+        assert_eq!(node.title_label.text(), "t");
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn remove_canvas_node_refuses_terminal_nodes() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let node = terminal_node(EnvironmentKind::LocalPty);
+        let id = node.id;
+        materialize_node(&app, node, &adw::ToastOverlay::new()).unwrap();
+
+        assert!(App::remove_canvas_node(&app, None, id).is_err());
+        assert!(app.borrow().nodes.contains_key(&id));
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn remove_canvas_node_requires_the_destructive_capability_explicitly() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+        let agent = Uuid::new_v4();
+        let workspace_id = app.borrow().workspace_id;
+
+        // The default grant (everything in DEFAULT_SET) must NOT cover this.
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            ControlCapability::DEFAULT_SET.into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+        assert!(App::remove_canvas_node(&app, Some(agent), id).is_err());
+
+        let request_id = app.borrow_mut().control.request_grant(
+            agent,
+            workspace_id,
+            [ControlCapability::RemoveCanvasNodes].into_iter().collect(),
+            None,
+        );
+        app.borrow_mut().control.approve(request_id).unwrap();
+        assert!(App::remove_canvas_node(&app, Some(agent), id).is_ok());
+        assert!(!app.borrow().nodes.contains_key(&id));
     }
 }

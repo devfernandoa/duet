@@ -11,6 +11,7 @@
 pub mod activity;
 pub mod adapter;
 pub mod bus;
+pub mod control_grant;
 pub mod env;
 pub mod identity;
 pub mod notes;
@@ -22,6 +23,7 @@ pub mod skill;
 
 pub use adapter::{AgentAdapter, adapter_for};
 pub use bus::MessageBus;
+pub use control_grant::{ControlCapability, DelegatedControlService, PendingGrantRequest};
 pub use identity::{AgentIdentity, agent_identities};
 pub use permissions::authorize;
 pub use registry::AgentRegistry;

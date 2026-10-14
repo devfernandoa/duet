@@ -21,12 +21,16 @@
 //! them from a request that arrived on another thread.
 
 use crate::agent::Agent;
-use crate::app::{App, PortalStep};
+use crate::app::{App, CanvasNodeSummary, PortalStep};
 use crate::message::{
     AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, NoteDetail, NoteSummary,
     PortalAction, PortalInfo, PortalPage, PortalScreenshot, PortalSummary, WhoamiInfo,
     WorkspaceInfo,
 };
+use crate::model::{
+    FileTreePayload, GroupPayload, NodeKind, NotePayload, NoteViewMode, PortalPayload, TextPayload,
+};
+use crate::orchestration::control_grant::ControlCapability;
 use crate::orchestration::resource::{ResolveOutcome, ResolvedResource, ResourceDetail};
 use crate::project::fs::DirEntry;
 use crate::project::git::{DiffScope, GitLogEntry, GitStatus};
@@ -82,6 +86,41 @@ pub enum ControlRequest {
         role: Option<String>,
         #[serde(default)]
         requested_by: Option<Uuid>,
+        /// Milestone 7.6: `x`/`y` and `width`/`height` must each be either
+        /// both present or both absent — a partial pair is a request error
+        /// (see `handle_request`'s `AgentsCreate` arm). Using any of these,
+        /// or `task`, switches `App::create_agent`'s gate from
+        /// `require_manager` to a `SpawnAgents` delegated-control grant.
+        #[serde(default)]
+        x: Option<f64>,
+        #[serde(default)]
+        y: Option<f64>,
+        #[serde(default)]
+        width: Option<f64>,
+        #[serde(default)]
+        height: Option<f64>,
+        #[serde(default)]
+        task: Option<String>,
+    },
+    /// `duetctl control request`: an Agent asks for delegated canvas-control
+    /// capabilities. Never approves anything by itself — see
+    /// `App::request_control_grant`; approval is only ever a GTK dialog
+    /// response (§6).
+    ControlRequestGrant {
+        requested_by: Uuid,
+        /// Kebab-case `ControlCapability` names (`spawn-agents`,
+        /// `create-canvas-nodes`, …) — see `parse_control_capability`.
+        capabilities: Vec<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// `duetctl control status`: capabilities currently granted to the caller
+    /// (or, with no acting agent, always reports every capability, since the
+    /// human operator is implicitly trusted — matches `require_manager`'s
+    /// `None` ⇒ `Ok` convention).
+    ControlStatus {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
     },
     AgentsRemove {
         target: String,
@@ -94,6 +133,99 @@ pub enum ControlRequest {
         role: Option<String>,
         #[serde(default)]
         requested_by: Option<Uuid>,
+    },
+    /// `duetctl canvas move <id> --x <num> --y <num>`: Milestone 7.6
+    /// delegated canvas-control, by stable id — see `App::move_node`. Fails
+    /// if `requested_by` lacks `MoveCanvasNodes`, or the node is locked.
+    CanvasMove {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        x: f64,
+        y: f64,
+    },
+    /// `duetctl canvas resize <id> --width <num> --height <num>`: see
+    /// `App::resize_node`. Fails if `requested_by` lacks
+    /// `ResizeCanvasNodes`, or the node is locked.
+    CanvasResize {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        width: f64,
+        height: f64,
+    },
+    /// `duetctl canvas create --kind <kind> [--name <text>] --x <num> --y
+    /// <num> [--width <num>] [--height <num>]`: Milestone 7.6's generic
+    /// node-creation surface — see `App::create_canvas_node`. `kind` is one
+    /// of `note | text | filetree | group | drawing | portal`; `Terminal`
+    /// stays behind `AgentsCreate`/`duetctl agents create`. Fails if
+    /// `requested_by` lacks `CreateCanvasNodes`.
+    CanvasCreate {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        kind: String,
+        #[serde(default)]
+        name: Option<String>,
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        width: Option<f64>,
+        #[serde(default)]
+        height: Option<f64>,
+    },
+    /// `duetctl canvas configure <id> [--name <text>] [--color <text>]`: a
+    /// Terminal's display name, or a Group's label/color — see
+    /// `App::configure_node`. Fails if `requested_by` lacks
+    /// `ConfigureCanvasNodes`.
+    CanvasConfigure {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    /// `duetctl canvas connect <source-id> <target-id>`: see
+    /// `App::create_edge`. Fails if `requested_by` lacks
+    /// `ConnectCanvasNodes`. Capabilities on the new edge are never chosen
+    /// here — they come entirely from `create_edge`'s existing
+    /// kind-pair table, which is already least-privilege by construction.
+    CanvasConnect {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        source: Uuid,
+        target: Uuid,
+    },
+    /// `duetctl canvas remove <id>`: see `App::remove_canvas_node`. Refuses
+    /// Terminal nodes outright — an Agent is only ever removed through
+    /// `AgentsRemove`/`require_manager`. Fails if `requested_by` lacks
+    /// `RemoveCanvasNodes`, which (unlike every other canvas capability)
+    /// is never in `ControlCapability::DEFAULT_SET` and so is never
+    /// implied by an empty `--capability` list — it always needs its own
+    /// explicit `control request --capability remove-canvas-nodes`.
+    CanvasRemove {
+        #[serde(default)]
+        requested_by: Option<Uuid>,
+        id: Uuid,
+    },
+    /// `duetctl canvas list`: every live node's geometry — see
+    /// `App::list_canvas_nodes`. Not capability-gated, same precedent as
+    /// `AgentsList`/`ConnectionsList` (§13: "the canvas is structured
+    /// data... provide structured geometry", never a screenshot).
+    CanvasList,
+    /// `duetctl canvas inspect <id>`: one node's geometry — see
+    /// `App::inspect_canvas_node`. Not capability-gated, same as `CanvasList`.
+    CanvasInspect {
+        id: Uuid,
+    },
+    /// `duetctl canvas find-space --width <num> --height <num>`: the first
+    /// grid position whose box doesn't overlap an existing node — see
+    /// `App::find_canvas_space`. Not capability-gated, same as `CanvasList`/
+    /// `CanvasInspect` — it only reads existing geometry.
+    CanvasFindSpace {
+        width: f64,
+        height: f64,
     },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
     /// in every session, instead of having its role and connections resent
@@ -415,6 +547,12 @@ pub enum ControlResponse {
     Sent {
         message: AgentMessage,
     },
+    ControlRequestPending {
+        request_id: Uuid,
+    },
+    ControlGrantStatus {
+        granted: Vec<String>,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },
@@ -432,6 +570,22 @@ pub enum ControlResponse {
     },
     Removed,
     RoleAssigned,
+    /// A canvas move/resize succeeded — same free-form-message shape as
+    /// `GitDone`, shared by `CanvasMove`/`CanvasResize` rather than one new
+    /// variant per canvas verb.
+    CanvasDone {
+        message: String,
+    },
+    CanvasNodes {
+        nodes: Vec<CanvasNodeSummary>,
+    },
+    CanvasNode {
+        node: CanvasNodeSummary,
+    },
+    CanvasPosition {
+        x: f64,
+        y: f64,
+    },
     Whoami {
         info: WhoamiInfo,
     },
@@ -617,6 +771,35 @@ fn parse_provider(name: &str) -> Result<Agent, String> {
     }
 }
 
+/// A `ControlCapability` as `duetctl control request --capability <...>`
+/// accepts it — the same kebab-case the enum's `serde` rename uses, so
+/// this list must track `ControlCapability`'s variants exactly.
+fn parse_control_capability(name: &str) -> Result<ControlCapability, String> {
+    match name {
+        "spawn-agents" => Ok(ControlCapability::SpawnAgents),
+        "create-canvas-nodes" => Ok(ControlCapability::CreateCanvasNodes),
+        "move-canvas-nodes" => Ok(ControlCapability::MoveCanvasNodes),
+        "resize-canvas-nodes" => Ok(ControlCapability::ResizeCanvasNodes),
+        "configure-canvas-nodes" => Ok(ControlCapability::ConfigureCanvasNodes),
+        "connect-canvas-nodes" => Ok(ControlCapability::ConnectCanvasNodes),
+        "remove-canvas-nodes" => Ok(ControlCapability::RemoveCanvasNodes),
+        other => Err(format!("unknown capability '{other}'")),
+    }
+}
+
+/// The inverse of `parse_control_capability`: the exact kebab-case string
+/// `duetctl control status` must print so its own output can be fed
+/// straight back into `control request --capability <name>`. Derived from
+/// `ControlCapability`'s existing `#[serde(rename_all = "kebab-case")]`
+/// rather than a second hand-written table that could drift from
+/// `parse_control_capability`'s.
+fn capability_slug(cap: ControlCapability) -> String {
+    serde_json::to_value(cap)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{cap:?}"))
+}
+
 /// Resolves a role name to its id against the live role roster (built-in
 /// plus custom) — the same name-matching style `agent::find_identity`
 /// already uses for agents. `"none"` is handled by the caller before this
@@ -638,6 +821,38 @@ fn resolve_optional_role(app: &App, role: Option<String>) -> Result<Option<Uuid>
         None | Some("none") => Ok(None),
         Some(name) => resolve_role_id(app, name).map(Some),
     }
+}
+
+/// An optional `(x, y)` position paired with an optional `(width, height)`
+/// size — `App::create_agent`'s own argument shape for these two fields.
+type PositionAndSize = (Option<(f64, f64)>, Option<(f64, f64)>);
+
+/// Builds `App::create_agent`'s `position`/`size` arguments from
+/// `ControlRequest::AgentsCreate`'s `x`/`y`/`width`/`height` fields — each
+/// pair must be both present or both absent (a partial pair is a request
+/// error); `(None, None)` means "use the defaults" the same way a plain
+/// `duetctl agents create` always has. Pure logic, factored out of
+/// `handle_request`'s `AgentsCreate` arm so it's unit-testable without a
+/// GTK display (every `handle_request` test needs one, via `App::new`).
+fn agents_create_position_and_size(
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<PositionAndSize, String> {
+    let position = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => return Err("agents create needs both --x and --y, or neither".to_string()),
+    };
+    let size = match (width, height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        (None, None) => None,
+        _ => {
+            return Err("agents create needs both --width and --height, or neither".to_string());
+        }
+    };
+    Ok((position, size))
 }
 
 /// Answers one accepted request — called from `main.rs`'s poll loop, on
@@ -865,6 +1080,11 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
             agent,
             role,
             requested_by,
+            x,
+            y,
+            width,
+            height,
+            task,
         } => {
             let provider = match parse_provider(&agent) {
                 Ok(provider) => provider,
@@ -874,21 +1094,64 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 Ok(role_id) => role_id,
                 Err(error) => return ControlResponse::Error { error },
             };
-            // A CLI creation has no cursor position to spawn at (unlike the
-            // GUI's "New session" dialog, which uses the viewport center) —
-            // cascade by however many nodes already exist so agents created
-            // back-to-back (as the acceptance scenario's setup does) don't
-            // all land exactly on top of each other.
-            let position = {
-                let count = app.borrow().nodes.len() as f64;
-                (120.0 + count * 40.0, 120.0 + count * 40.0)
+            // `App::default_spawn_position` supplies the cascade position
+            // a CLI creation with no explicit `x`/`y` always used (the GUI's
+            // "New session" dialog passes its own viewport-center position
+            // instead, via `App::create_session` directly).
+            let (position, size) = match agents_create_position_and_size(x, y, width, height) {
+                Ok(pair) => pair,
+                Err(error) => return ControlResponse::Error { error },
             };
-            match App::create_agent(app, requested_by, name, cwd, provider, role_id, position) {
+            match App::create_agent(
+                app,
+                requested_by,
+                name,
+                cwd,
+                provider,
+                role_id,
+                position,
+                size,
+                task,
+            ) {
                 Ok(id) => ControlResponse::Created { id },
                 Err(error) => ControlResponse::Error {
                     error: error.to_string(),
                 },
             }
+        }
+        ControlRequest::ControlRequestGrant {
+            requested_by,
+            capabilities,
+            reason,
+        } => {
+            let mut parsed = std::collections::BTreeSet::new();
+            for name in &capabilities {
+                match parse_control_capability(name) {
+                    Ok(cap) => {
+                        parsed.insert(cap);
+                    }
+                    Err(error) => return ControlResponse::Error { error },
+                }
+            }
+            if parsed.is_empty() {
+                parsed = ControlCapability::DEFAULT_SET.into_iter().collect();
+            }
+            let request_id = App::request_control_grant(app, requested_by, parsed, reason);
+            ControlResponse::ControlRequestPending { request_id }
+        }
+        ControlRequest::ControlStatus { requested_by } => {
+            let granted = match requested_by {
+                None => ControlCapability::DEFAULT_SET
+                    .into_iter()
+                    .chain([ControlCapability::RemoveCanvasNodes])
+                    .map(capability_slug)
+                    .collect(),
+                Some(agent_id) => App::control_status(app, agent_id)
+                    .into_iter()
+                    .map(capability_slug)
+                    .collect(),
+            };
+            ControlResponse::ControlGrantStatus { granted }
         }
         ControlRequest::AgentsRemove {
             target,
@@ -926,6 +1189,96 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                     error: error.to_string(),
                 },
             }
+        }
+        ControlRequest::CanvasMove {
+            requested_by,
+            id,
+            x,
+            y,
+        } => respond(App::move_node(app, requested_by, id, (x, y)), |()| {
+            ControlResponse::CanvasDone {
+                message: format!("moved node {id}"),
+            }
+        }),
+        ControlRequest::CanvasResize {
+            requested_by,
+            id,
+            width,
+            height,
+        } => respond(
+            App::resize_node(app, requested_by, id, (width, height)),
+            |()| ControlResponse::CanvasDone {
+                message: format!("resized node {id}"),
+            },
+        ),
+        ControlRequest::CanvasCreate {
+            requested_by,
+            kind,
+            name,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let kind = match canvas_create_kind(&kind, name) {
+                Ok(kind) => kind,
+                Err(error) => return ControlResponse::Error { error },
+            };
+            let size = match canvas_create_size(width, height) {
+                Ok(size) => size,
+                Err(error) => return ControlResponse::Error { error },
+            };
+            respond(
+                App::create_canvas_node(app, requested_by, kind, (x, y), size),
+                |id| ControlResponse::CanvasDone {
+                    message: format!("created node {id}"),
+                },
+            )
+        }
+        ControlRequest::CanvasConfigure {
+            requested_by,
+            id,
+            name,
+            color,
+        } => respond(
+            App::configure_node(app, requested_by, id, name, color),
+            |()| ControlResponse::CanvasDone {
+                message: format!("configured node {id}"),
+            },
+        ),
+        ControlRequest::CanvasConnect {
+            requested_by,
+            source,
+            target,
+        } => respond(
+            App::create_edge(app, requested_by, source, target),
+            |created| ControlResponse::CanvasDone {
+                message: if created {
+                    format!("connected {source} -> {target}")
+                } else {
+                    format!("{source} and {target} are not connected to each other")
+                },
+            },
+        ),
+        ControlRequest::CanvasRemove { requested_by, id } => {
+            respond(App::remove_canvas_node(app, requested_by, id), |()| {
+                ControlResponse::CanvasDone {
+                    message: format!("removed node {id}"),
+                }
+            })
+        }
+        ControlRequest::CanvasList => ControlResponse::CanvasNodes {
+            nodes: App::list_canvas_nodes(app),
+        },
+        ControlRequest::CanvasInspect { id } => match App::inspect_canvas_node(app, id) {
+            Some(node) => ControlResponse::CanvasNode { node },
+            None => ControlResponse::Error {
+                error: format!("no such node {id}"),
+            },
+        },
+        ControlRequest::CanvasFindSpace { width, height } => {
+            let (x, y) = App::find_canvas_space(app, width, height);
+            ControlResponse::CanvasPosition { x, y }
         }
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
@@ -1201,6 +1554,7 @@ pub fn is_cli_verb(verb: &str) -> bool {
         "agent"
             | "agents"
             | "send"
+            | "control"
             | "connections"
             | "workspace"
             | "whoami"
@@ -1213,6 +1567,7 @@ pub fn is_cli_verb(verb: &str) -> bool {
             | "portals"
             | "drawing"
             | "drawings"
+            | "canvas"
     )
 }
 
@@ -1301,6 +1656,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, rest @ ..] if cmd == "agent" => parse_legacy_agent(rest),
         [cmd, rest @ ..] if cmd == "agents" => parse_agents(rest),
         [cmd, rest @ ..] if cmd == "send" => parse_send(rest),
+        [cmd, rest @ ..] if cmd == "control" => parse_control(rest),
         [cmd, only] if cmd == "connections" && only == "list" => {
             Ok(ControlRequest::ConnectionsList)
         }
@@ -1320,6 +1676,7 @@ fn parse_cli_request(args: &[String]) -> anyhow::Result<ControlRequest> {
         [cmd, rest @ ..] if cmd == "file" => parse_file(rest),
         [cmd, rest @ ..] if cmd == "git" => parse_git(rest),
         [cmd, rest @ ..] if cmd == "portal" || cmd == "portals" => parse_portal(rest),
+        [cmd, rest @ ..] if cmd == "canvas" => parse_canvas(rest),
         _ => anyhow::bail!(USAGE),
     }
 }
@@ -1328,9 +1685,12 @@ const USAGE: &str = r#"usage:
   duetctl agents list
   duetctl agents inspect <id-or-name>
   duetctl agents create --name <name> --cwd <dir> --agent <claude|codex|opencode|shell> [--role <role>]
+                         [--x <num> --y <num>] [--width <num> --height <num>] [--task <text>]
   duetctl agents remove <id-or-name>
   duetctl agents assign-role <id-or-name> <role-or-none>
   duetctl send --from <id> --to <id-or-name> "<message>"
+  duetctl control request --capability <name> [--capability <name> ...] [--reason "<text>"]
+  duetctl control status
   duetctl connections list
   duetctl workspace inspect
   duetctl whoami
@@ -1372,10 +1732,73 @@ const USAGE: &str = r#"usage:
   duetctl portal click <portal> <selector>
   duetctl portal type <portal> <selector> <text> [--append] [--submit]
   duetctl portal evaluate <portal> [<script>]    (script read from stdin if omitted)
+  duetctl canvas move <id> --x <num> --y <num>
+  duetctl canvas resize <id> --width <num> --height <num>
+  duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
+                         --x <num> --y <num> [--width <num>] [--height <num>]
+  duetctl canvas configure <id> [--name <text>] [--color <text>]
+  duetctl canvas connect <source-id> <target-id>
+  duetctl canvas remove <id>          (never Terminal nodes; needs an explicit
+                                        remove-canvas-nodes grant — not implied
+                                        by a default `control request`)
+  duetctl canvas list                 (every live node's geometry; not gated)
+  duetctl canvas inspect <id>         (one node's geometry; not gated)
+  duetctl canvas find-space --width <num> --height <num>
+                                       (first free grid position; not gated)
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
   duetctl resource inspect <id>"#;
+
+const CONTROL_USAGE: &str = r#"usage:
+  duetctl control request --capability <name> [--capability <name> ...] [--reason "<text>"]
+  duetctl control status
+<name> is one of: spawn-agents, create-canvas-nodes, move-canvas-nodes,
+  resize-canvas-nodes, configure-canvas-nodes, connect-canvas-nodes,
+  remove-canvas-nodes
+omitting --capability grants every name above except remove-canvas-nodes,
+  which is opt-in only and must always be requested by name"#;
+
+/// `duetctl control request`/`status` — Milestone 7.6's delegated
+/// canvas-control. `request` only makes sense from inside an agent's own
+/// launched shell (there is no human-side "request yourself a grant"); the
+/// request is never approved here — see `ControlRequest::ControlRequestGrant`'s
+/// doc comment.
+fn parse_control(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [cmd, rest @ ..] if cmd == "request" => parse_control_request(rest),
+        [only] if only == "status" => Ok(ControlRequest::ControlStatus {
+            requested_by: acting_agent_id(),
+        }),
+        _ => anyhow::bail!(CONTROL_USAGE),
+    }
+}
+
+fn parse_control_request(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let requested_by = acting_agent_id().ok_or_else(|| {
+        anyhow::anyhow!(
+            "control request needs an agent identity (DUET_AGENT_ID) — run this from \
+             inside an agent's shell\n\n{CONTROL_USAGE}"
+        )
+    })?;
+    let mut capabilities = Vec::new();
+    let mut reason = None;
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].clone());
+        match flag {
+            "--capability" => capabilities.push(value),
+            "--reason" => reason = Some(value),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CONTROL_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::ControlRequestGrant {
+        requested_by,
+        capabilities,
+        reason,
+    })
+}
 
 fn parse_resource(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
@@ -1858,6 +2281,219 @@ fn parse_notes_patch(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest
     })
 }
 
+const CANVAS_USAGE: &str = r#"usage:
+  duetctl canvas move <id> --x <num> --y <num>
+  duetctl canvas resize <id> --width <num> --height <num>
+  duetctl canvas create --kind <note|text|filetree|group|drawing|portal> [--name <text>]
+                         --x <num> --y <num> [--width <num>] [--height <num>]
+  duetctl canvas configure <id> [--name <text>] [--color <text>]
+  duetctl canvas connect <source-id> <target-id>
+  duetctl canvas remove <id>          (never Terminal nodes; needs an explicit
+                                        remove-canvas-nodes grant — not implied
+                                        by a default `control request`)
+  duetctl canvas list                 (every live node's geometry; not gated)
+  duetctl canvas inspect <id>         (one node's geometry; not gated)
+  duetctl canvas find-space --width <num> --height <num>
+                                       (first free grid position; not gated)"#;
+
+/// `duetctl canvas move|resize|create|configure|connect|remove <id> ...`:
+/// Milestone 7.6's delegated canvas-control
+/// move/resize/create/configure/connect/remove — see
+/// `App::move_node`/`App::resize_node`/`App::create_canvas_node`/
+/// `App::configure_node`/`App::create_edge`/`App::remove_canvas_node`.
+fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
+    match args {
+        [cmd, id, rest @ ..] if cmd == "move" => parse_canvas_move(parse_uuid_arg(id)?, rest),
+        [cmd, id, rest @ ..] if cmd == "resize" => parse_canvas_resize(parse_uuid_arg(id)?, rest),
+        [cmd, rest @ ..] if cmd == "create" => parse_canvas_create(rest),
+        [cmd, id, rest @ ..] if cmd == "configure" => {
+            parse_canvas_configure(parse_uuid_arg(id)?, rest)
+        }
+        [cmd, source, target] if cmd == "connect" => Ok(ControlRequest::CanvasConnect {
+            requested_by: acting_agent_id(),
+            source: parse_uuid_arg(source)?,
+            target: parse_uuid_arg(target)?,
+        }),
+        [cmd, id] if cmd == "remove" => Ok(ControlRequest::CanvasRemove {
+            requested_by: acting_agent_id(),
+            id: parse_uuid_arg(id)?,
+        }),
+        [only] if only == "list" => Ok(ControlRequest::CanvasList),
+        [cmd, id] if cmd == "inspect" => Ok(ControlRequest::CanvasInspect {
+            id: parse_uuid_arg(id)?,
+        }),
+        [cmd, rest @ ..] if cmd == "find-space" => parse_canvas_find_space(rest),
+        _ => anyhow::bail!(CANVAS_USAGE),
+    }
+}
+
+/// Builds the `NodeKind` for `ControlRequest::CanvasCreate`'s `kind` string —
+/// the same payload literals `create_note`/`create_text_node`/`create_group`/
+/// `create_drawing` already use, so this orchestrator path produces exactly
+/// the same kind of node the GUI buttons do. `name` seeds a Note's/Text's
+/// initial content, a Group's label, or a Portal's display name; it is
+/// ignored for `filetree`/`drawing`, which have no name field.
+fn canvas_create_kind(kind: &str, name: Option<String>) -> Result<NodeKind, String> {
+    match kind {
+        "note" => Ok(NodeKind::Note(NotePayload {
+            markdown: name.unwrap_or_default(),
+            color: "yellow".to_string(),
+            view_mode: NoteViewMode::Edit,
+            file: None,
+        })),
+        "text" => Ok(NodeKind::Text(TextPayload {
+            content: name.unwrap_or_default(),
+        })),
+        "filetree" => Ok(NodeKind::FileTree(FileTreePayload::default())),
+        "group" => Ok(NodeKind::Group(GroupPayload {
+            label: name.unwrap_or_default(),
+            ..Default::default()
+        })),
+        "drawing" => Ok(NodeKind::Drawing(Default::default())),
+        "portal" => {
+            let name =
+                name.ok_or_else(|| "canvas create --kind portal requires --name".to_string())?;
+            let name = crate::orchestration::portal::validate_portal_name(&name)?;
+            Ok(NodeKind::Portal(PortalPayload::new(&name, "")))
+        }
+        other => Err(format!(
+            "unknown canvas kind '{other}' (expected note|text|filetree|group|drawing|portal)"
+        )),
+    }
+}
+
+/// `ControlRequest::CanvasCreate`'s `width`/`height` pair, same
+/// both-or-neither rule `agents_create_position_and_size` already applies to
+/// its own optional size pair: a lone half silently falling back to `kind`'s
+/// default size would discard the agent's explicit input with no error, so
+/// it is rejected instead.
+fn canvas_create_size(
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<Option<(f64, f64)>, String> {
+    match (width, height) {
+        (Some(width), Some(height)) => Ok(Some((width, height))),
+        (None, None) => Ok(None),
+        _ => Err("canvas create needs both --width and --height, or neither".to_string()),
+    }
+}
+
+fn parse_canvas_move(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut x, mut y) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--x" => x = Some(parse_f64_arg(value)?),
+            "--y" => y = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasMove {
+        requested_by: acting_agent_id(),
+        id,
+        x: x.ok_or_else(|| anyhow::anyhow!("canvas move needs --x\n\n{CANVAS_USAGE}"))?,
+        y: y.ok_or_else(|| anyhow::anyhow!("canvas move needs --y\n\n{CANVAS_USAGE}"))?,
+    })
+}
+
+fn parse_canvas_resize(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut width, mut height) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--width" => width = Some(parse_f64_arg(value)?),
+            "--height" => height = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasResize {
+        requested_by: acting_agent_id(),
+        id,
+        width: width
+            .ok_or_else(|| anyhow::anyhow!("canvas resize needs --width\n\n{CANVAS_USAGE}"))?,
+        height: height
+            .ok_or_else(|| anyhow::anyhow!("canvas resize needs --height\n\n{CANVAS_USAGE}"))?,
+    })
+}
+
+fn parse_canvas_create(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut kind, mut name, mut x, mut y, mut width, mut height) =
+        (None, None, None, None, None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--kind" => kind = Some(value.to_string()),
+            "--name" => name = Some(value.to_string()),
+            "--x" => x = Some(parse_f64_arg(value)?),
+            "--y" => y = Some(parse_f64_arg(value)?),
+            "--width" => width = Some(parse_f64_arg(value)?),
+            "--height" => height = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasCreate {
+        requested_by: acting_agent_id(),
+        kind: kind
+            .ok_or_else(|| anyhow::anyhow!("canvas create needs --kind\n\n{CANVAS_USAGE}"))?,
+        name,
+        x: x.ok_or_else(|| anyhow::anyhow!("canvas create needs --x\n\n{CANVAS_USAGE}"))?,
+        y: y.ok_or_else(|| anyhow::anyhow!("canvas create needs --y\n\n{CANVAS_USAGE}"))?,
+        width,
+        height,
+    })
+}
+
+fn parse_canvas_configure(id: Uuid, args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut name, mut color) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--name" => name = Some(value.to_string()),
+            "--color" => color = Some(value.to_string()),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    Ok(ControlRequest::CanvasConfigure {
+        requested_by: acting_agent_id(),
+        id,
+        name,
+        color,
+    })
+}
+
+fn parse_canvas_find_space(args: &[String]) -> anyhow::Result<ControlRequest> {
+    let (mut width, mut height) = (None, None);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let (flag, value) = (args[i].as_str(), args[i + 1].as_str());
+        match flag {
+            "--width" => width = Some(parse_f64_arg(value)?),
+            "--height" => height = Some(parse_f64_arg(value)?),
+            other => anyhow::bail!("unknown flag '{other}'\n\n{CANVAS_USAGE}"),
+        }
+        i += 2;
+    }
+    let width = width
+        .ok_or_else(|| anyhow::anyhow!("canvas find-space needs --width\n\n{CANVAS_USAGE}"))?;
+    let height = height
+        .ok_or_else(|| anyhow::anyhow!("canvas find-space needs --height\n\n{CANVAS_USAGE}"))?;
+    if width <= 0.0 {
+        anyhow::bail!("canvas find-space --width must be a positive number, got '{width}'");
+    }
+    if height <= 0.0 {
+        anyhow::bail!("canvas find-space --height must be a positive number, got '{height}'");
+    }
+    Ok(ControlRequest::CanvasFindSpace { width, height })
+}
+
 fn parse_legacy_agent(args: &[String]) -> anyhow::Result<ControlRequest> {
     match args {
         [only] if only == "list" => Ok(ControlRequest::List),
@@ -1892,6 +2528,7 @@ fn parse_agents(args: &[String]) -> anyhow::Result<ControlRequest> {
 
 fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
     let (mut name, mut cwd, mut agent, mut role) = (None, None, None, None);
+    let (mut x, mut y, mut width, mut height, mut task) = (None, None, None, None, None);
     let mut i = 0;
     while i + 1 < args.len() {
         let (flag, value) = (args[i].as_str(), args[i + 1].clone());
@@ -1900,6 +2537,11 @@ fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
             "--cwd" => cwd = Some(value),
             "--agent" => agent = Some(value),
             "--role" => role = Some(value),
+            "--x" => x = Some(parse_f64_arg(&value)?),
+            "--y" => y = Some(parse_f64_arg(&value)?),
+            "--width" => width = Some(parse_f64_arg(&value)?),
+            "--height" => height = Some(parse_f64_arg(&value)?),
+            "--task" => task = Some(value),
             other => anyhow::bail!("unknown flag '{other}'\n\n{USAGE}"),
         }
         i += 2;
@@ -1912,7 +2554,28 @@ fn parse_agents_create(args: &[String]) -> anyhow::Result<ControlRequest> {
         agent: agent.ok_or_else(|| anyhow::anyhow!("agents create needs --agent\n\n{USAGE}"))?,
         role,
         requested_by: acting_agent_id(),
+        x,
+        y,
+        width,
+        height,
+        task,
     })
+}
+
+/// Parses a `--x`/`--y`/`--width`/`--height` value. Rejects non-finite
+/// input (`nan`/`inf`/`-inf`) at this trust boundary — an agent-supplied
+/// non-finite float would otherwise land in `NodeRecord.position`/`size`,
+/// serialize as JSON `null`, and fail to deserialize on the next launch,
+/// triggering `backup_corrupt_file` and silently discarding the user's
+/// workspace (CLAUDE.md: "never silently discard or reset persisted data").
+fn parse_f64_arg(value: &str) -> anyhow::Result<f64> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected a number, got '{value}'"))?;
+    if !parsed.is_finite() {
+        anyhow::bail!("expected a finite number, got '{value}'");
+    }
+    Ok(parsed)
 }
 
 fn parse_send(args: &[String]) -> anyhow::Result<ControlRequest> {
@@ -1958,6 +2621,19 @@ fn print_response(response: &ControlResponse) {
         }
         ControlResponse::Sent { message } => {
             println!("{:?} (message {})", message.status, message.id);
+        }
+        ControlResponse::ControlRequestPending { request_id } => {
+            println!(
+                "request {request_id} is pending human approval (run `duetctl control status` to check)"
+            );
+        }
+        ControlResponse::ControlGrantStatus { granted } => {
+            if granted.is_empty() {
+                println!("no capabilities granted");
+            }
+            for capability in granted {
+                println!("{capability}");
+            }
         }
         ControlResponse::AgentList { agents } => {
             if agents.is_empty() {
@@ -2007,6 +2683,17 @@ fn print_response(response: &ControlResponse) {
         ControlResponse::Created { id } => println!("created agent {id}"),
         ControlResponse::Removed => println!("removed"),
         ControlResponse::RoleAssigned => println!("role assigned"),
+        ControlResponse::CanvasDone { message } => println!("{message}"),
+        ControlResponse::CanvasNodes { nodes } => {
+            if nodes.is_empty() {
+                println!("no nodes");
+            }
+            for node in nodes {
+                print_canvas_node_summary(node);
+            }
+        }
+        ControlResponse::CanvasNode { node } => print_canvas_node_summary(node),
+        ControlResponse::CanvasPosition { x, y } => println!("{x}\t{y}"),
         ControlResponse::Whoami { info } => {
             println!("id:       {}", info.agent.id);
             println!("name:     {}", info.agent.name);
@@ -2302,6 +2989,24 @@ fn print_response(response: &ControlResponse) {
     }
 }
 
+/// One line per node for `canvas list`/`canvas inspect`'s human-readable
+/// output — `AgentList`'s tab-separated shape, with geometry instead of
+/// provider/activity.
+fn print_canvas_node_summary(node: &CanvasNodeSummary) {
+    println!(
+        "{}\t{}\t{}\tpos=({},{})\tsize=({},{})\tlocked={}\tz={}",
+        node.id,
+        node.kind,
+        node.name.as_deref().unwrap_or("-"),
+        node.position.0,
+        node.position.1,
+        node.size.0,
+        node.size.1,
+        node.locked,
+        node.z_order
+    );
+}
+
 fn print_resolved_resource(resource: &ResolvedResource) {
     println!("kind:      {}", resource.kind.label());
     println!("id:        {}", resource.id);
@@ -2343,6 +3048,69 @@ fn print_resolve_outcome(outcome: &ResolveOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::AccountStore;
+
+    /// `duetctl control status`'s output must be exactly what
+    /// `duetctl control request --capability <name>` accepts back — a
+    /// hand-written mismatch here (e.g. `format!("{cap:?}")` emitting
+    /// `"SpawnAgents"` while the parser only accepts `"spawn-agents"`)
+    /// would silently break that round trip. No GTK involved, so this
+    /// doesn't need `gtk4::init()`/`#[ignore]`.
+    #[test]
+    fn capability_slug_round_trips_through_parse_control_capability() {
+        for cap in ControlCapability::DEFAULT_SET
+            .into_iter()
+            .chain([ControlCapability::RemoveCanvasNodes])
+        {
+            let slug = capability_slug(cap);
+            assert_eq!(
+                parse_control_capability(&slug),
+                Ok(cap),
+                "capability_slug({cap:?}) = {slug:?} doesn't round-trip through parse_control_capability"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn control_request_grant_never_grants_anything_by_itself() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let agent = Uuid::new_v4();
+        let response = handle_request(
+            &app,
+            ControlRequest::ControlRequestGrant {
+                requested_by: agent,
+                capabilities: vec!["spawn-agents".to_string()],
+                reason: None,
+            },
+        );
+        assert!(matches!(
+            response,
+            ControlResponse::ControlRequestPending { .. }
+        ));
+        assert!(
+            App::require_control_capability(&app, Some(agent), ControlCapability::SpawnAgents)
+                .is_err()
+        );
+
+        let status = handle_request(
+            &app,
+            ControlRequest::ControlStatus {
+                requested_by: Some(agent),
+            },
+        );
+        assert!(matches!(
+            status,
+            ControlResponse::ControlGrantStatus { granted } if granted.is_empty()
+        ));
+    }
 
     #[test]
     fn legacy_list_still_parses_with_no_arguments() {
@@ -2471,12 +3239,27 @@ mod tests {
             "claude".to_string(),
             "--role".to_string(),
             "Developer".to_string(),
+            "--x".to_string(),
+            "1200".to_string(),
+            "--y".to_string(),
+            "500".to_string(),
+            "--width".to_string(),
+            "420".to_string(),
+            "--height".to_string(),
+            "320".to_string(),
+            "--task".to_string(),
+            "implement the thing".to_string(),
         ];
         let ControlRequest::AgentsCreate {
             name,
             cwd,
             agent,
             role,
+            x,
+            y,
+            width,
+            height,
+            task,
             ..
         } = parse_cli_request(&args).unwrap()
         else {
@@ -2486,6 +3269,159 @@ mod tests {
         assert_eq!(cwd, PathBuf::from("/tmp"));
         assert_eq!(agent, "claude");
         assert_eq!(role, Some("Developer".to_string()));
+        assert_eq!(x, Some(1200.0));
+        assert_eq!(y, Some(500.0));
+        assert_eq!(width, Some(420.0));
+        assert_eq!(height, Some(320.0));
+        assert_eq!(task, Some("implement the thing".to_string()));
+    }
+
+    #[test]
+    fn agents_create_defaults_the_new_delegated_control_fields_to_none() {
+        let args = [
+            "agents".to_string(),
+            "create".to_string(),
+            "--name".to_string(),
+            "backend".to_string(),
+            "--cwd".to_string(),
+            "/tmp".to_string(),
+            "--agent".to_string(),
+            "claude".to_string(),
+        ];
+        let ControlRequest::AgentsCreate {
+            x,
+            y,
+            width,
+            height,
+            task,
+            ..
+        } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected AgentsCreate");
+        };
+        assert_eq!(x, None);
+        assert_eq!(y, None);
+        assert_eq!(width, None);
+        assert_eq!(height, None);
+        assert_eq!(task, None);
+    }
+
+    #[test]
+    fn agents_create_rejects_non_finite_coordinates() {
+        for bad in ["nan", "inf", "-inf"] {
+            let args = [
+                "agents".to_string(),
+                "create".to_string(),
+                "--name".to_string(),
+                "backend".to_string(),
+                "--cwd".to_string(),
+                "/tmp".to_string(),
+                "--agent".to_string(),
+                "claude".to_string(),
+                "--x".to_string(),
+                bad.to_string(),
+                "--y".to_string(),
+                "0".to_string(),
+            ];
+            let error = parse_cli_request(&args)
+                .expect_err(&format!("--x {bad} should have been rejected"));
+            assert!(
+                error.to_string().contains("finite"),
+                "unexpected error for --x {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_find_space_parses_width_and_height() {
+        let args = [
+            "canvas".to_string(),
+            "find-space".to_string(),
+            "--width".to_string(),
+            "200".to_string(),
+            "--height".to_string(),
+            "150".to_string(),
+        ];
+        let ControlRequest::CanvasFindSpace { width, height } = parse_cli_request(&args).unwrap()
+        else {
+            panic!("expected CanvasFindSpace");
+        };
+        assert_eq!(width, 200.0);
+        assert_eq!(height, 150.0);
+    }
+
+    #[test]
+    fn canvas_find_space_rejects_non_positive_width_or_height() {
+        for (width, height) in [("0", "150"), ("-5", "150"), ("200", "0"), ("200", "-5")] {
+            let args = [
+                "canvas".to_string(),
+                "find-space".to_string(),
+                "--width".to_string(),
+                width.to_string(),
+                "--height".to_string(),
+                height.to_string(),
+            ];
+            let error = parse_cli_request(&args).expect_err(&format!(
+                "--width {width} --height {height} should be rejected"
+            ));
+            assert!(
+                error.to_string().contains("positive"),
+                "unexpected error for --width {width} --height {height}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_find_space_rejects_non_finite_width_or_height() {
+        for bad in ["nan", "inf", "-inf"] {
+            let args = [
+                "canvas".to_string(),
+                "find-space".to_string(),
+                "--width".to_string(),
+                bad.to_string(),
+                "--height".to_string(),
+                "150".to_string(),
+            ];
+            let error = parse_cli_request(&args)
+                .expect_err(&format!("--width {bad} should have been rejected"));
+            assert!(
+                error.to_string().contains("finite"),
+                "unexpected error for --width {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_create_size_requires_the_pair_complete() {
+        assert_eq!(
+            canvas_create_size(Some(1.0), Some(2.0)),
+            Ok(Some((1.0, 2.0)))
+        );
+        assert_eq!(canvas_create_size(None, None), Ok(None));
+        assert!(canvas_create_size(Some(1.0), None).is_err());
+        assert!(canvas_create_size(None, Some(2.0)).is_err());
+    }
+
+    #[test]
+    fn agents_create_position_and_size_requires_each_pair_complete() {
+        // A whole pair, or a whole pair plus the other whole pair: fine.
+        assert_eq!(
+            agents_create_position_and_size(Some(1.0), Some(2.0), None, None),
+            Ok((Some((1.0, 2.0)), None))
+        );
+        assert_eq!(
+            agents_create_position_and_size(None, None, Some(3.0), Some(4.0)),
+            Ok((None, Some((3.0, 4.0))))
+        );
+        assert_eq!(
+            agents_create_position_and_size(None, None, None, None),
+            Ok((None, None))
+        );
+        // A lone half of either pair is rejected.
+        assert!(agents_create_position_and_size(Some(1.0), None, None, None).is_err());
+        assert!(agents_create_position_and_size(None, Some(2.0), None, None).is_err());
+        assert!(agents_create_position_and_size(None, None, Some(3.0), None).is_err());
+        assert!(agents_create_position_and_size(None, None, None, Some(4.0)).is_err());
     }
 
     #[test]

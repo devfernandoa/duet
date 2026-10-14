@@ -1374,6 +1374,7 @@ fn open_new_session_dialog(
                 role_id,
                 viewport_center,
                 &toast_overlay,
+                None,
             );
             match result {
                 Ok(_id) => dialog.close(),
