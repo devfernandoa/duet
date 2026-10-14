@@ -4295,6 +4295,17 @@ fn node_menu_items(app: &Rc<RefCell<App>>, id: Uuid) -> Vec<MenuItem> {
                 items.push(separator());
                 items.extend(open_in_portal);
             }
+            let workspace_id = app.borrow().workspace_id;
+            if app.borrow().control.has_any_grant(workspace_id, id) {
+                items.push(separator());
+                let app_c = Rc::clone(app);
+                items.push((
+                    "! Revoke canvas control".to_string(),
+                    Box::new(move || {
+                        App::revoke_control_grant(&app_c, id);
+                    }),
+                ));
+            }
             items
         }
         NodeKind::Note(note) => {
