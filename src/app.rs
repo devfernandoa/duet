@@ -65,6 +65,7 @@ use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -353,6 +354,20 @@ pub enum WorkspaceRuntimeState {
     Active,
     Background,
     Unloaded,
+}
+
+/// §10/§13's read model for an orchestrator's spatial reasoning: enough
+/// structured geometry to place/avoid-colliding-with other nodes, never
+/// a screenshot (§13's explicit "do NOT give agents screenshots").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasNodeSummary {
+    pub id: Uuid,
+    pub kind: String,
+    pub name: Option<String>,
+    pub position: (f64, f64),
+    pub size: (f64, f64),
+    pub locked: bool,
+    pub z_order: i64,
 }
 
 pub struct App {
@@ -2332,6 +2347,44 @@ impl App {
         }
         let _ = app.borrow().persist();
         Ok(())
+    }
+
+    /// §10/§13's read model for an orchestrator's spatial reasoning: enough
+    /// structured geometry to place/avoid-colliding-with other nodes, never
+    /// a screenshot (§13's explicit "do NOT give agents screenshots"). Not
+    /// capability-gated, same as `agent_infos`/`connection_infos` — plain
+    /// discovery, needed to make spatial decisions at all.
+    pub fn list_canvas_nodes(app: &Rc<RefCell<App>>) -> Vec<CanvasNodeSummary> {
+        app.borrow()
+            .nodes
+            .values()
+            .map(|entry| App::summarize_node(&entry.record))
+            .collect()
+    }
+
+    pub fn inspect_canvas_node(app: &Rc<RefCell<App>>, id: Uuid) -> Option<CanvasNodeSummary> {
+        app.borrow()
+            .nodes
+            .get(&id)
+            .map(|entry| App::summarize_node(&entry.record))
+    }
+
+    fn summarize_node(record: &NodeRecord) -> CanvasNodeSummary {
+        let name = match &record.kind {
+            NodeKind::Terminal(terminal) => Some(terminal.name.clone()),
+            NodeKind::Group(group) if !group.label.is_empty() => Some(group.label.clone()),
+            NodeKind::Portal(portal) => Some(portal.name.clone()),
+            _ => None,
+        };
+        CanvasNodeSummary {
+            id: record.id,
+            kind: record.kind.label().to_string(),
+            name,
+            position: record.position,
+            size: record.size,
+            locked: record.locked,
+            z_order: record.z_order,
+        }
     }
 
     /// The same per-kind default size `create_note`/`create_group`/
@@ -6061,6 +6114,29 @@ mod tests {
             AccountStore::new(tmp.join("accounts")),
             tmp.join("store.json"),
         )
+    }
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn list_canvas_nodes_reports_every_live_node() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("duet-test-{}", Uuid::new_v4()));
+        let app = App::new(
+            AccountStore::new(tmp.join("accounts")),
+            tmp.join("store.json"),
+        );
+        let note = note_with_markdown("a");
+        let id = note.id;
+        materialize_node(&app, note, &adw::ToastOverlay::new()).unwrap();
+
+        let nodes = App::list_canvas_nodes(&app);
+        assert!(nodes.iter().any(|n| n.id == id && n.kind == "Note"));
+
+        let inspected = App::inspect_canvas_node(&app, id).unwrap();
+        assert_eq!(inspected.id, id);
+        assert!(App::inspect_canvas_node(&app, Uuid::new_v4()).is_none());
     }
 
     /// Milestone 4 section 8: a service-driven write must be immediately

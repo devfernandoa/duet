@@ -21,7 +21,7 @@
 //! them from a request that arrived on another thread.
 
 use crate::agent::Agent;
-use crate::app::{App, PortalStep};
+use crate::app::{App, CanvasNodeSummary, PortalStep};
 use crate::message::{
     AgentInfo, AgentMessage, AgentSummary, ConnectionInfo, LinkSummary, NoteDetail, NoteSummary,
     PortalAction, PortalInfo, PortalPage, PortalScreenshot, PortalSummary, WhoamiInfo,
@@ -207,6 +207,16 @@ pub enum ControlRequest {
     CanvasRemove {
         #[serde(default)]
         requested_by: Option<Uuid>,
+        id: Uuid,
+    },
+    /// `duetctl canvas list`: every live node's geometry — see
+    /// `App::list_canvas_nodes`. Not capability-gated, same precedent as
+    /// `AgentsList`/`ConnectionsList` (§13: "the canvas is structured
+    /// data... provide structured geometry", never a screenshot).
+    CanvasList,
+    /// `duetctl canvas inspect <id>`: one node's geometry — see
+    /// `App::inspect_canvas_node`. Not capability-gated, same as `CanvasList`.
+    CanvasInspect {
         id: Uuid,
     },
     /// `duetctl whoami`: what the `duet` skill tells an agent to run first
@@ -557,6 +567,12 @@ pub enum ControlResponse {
     /// variant per canvas verb.
     CanvasDone {
         message: String,
+    },
+    CanvasNodes {
+        nodes: Vec<CanvasNodeSummary>,
+    },
+    CanvasNode {
+        node: CanvasNodeSummary,
     },
     Whoami {
         info: WhoamiInfo,
@@ -1235,6 +1251,15 @@ pub fn handle_request(app: &Rc<RefCell<App>>, request: ControlRequest) -> Contro
                 }
             })
         }
+        ControlRequest::CanvasList => ControlResponse::CanvasNodes {
+            nodes: App::list_canvas_nodes(app),
+        },
+        ControlRequest::CanvasInspect { id } => match App::inspect_canvas_node(app, id) {
+            Some(node) => ControlResponse::CanvasNode { node },
+            None => ControlResponse::Error {
+                error: format!("no such node {id}"),
+            },
+        },
         ControlRequest::Whoami { agent_id } => {
             let Some(agent_id) = agent_id else {
                 return ControlResponse::Error {
@@ -1696,6 +1721,8 @@ const USAGE: &str = r#"usage:
   duetctl canvas remove <id>          (never Terminal nodes; needs an explicit
                                         remove-canvas-nodes grant — not implied
                                         by a default `control request`)
+  duetctl canvas list                 (every live node's geometry; not gated)
+  duetctl canvas inspect <id>         (one node's geometry; not gated)
   append --json to any command for machine-readable output"#;
 
 const RESOURCE_USAGE: &str = r#"usage:
@@ -2241,7 +2268,9 @@ const CANVAS_USAGE: &str = r#"usage:
   duetctl canvas connect <source-id> <target-id>
   duetctl canvas remove <id>          (never Terminal nodes; needs an explicit
                                         remove-canvas-nodes grant — not implied
-                                        by a default `control request`)"#;
+                                        by a default `control request`)
+  duetctl canvas list                 (every live node's geometry; not gated)
+  duetctl canvas inspect <id>         (one node's geometry; not gated)"#;
 
 /// `duetctl canvas move|resize|create|configure|connect|remove <id> ...`:
 /// Milestone 7.6's delegated canvas-control
@@ -2263,6 +2292,10 @@ fn parse_canvas(args: &[String]) -> anyhow::Result<ControlRequest> {
         }),
         [cmd, id] if cmd == "remove" => Ok(ControlRequest::CanvasRemove {
             requested_by: acting_agent_id(),
+            id: parse_uuid_arg(id)?,
+        }),
+        [only] if only == "list" => Ok(ControlRequest::CanvasList),
+        [cmd, id] if cmd == "inspect" => Ok(ControlRequest::CanvasInspect {
             id: parse_uuid_arg(id)?,
         }),
         _ => anyhow::bail!(CANVAS_USAGE),
@@ -2599,6 +2632,15 @@ fn print_response(response: &ControlResponse) {
         ControlResponse::Removed => println!("removed"),
         ControlResponse::RoleAssigned => println!("role assigned"),
         ControlResponse::CanvasDone { message } => println!("{message}"),
+        ControlResponse::CanvasNodes { nodes } => {
+            if nodes.is_empty() {
+                println!("no nodes");
+            }
+            for node in nodes {
+                print_canvas_node_summary(node);
+            }
+        }
+        ControlResponse::CanvasNode { node } => print_canvas_node_summary(node),
         ControlResponse::Whoami { info } => {
             println!("id:       {}", info.agent.id);
             println!("name:     {}", info.agent.name);
@@ -2892,6 +2934,24 @@ fn print_response(response: &ControlResponse) {
             eprintln!("duetctl: {error}");
         }
     }
+}
+
+/// One line per node for `canvas list`/`canvas inspect`'s human-readable
+/// output — `AgentList`'s tab-separated shape, with geometry instead of
+/// provider/activity.
+fn print_canvas_node_summary(node: &CanvasNodeSummary) {
+    println!(
+        "{}\t{}\t{}\tpos=({},{})\tsize=({},{})\tlocked={}\tz={}",
+        node.id,
+        node.kind,
+        node.name.as_deref().unwrap_or("-"),
+        node.position.0,
+        node.position.1,
+        node.size.0,
+        node.size.1,
+        node.locked,
+        node.z_order
+    );
 }
 
 fn print_resolved_resource(resource: &ResolvedResource) {
