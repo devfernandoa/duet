@@ -823,6 +823,10 @@ fn resolve_optional_role(app: &App, role: Option<String>) -> Result<Option<Uuid>
     }
 }
 
+/// An optional `(x, y)` position paired with an optional `(width, height)`
+/// size — `App::create_agent`'s own argument shape for these two fields.
+type PositionAndSize = (Option<(f64, f64)>, Option<(f64, f64)>);
+
 /// Builds `App::create_agent`'s `position`/`size` arguments from
 /// `ControlRequest::AgentsCreate`'s `x`/`y`/`width`/`height` fields — each
 /// pair must be both present or both absent (a partial pair is a request
@@ -835,7 +839,7 @@ fn agents_create_position_and_size(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
-) -> Result<(Option<(f64, f64)>, Option<(f64, f64)>), String> {
+) -> Result<PositionAndSize, String> {
     let position = match (x, y) {
         (Some(x), Some(y)) => Some((x, y)),
         (None, None) => None,
